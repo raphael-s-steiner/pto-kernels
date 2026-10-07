@@ -6,6 +6,7 @@ import torch
 from cube.jit_util_hadamard_cube import (
     MAX_CUBE_HADAMARD_N,
     MIN_CUBE_HADAMARD_N,
+    cube_block_dim_schedule,
     validate_cube_hadamard_args,
 )
 
@@ -191,3 +192,51 @@ def test_shape_mismatch_rejected(npu_device):
 
     with pytest.raises(ValueError, match="matching shapes"):
         validate_cube_hadamard_args(x, y)
+
+
+# --- block_dim schedule ---------------------------------------------------
+#
+# block_dim is a per-launch argument and the best value moves with the shape:
+# too many cores leaves each one a tile run too short to fill its pipes, and a
+# constant 24 costs up to 1.83x at the small end of this kernel's own benchmark
+# range. It must not change the result, which is what these pin down.
+
+
+def test_block_dim_schedule_in_range():
+    for n in TEST_HIDDEN_DIMS:
+        for batch in (1, 7, 64, 256, 1024, 8192, 65536):
+            bd = cube_block_dim_schedule(batch, n, 24)
+            assert 1 <= bd <= 24, (batch, n, bd)
+
+
+def test_block_dim_schedule_grows_with_batch():
+    """More tiles justify more cores, so the schedule must be monotone."""
+    for n in TEST_HIDDEN_DIMS:
+        seq = [cube_block_dim_schedule(b, n, 24)
+               for b in (1, 64, 256, 1024, 4096, 8192, 65536)]
+        assert seq == sorted(seq), (n, seq)
+
+
+def test_block_dim_schedule_respects_cap():
+    assert cube_block_dim_schedule(1 << 20, 256, 4) == 4
+    assert cube_block_dim_schedule(1 << 20, 256, 1) == 1
+
+
+@pytest.mark.parametrize("n", [256, 1024, 4096])
+def test_block_dim_does_not_change_result(cube_hadamard_kernel, npu_device, n):
+    """The gate that makes the schedule free of correctness risk: every
+    block_dim, including the scheduled one, must give bit-identical output."""
+    torch.manual_seed(7)
+    batch = 300  # not a multiple of any tile size, so the tails differ per core
+    x = torch.randn(batch, n, device=npu_device, dtype=DTYPE)
+
+    reference = torch.empty_like(x)
+    cube_hadamard_kernel(x, reference, block_dim=24)
+    torch.npu.synchronize()
+
+    scheduled = cube_block_dim_schedule(batch, n, 24)
+    for block_dim in sorted({1, 2, 3, 5, 8, 13, 24, scheduled}):
+        y = torch.full_like(x, float("nan"))
+        cube_hadamard_kernel(x, y, block_dim=block_dim)
+        torch.npu.synchronize()
+        assert torch.equal(y, reference), f"block_dim={block_dim} changed the result"

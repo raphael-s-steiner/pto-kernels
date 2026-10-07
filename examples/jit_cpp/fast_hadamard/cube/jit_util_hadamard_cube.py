@@ -1,4 +1,5 @@
 import ctypes
+import math
 
 import torch
 
@@ -20,6 +21,59 @@ MIN_CUBE_HADAMARD_N = 256
 MAX_CUBE_HADAMARD_N = 16384
 
 _FACTOR_CACHE: dict = {}
+
+# Samples per tile, mirroring FAST_HADAMARD_CUBE_CASES in the kernel. A tile is
+# S consecutive samples, so a launch has ceil(batch / S) tiles to spread over
+# the cores. Keep in step with the kernel if that table changes.
+_SAMPLES_PER_TILE = {256: 32, 512: 16, 1024: 8, 2048: 4, 4096: 2, 8192: 1,
+                     16384: 1}
+
+# Cores are only worth adding while each still gets a tile run long enough to
+# keep its pipes full. Measured on 910B2: at N=256 a core moves 94 GB/s with
+# only 2 tiles queued against 359 GB/s on a long run, so spreading 48 tiles over
+# 24 cores is 1.87x SLOWER than over 8. bd = sqrt(k * tiles) trades the two off,
+# and k is where a size sits on that curve: small k means high per-tile latency,
+# so few cores with long runs.
+#
+# Fitted per N rather than by a rule, because the two R == 16 sizes do not
+# behave like the rest and nothing about N predicts which way: N=512 wants k=1
+# where N=1024 wants 8, and assuming 8 for it cost 1.51x. N=512's tile is 16
+# TEXTRACTs plus 16 TSTOREs, the most per-tile work in the table, which is the
+# likely reason -- but it was found by measuring, not by that argument.
+#
+# Last column is what the old constant 24 cost at that size, i.e. what the
+# schedule buys:
+#
+#     N      k     shapes   worst regret   constant-24 worst
+#   256   0.49        6         1.025x           1.834x
+#   512   1.00        6         1.005x           1.908x
+#  1024   8.00        6         1.000x           1.207x
+#  2048  16.00        6         1.000x           1.085x
+#  4096   8.00        6         1.000x           1.093x
+#  8192   8.00        5         1.000x           1.000x
+# 16384   8.00        5         1.000x           1.000x
+_TILE_RUN_K = {256: 0.49, 512: 1.0, 1024: 8.0, 2048: 16.0, 4096: 8.0,
+               8192: 8.0, 16384: 8.0}
+# Only reached if FAST_HADAMARD_CUBE_CASES grows a size this table has not been
+# fitted for. Then it is an extrapolation -- sweep block_dim and add the entry.
+_DEFAULT_TILE_RUN_K = 8.0
+
+
+def cube_block_dim_schedule(batch: int, n: int, max_block_dim: int) -> int:
+    """Pick block_dim for one launch: enough cores to use the part, but not so
+    many that each core's tile run is too short to fill its pipes.
+
+    Fitted to block_dim sweeps in msprof device time on 910B2 covering every N in
+    the kernel's case table x batch in {64, 256, 1024, 4096, 8192, 65536} -- 40
+    shapes, no extrapolation. Lands within 1.025x of the best measured block_dim
+    (mean 1.001x), against 1.91x worst / 1.19x mean for a constant 24.
+
+    block_dim cannot change results, so an explicit block_dim always overrides
+    this; test_block_dim_does_not_change_result is the gate on that.
+    """
+    tiles = -(-int(batch) // _SAMPLES_PER_TILE.get(int(n), 1))
+    k = _TILE_RUN_K.get(int(n), _DEFAULT_TILE_RUN_K)
+    return max(1, min(int(max_block_dim), round(math.sqrt(k * tiles))))
 
 
 def hadamard_split(n: int) -> tuple[int, int]:
@@ -103,7 +157,7 @@ def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE):
         y,
         batch=None,
         n=None,
-        block_dim=resolved_block_dim,
+        block_dim=None,
         stream_ptr=None,
     ):
         resolved_batch, resolved_n = validate_cube_hadamard_args(x, y)
@@ -112,9 +166,18 @@ def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE):
         if n is not None and int(n) != resolved_n:
             raise ValueError("n must match the input tensor shape.")
 
+        # block_dim is a per-launch argument, not a property of the compiled
+        # kernel: the best value moves with the shape, and a constant costs up
+        # to 1.83x at the small end of this kernel's own benchmark range.
+        launch_block_dim = (
+            cube_block_dim_schedule(resolved_batch, resolved_n, resolved_block_dim)
+            if block_dim is None
+            else resolve_launch_block_dim(block_dim, resolved_block_dim)
+        )
+
         h_left, h_right = hadamard_factors(resolved_n, x.device)
         kernel(
-            resolve_launch_block_dim(block_dim, resolved_block_dim),
+            launch_block_dim,
             resolve_stream_ptr(stream_ptr),
             torch_to_ctypes(x),
             torch_to_ctypes(y),

@@ -20,6 +20,7 @@ from bench_common import (
     validate_benchmark_args,
     write_csv_records,
 )
+from cube.jit_util_hadamard_cube import cube_block_dim_schedule
 from cube.jit_util_hadamard_cube import jit_compile as jit_compile_cube
 from standard.jit_util_hadamard import jit_compile as jit_compile_vector
 
@@ -39,7 +40,7 @@ CUBE_COMPARE_POOL_KINDS = {
 }
 
 CSV_HEADER = (
-    "batch,N,cube_duration_us,vector_duration_us,"
+    "batch,N,cube_block_dim,cube_duration_us,vector_duration_us,"
     "cube_bandwidth_gbs,vector_bandwidth_gbs,cube_speedup_vs_vector,trials,"
     "cube_duration_mean_us,cube_duration_std_us,cube_duration_min_us,"
     "cube_duration_max_us,cube_duration_cv_pct,vector_duration_mean_us,"
@@ -162,6 +163,13 @@ def measure_cube_hadamard_shape(
     result = {
         "batch": batch,
         "n": n,
+        # What this shape actually launched with: cube_block_dim is None when the
+        # wrapper's per-shape schedule is in charge, so resolve it for the record.
+        "cube_block_dim": (
+            cube_block_dim
+            if cube_block_dim is not None
+            else cube_block_dim_schedule(batch, n, cube_func.block_dim)
+        ),
         "cube_us": cube_us,
         "vector_us": vector_us,
         "cube_bw": bandwidth_gbs(data_bytes, cube_us),
@@ -194,7 +202,8 @@ def print_cube_hadamard_shape_summary(result) -> None:
 
 def format_cube_hadamard_csv_record(result) -> str:
     return (
-        f"{result['batch']},{result['n']},{result['cube_us']:.4f},"
+        f"{result['batch']},{result['n']},{result['cube_block_dim']},"
+        f"{result['cube_us']:.4f},"
         f"{result['vector_us']:.4f},{result['cube_bw']:.4f},"
         f"{result['vector_bw']:.4f},{result['cube_speedup_vs_vector']:.4f},"
         f"{result['trials']},{result['cube_mean_us']:.4f},"
@@ -219,7 +228,10 @@ def benchmark(
     hidden_dims,
 ):
     ensure_output_dir(output_dir)
-    cube_block_dim = cube_func.block_dim
+    # None lets the cube wrapper apply its per-shape block_dim schedule, which is
+    # what ships; pinning a constant here would benchmark a configuration nobody
+    # runs. The vector kernel has no schedule, so it keeps its resolved default.
+    cube_block_dim = None
     vector_block_dim = vector_func.block_dim
 
     # Both arms leave stream_ptr at None so that each call resolves it through
@@ -238,7 +250,8 @@ def benchmark(
     print(f"\n{'=' * 96}")
     print(
         f"CUBE vs VECTOR HADAMARD BENCHMARK "
-        f"(cube BLOCK_DIM={cube_block_dim}, vector BLOCK_DIM={vector_block_dim})"
+        f"(cube BLOCK_DIM=scheduled per shape, max {cube_func.block_dim}, "
+        f"vector BLOCK_DIM={vector_block_dim})"
     )
     print(f"{'=' * 96}")
     header = (
@@ -270,7 +283,9 @@ def benchmark(
             print_cube_hadamard_shape_summary(result)
             records.append(format_cube_hadamard_csv_record(result))
 
-    csv_path = output_dir / f"fht_cube_compare_bd{cube_block_dim}.csv"
+    # Keyed on the cap, not the value used: the schedule picks per shape, and
+    # the cube_block_dim column records what each row actually ran at.
+    csv_path = output_dir / f"fht_cube_compare_bd{cube_func.block_dim}.csv"
     write_csv_records(csv_path, CSV_HEADER, records)
     print(f"\nSaved to {csv_path}")
 
