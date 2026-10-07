@@ -29,7 +29,8 @@ import sys
 BASE = pathlib.Path(__file__).resolve().parent
 PROF_DIR = BASE / "outputs" / "prof"
 
-KERNEL_MARKERS = ("fast_hadamard_cube", "fast_hadamard_fp16")
+KERNEL_MARKERS = ("fast_hadamard_cube", "fast_hadamard_onesided",
+                  "fast_hadamard_fp16")
 
 
 def run_msprof(cfg_path: pathlib.Path) -> pathlib.Path:

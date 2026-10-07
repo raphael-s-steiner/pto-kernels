@@ -4,6 +4,8 @@
 
 - `standard/`: plain Hadamard kernel, benchmark, plot, and test files
 - `cube/`: cube-unit (matmul) Hadamard kernel, benchmark, plot, and test files
+- `onesided/`: cube-unit Hadamard as a SINGLE dense product `Y = X * H_N`, for
+  `N` in 64..512 -- benchmark, plot, and test files
 - `fuse_int8_quant/`: int8 quantize and fused Hadamard+int8 quant files
 - `fuse_int4_quant/`: int4 quantize and fused Hadamard+int4 quant files
 - shared helpers stay at the top level:
@@ -27,6 +29,9 @@ python test.py --list
 python benchmark.py --target standard --npu 0
 # cube-unit Hadamard, also timed against the standard vector kernel
 python benchmark.py --target cube --npu 0
+# one-sided (single dense matmul) Hadamard over N in {64, 128, 256, 512}, timed
+# against the vector kernel and, where N >= 256, the two-sided cube kernel
+python benchmark.py --target onesided --npu 0
 python benchmark.py --target quantize_int8 --npu 0
 python benchmark.py --target quantize_int4 --npu 0
 # run both standalone quantize suites for later int8-vs-int4 plotting
@@ -43,6 +48,8 @@ python benchmark.py --target all --npu 0
 python plot.py --target standard
 # cube-vs-vector duration, bandwidth, and speedup plots
 python plot.py --target cube
+# one-sided-vs-vector plots, plus one-sided-vs-two-sided for the N it shares
+python plot.py --target onesided
 python plot.py --target quantize_int8
 python plot.py --target quantize_int4
 # generate top-level int8-vs-int4 quantize comparison plots
@@ -57,6 +64,7 @@ python plot.py --target all
 # correctness tests
 python test.py --target standard -v --npu "npu:0"
 python test.py --target cube -v --npu "npu:0"
+python test.py --target onesided -v --npu "npu:0"
 python test.py --target quantize_int8 -v --npu "npu:0"
 python test.py --target quantize_int4 -v --npu "npu:0"
 python test.py --target hadamard_quant_int8 -v --npu "npu:0"
@@ -72,6 +80,7 @@ implementations:
 
 - `standard/outputs/csv/fht_pto_bd*.csv` from `benchmark.py --target standard`
 - `cube/outputs/csv/fht_cube_compare_bd*.csv` from `benchmark.py --target cube`
+- `onesided/outputs/csv/fht_onesided_compare_bd*.csv` from `benchmark.py --target onesided`
 - `fuse_int8_quant/outputs/csv/quantize_compare_bd*.csv` from `benchmark.py --target quantize_int8`
 - `fuse_int8_quant/outputs/csv/fht_quant_compare_bd*.csv` from `benchmark.py --target hadamard_quant_int8`
 - `fuse_int4_quant/outputs/csv/quantize_compare_bd*.csv` from `benchmark.py --target quantize_int4`
@@ -270,6 +279,119 @@ event ids, and renumbering the *existing* ids -- in a path that was otherwise
 untouched -- cost a reproducible 0.92x at N=1024 batch 65536. The two drivers
 now keep separate id names over a shared pool so the shallow path's flags are
 exactly what they were. Measure renumbering as its own change.
+
+### The one-sided kernel (`onesided/`, N = 64..512)
+
+`cube/` applies the balanced Kronecker split and pays two matmuls of about
+sqrt(N) on a side. `onesided/` instead does the whole transform as one dense
+product `Y = X * H_N`. That costs sqrt(N)/2 times as many MACs -- 8x at N=256 --
+and buys a tile body that touches each pipe exactly ONCE:
+
+```
+GM --MTE2--> L1 --MTE1--> L0A --M--> L0C --FIX--> GM
+```
+
+which is precisely what the two-sided tile cannot do. Its tile has to turn the
+intermediate around through L1 between the two multiplies, so it visits MTE1 and
+M twice and consecutive tiles serialize behind the second visit -- the effect
+measured above, where a tile costs 340 ns on a core with a short run against
+91 ns on a long one. On the cube a fp16 matmul is nearly free beside the data
+movement, so trading MACs for a straight pipe is the right side of the trade
+while N is small.
+
+Measured, paired over 3 interleaved passes, with each kernel's own `block_dim`
+schedule. Ratios above 1.0 mean the one-sided kernel is faster:
+
+| N | batch | bd | one-sided us | GB/s | vector | vs vector | two-sided | vs two-sided |
+|---:|------:|---:|-------------:|-----:|-------:|----------:|----------:|-------------:|
+|  64 |   256 |  3 |   1.90 |   34 |   3.25 |  1.71x | n/a | -- |
+|  64 |  1024 |  6 |   2.02 |  130 |   4.00 |  1.98x | n/a | -- |
+|  64 |  8192 | 16 |   2.74 |  765 |  10.67 |  3.89x | n/a | -- |
+|  64 | 65536 | 24 |   5.51 | 3045 |  63.14 | **11.46x** | n/a | -- |
+| 128 |   256 |  6 |   2.36 |   56 |   3.29 |  1.39x | n/a | -- |
+| 128 |  1024 | 11 |   2.66 |  197 |   4.19 |  1.58x | n/a | -- |
+| 128 |  8192 | 24 |   3.90 | 1076 |  12.73 |  3.26x | n/a | -- |
+| 128 | 65536 | 24 |  10.24 | 3277 |  79.27 |  7.74x | n/a | -- |
+| 256 |   256 |  8 |   3.26 |   80 |   3.38 |  1.04x |  6.88 | **2.11x** |
+| 256 |  1024 | 16 |   3.86 |  272 |   4.06 |  1.05x | 12.16 | **3.15x** |
+| 256 |  8192 | 24 |   8.36 | 1003 |  12.74 |  1.52x | 20.12 | **2.41x** |
+| 256 | 65536 | 24 |  39.63 | 1693 |  81.34 |  2.05x | 42.78 | 1.08x |
+| 512 |   256 |  8 |   6.26 |   84 |   3.66 |  0.58x | 12.08 | 1.93x |
+| 512 |  1024 | 16 |   7.04 |  298 |   5.47 |  0.78x | 17.10 | 2.43x |
+| 512 |  8192 | 24 |  31.12 |  539 |  21.57 |  0.69x | 29.03 | 0.93x |
+| 512 | 65536 | 24 | 208.58 |  644 | 149.29 |  0.72x | 112.72 | 0.54x |
+
+Faster than the vector kernel at **all 12 shapes with `N <= 256`**, geometric mean
+**2.35x**, up to 11.46x. It also adds N=64 and N=128 to the cube path, which the
+two-sided split cannot reach at all (it needs `N = R * C` with both factors
+16-aligned, so `N >= 256`). And at N=256 it is 1.08x to 3.15x faster than the
+two-sided kernel -- exactly the weak case diagnosed above: `N=256` batch 1024
+goes from 0.66x of the vector kernel to 1.05x.
+
+The GB/s column exceeds HBM at the small sizes because at those batches the
+whole working set is L2-resident (N=64 batch 65536 is 16.8 MB). Both arms read
+the same data, so the comparison is unaffected.
+
+It is also the most accurate of the three: fp32 accumulation rounded to fp16
+exactly ONCE, measured 2.16e-4 worst relative RMS against an exact fp64
+transform, against ~3.0e-4 for the two-sided split (two roundings) and 6.3e-4 to
+8.4e-4 for the vector butterfly (`log2(N)` roundings).
+
+**Where it stops paying, and why 512 is the ceiling.** All of H is read once per
+tile, so H's L1->L0B traffic per sample is `N*N*2 / S` bytes against `4*N` bytes
+of HBM traffic for X and Y. With `S*N` fixed by L0C capacity that ratio grows as
+`N^2`, giving three regimes:
+
+| N | H size | where H lives | H traffic vs data | result |
+|---:|-------:|---|---|---|
+| <= 128 | <= 32 KB | **L0B, for the whole kernel** | zero | 1.4x - 11.5x vs vector |
+| 256 | 128 KB | L1 (too big for L0B's 64 KB) | ~1:1 | 1.0x - 2.1x vs vector |
+| 512 | 512 KB | nowhere -- it IS all of L1, so it streams from GM per tile | ~4:1 | 0.6x - 0.8x vs vector |
+
+That ratio is also why the two sizes want different tile heights, which is the
+one tuning decision here that does not generalise across `N`. Doubling the tile
+halves H's per-sample traffic but costs the second L0C accumulator: at N=512,
+where H traffic is 4:1, it is worth **1.57x - 1.90x**; at N=256, where it is only
+~1:1, the same change **loses** 0.84x - 0.99x. So `PTO_OS_S512` is 64 while
+`PTO_OS_S256` stays at 16384/256. `S * N = 32768` fills L0C, so N=512 is already
+at the tallest tile the part allows and 4:1 is its floor.
+
+So N=512 is supported but is not the right kernel there: prefer the vector kernel
+at N=512, except below ~1024 batch where this one is still 1.9x - 2.4x faster
+than `cube/`. A noop-floor probe (`PTO_OS_NOMM=1`,
+matmuls deleted, every transfer kept) confirms the mechanism rather than
+assuming it -- the matmuls are **0%** of N=512's time and 7-8% of N=256's, so
+both are purely movement-bound and no amount of overlapping the chunk moves with
+the matmuls can help. That is also why the chunk-level double buffering is
+allocated but deliberately left unexploited: the probe says there is nothing
+there to win. At N=64/128 the matmuls are 6-33%, and those sizes keep H resident
+so they have no chunk loop at all.
+
+Guidance, by `N`:
+
+| N | use |
+|---:|---|
+| 64, 128 | `onesided/` |
+| 256 | `onesided/` |
+| 512 | `standard/` (vector); `onesided/` below ~1024 batch, `cube/` above ~8192 |
+| >= 1024 | `cube/` (two-sided) |
+
+**One gotcha worth recording**, because it is the flip side of the whole design.
+The straight-pipe body has no edge holding MTE1 back, so MTE1 runs ahead by
+slots and tile `i+2`'s `TMOV` lands on the L0A slot tile `i`'s `TMATMUL` is still
+reading. The two-sided kernel gets that WAR protection for free from its own L1
+turnaround; here it has to be an explicit `M -> MTE1` flag per slot. Without it
+the kernel faults, at a shape that moves between runs. A second instance of the
+same class: staging an H chunk with the generic `Sync<PIPE_MTE2, PIPE_MTE1>()`
+helper, whose id 0 collides with `EV_X0` on that very pipe pair -- only the
+streamed-H case runs that Sync inside the tile loop, so it corrupted the X ring's
+credits at N=512 and nowhere else.
+
+Compile-time switches are documented at the top of the kernel;
+`onesided/build_variant.sh` builds one combination and
+`onesided/validate_variant.py` checks a prebuilt variant against the exact fp64
+reference over 168 cases. Validate before timing: a switch that computes the
+wrong answer is a broken lever, not a slow technique.
 
 The cube path is also the more accurate of the two: it accumulates in fp32 and
 rounds to fp16 twice instead of `log2(N)` times, which measures a relative RMS

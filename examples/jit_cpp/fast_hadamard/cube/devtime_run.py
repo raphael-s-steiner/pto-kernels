@@ -15,6 +15,7 @@ import torch
 import torch_npu  # noqa: F401
 
 from cube.jit_util_hadamard_cube import hadamard_factors
+from onesided.jit_util_hadamard_onesided import hadamard_full
 from jit_util_common import get_current_stream_ptr, load_cdll, load_required_symbol
 
 BASE = pathlib.Path(__file__).resolve().parents[1]
@@ -26,6 +27,10 @@ CUBE_ARGS = [
 STD_ARGS = [
     ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p,
     ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+]
+ONESIDED_ARGS = [
+    ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
 ]
 
 _LIBS: dict = {}
@@ -57,7 +62,13 @@ def main():
         # config -- but never inside the timed loop, which has no torch ops.
         stream_ptr = get_current_stream_ptr()
 
-        if kind == "cube":
+        if kind == "onesided":
+            fn = kernel_for(so, ONESIDED_ARGS)
+            h = hadamard_full(n, x.device)
+            args = (block_dim, stream_ptr,
+                    ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(y.data_ptr()),
+                    ctypes.c_void_p(h.data_ptr()), batch, n)
+        elif kind == "cube":
             fn = kernel_for(so, CUBE_ARGS)
             h_left, h_right = hadamard_factors(n, x.device)
             args = (block_dim, stream_ptr,
