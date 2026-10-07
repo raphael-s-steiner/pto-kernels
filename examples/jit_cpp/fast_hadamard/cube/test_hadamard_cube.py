@@ -1,0 +1,193 @@
+import math
+
+import pytest
+import torch
+
+from cube.jit_util_hadamard_cube import (
+    MAX_CUBE_HADAMARD_N,
+    MIN_CUBE_HADAMARD_N,
+    validate_cube_hadamard_args,
+)
+
+TEST_BATCHES = [1, 7, 22, 65]
+TEST_HIDDEN_DIMS = [256, 512, 1024, 2048, 4096, 8192, 16384]
+TEST_SEEDS = [0, 1]
+TILE_BOUNDARY_HIDDEN_DIMS = [256, 1024, 4096]
+TILE_BOUNDARY_BATCHES = [1, 2, 3, 31, 32, 33, 47, 64, 65]
+DTYPE = torch.float16
+
+# The cube kernel accumulates in fp32 and rounds to fp16 only twice (once per
+# TMATMUL), so it does not reproduce the staged-fp16 reference bit for bit and
+# is compared against an exact float64 transform instead. Measured worst case
+# over the grid below is 3.0e-4 relative RMS and 2.4e-3 for the worst element,
+# both relative to the output RMS; the tolerances keep 3-4x of margin.
+REL_RMS_TOL = 1e-3
+MAX_ELEMENT_TOL = 1e-2
+
+
+def fwht_f64(x):
+    """Exact natural-order (Sylvester) Walsh-Hadamard transform in float64.
+
+    Everything runs on the host: the NPU has no float64 and silently falls
+    back to float32 for it.
+    """
+    a = x.cpu().double().clone()
+    b, n = a.shape
+    h = 1
+    while h < n:
+        a = a.reshape(b, n // (2 * h), 2, h)
+        u = a[:, :, 0, :].clone()
+        v = a[:, :, 1, :].clone()
+        a = torch.stack((u + v, u - v), dim=2).reshape(b, n)
+        h *= 2
+    return a
+
+
+def hadamard_ref_inplace(x):
+    """Reference FHT with the same stage layout as the PTO vector kernel."""
+    x = x.clone()
+    n = x.shape[-1]
+    n_half = n // 2
+    log2_n = int(math.log2(n))
+
+    for _ in range(log2_n):
+        even = x[..., 0::2].clone()
+        odd = x[..., 1::2].clone()
+        x[..., :n_half] = even + odd
+        x[..., n_half:] = even - odd
+    return x
+
+
+def relative_errors(actual, exact):
+    """(relative RMS, worst element) of `actual`, both scaled by the exact RMS."""
+    rms = exact.pow(2).mean().sqrt()
+    diff = actual - exact
+    return (
+        (diff.pow(2).mean().sqrt() / rms).item(),
+        (diff.abs().max() / rms).item(),
+    )
+
+
+def run_cube_hadamard(cube_hadamard_kernel, x):
+    y = torch.empty_like(x)
+    cube_hadamard_kernel(x, y)
+    torch.npu.synchronize()
+    return y
+
+
+def assert_matches_exact(y, x_cpu, context):
+    actual = y.cpu().double()
+    assert torch.isfinite(actual).all(), f"non-finite output for {context}"
+    if actual.numel() == 0:
+        return
+
+    exact = fwht_f64(x_cpu)
+    rel_rms, max_element = relative_errors(actual, exact)
+    assert rel_rms <= REL_RMS_TOL, (
+        f"relative RMS {rel_rms:.3e} exceeds {REL_RMS_TOL:.1e} for {context}"
+    )
+    assert max_element <= MAX_ELEMENT_TOL, (
+        f"worst element {max_element:.3e} exceeds {MAX_ELEMENT_TOL:.1e} "
+        f"for {context}"
+    )
+
+
+def check_shape(cube_hadamard_kernel, npu_device, batch, n, seed=0):
+    torch.manual_seed(seed)
+    x_cpu = torch.randn(batch, n, dtype=DTYPE)
+    y = run_cube_hadamard(cube_hadamard_kernel, x_cpu.to(npu_device))
+    assert_matches_exact(y, x_cpu, f"seed={seed}, batch={batch}, N={n}")
+
+
+@pytest.mark.parametrize("seed", TEST_SEEDS)
+@pytest.mark.parametrize("batch", TEST_BATCHES)
+@pytest.mark.parametrize("n", TEST_HIDDEN_DIMS)
+def test_cube_hadamard_correctness(cube_hadamard_kernel, npu_device, seed, batch, n):
+    check_shape(cube_hadamard_kernel, npu_device, batch, n, seed=seed)
+
+
+@pytest.mark.parametrize("n", TILE_BOUNDARY_HIDDEN_DIMS)
+def test_sample_tile_boundaries(cube_hadamard_kernel, npu_device, n):
+    """The kernel halves its sample tile on the way down, so straddle the sizes."""
+    for batch in TILE_BOUNDARY_BATCHES:
+        check_shape(cube_hadamard_kernel, npu_device, batch, n)
+
+
+def test_batch_partition_boundaries(cube_hadamard_kernel, npu_device):
+    n = 1024
+    cores = cube_hadamard_kernel.block_dim
+    batches = sorted({0, 1, cores - 1, cores, cores + 1, 2 * cores, 2 * cores + 1})
+
+    for batch in batches:
+        check_shape(cube_hadamard_kernel, npu_device, batch, n)
+
+
+@pytest.mark.parametrize("n", [256, 4096])
+def test_input_is_not_modified(cube_hadamard_kernel, npu_device, n):
+    torch.manual_seed(0)
+    x_cpu = torch.randn(9, n, dtype=DTYPE)
+    x = x_cpu.to(npu_device)
+
+    run_cube_hadamard(cube_hadamard_kernel, x)
+
+    assert torch.equal(x.cpu(), x_cpu), f"kernel modified its input for N={n}"
+
+
+@pytest.mark.parametrize("n", [1024, 4096])
+def test_more_accurate_than_staged_fp16(cube_hadamard_kernel, npu_device, n):
+    """Rounding twice instead of log2(N) times is the point of the cube path."""
+    torch.manual_seed(0)
+    x_cpu = torch.randn(16, n, dtype=DTYPE)
+    exact = fwht_f64(x_cpu)
+
+    y = run_cube_hadamard(cube_hadamard_kernel, x_cpu.to(npu_device))
+
+    cube_rel_rms, _ = relative_errors(y.cpu().double(), exact)
+    staged_rel_rms, _ = relative_errors(hadamard_ref_inplace(x_cpu).double(), exact)
+    assert cube_rel_rms <= staged_rel_rms, (
+        f"cube relative RMS {cube_rel_rms:.3e} is worse than the staged fp16 "
+        f"reference {staged_rel_rms:.3e} for N={n}"
+    )
+
+
+@pytest.mark.parametrize("n", [MIN_CUBE_HADAMARD_N // 2, MAX_CUBE_HADAMARD_N * 2])
+def test_out_of_range_n_rejected(npu_device, n):
+    x = torch.randn(2, n, device=npu_device, dtype=DTYPE)
+    y = torch.empty_like(x)
+
+    with pytest.raises(ValueError, match="n must be in"):
+        validate_cube_hadamard_args(x, y)
+
+
+def test_non_power_of_two_n_rejected(npu_device):
+    x = torch.randn(2, 192, device=npu_device, dtype=DTYPE)
+    y = torch.empty_like(x)
+
+    with pytest.raises(ValueError, match="power of two"):
+        validate_cube_hadamard_args(x, y)
+
+
+def test_wrong_dtype_rejected(npu_device):
+    x = torch.randn(2, 1024, device=npu_device, dtype=torch.float32)
+    y = torch.empty_like(x)
+
+    with pytest.raises(TypeError, match="torch.float16"):
+        validate_cube_hadamard_args(x, y)
+
+
+def test_noncontiguous_input_rejected(npu_device):
+    x = torch.randn(1024, 5, device=npu_device, dtype=DTYPE).transpose(0, 1)
+    y = torch.empty(5, 1024, device=npu_device, dtype=DTYPE)
+    assert x.shape == y.shape
+    assert not x.is_contiguous()
+
+    with pytest.raises(ValueError, match="contiguous"):
+        validate_cube_hadamard_args(x, y)
+
+
+def test_shape_mismatch_rejected(npu_device):
+    x = torch.randn(2, 1024, device=npu_device, dtype=DTYPE)
+    y = torch.empty(3, 1024, device=npu_device, dtype=DTYPE)
+
+    with pytest.raises(ValueError, match="matching shapes"):
+        validate_cube_hadamard_args(x, y)

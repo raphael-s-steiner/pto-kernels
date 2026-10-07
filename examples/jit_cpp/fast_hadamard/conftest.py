@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from cube.jit_util_hadamard_cube import jit_compile as jit_compile_cube
 from jit_util_common import normalize_npu_device
 from standard.jit_util_hadamard import jit_compile
 
@@ -32,3 +33,10 @@ def hadamard_kernel(npu_device):
     base = Path(__file__).resolve().parent
     src = base / "standard" / "fast_hadamard.cpp"
     return jit_compile(str(src), verbose=True, device=npu_device)
+
+
+@pytest.fixture(scope="session")
+def cube_hadamard_kernel(npu_device):
+    base = Path(__file__).resolve().parent
+    src = base / "cube" / "fast_hadamard_cube.cpp"
+    return jit_compile_cube(str(src), verbose=True, device=npu_device)
