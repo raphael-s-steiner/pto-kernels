@@ -4,7 +4,8 @@
 
 - `standard/`: plain Hadamard kernel, benchmark, plot, and test files
 - `cube/`: cube-unit (matmul) Hadamard kernel, benchmark, plot, and test files
-- `onesided/`: cube-unit Hadamard as a SINGLE dense product `Y = X * H_N`, for
+- `onesided/`: cube-unit Hadamard as a single right-multiplication `Y = X * H_N`,
+  with `H_N = H_B (x) H_M` applied as fixed-size matmuls accumulated in L0C, for
   `N` in 64..512 -- benchmark, plot, and test files
 - `fuse_int8_quant/`: int8 quantize and fused Hadamard+int8 quant files
 - `fuse_int4_quant/`: int4 quantize and fused Hadamard+int4 quant files
@@ -29,7 +30,7 @@ python test.py --list
 python benchmark.py --target standard --npu 0
 # cube-unit Hadamard, also timed against the standard vector kernel
 python benchmark.py --target cube --npu 0
-# one-sided (single dense matmul) Hadamard over N in {64, 128, 256, 512}, timed
+# one-sided (blocked right-multiply) Hadamard over N in {64, 128, 256, 512}, timed
 # against the vector kernel and, where N >= 256, the two-sided cube kernel
 python benchmark.py --target onesided --npu 0
 python benchmark.py --target quantize_int8 --npu 0
@@ -166,9 +167,10 @@ batch 65536. Geometric mean over the 18 shapes above is 1.42x.
 balanced split makes both Hadamard factors 16x16, so a tile is only 32 samples
 and a given batch yields the fewest tiles of any size -- which turned out to be
 exactly the problem. See **Why N=256 is the weak case** below. The alternative
-for small `N` is a single dense `Y = X * H_N` product, which trades 8x the FLOPs
-for far fewer descriptors; it is not implemented here because it is no longer
-the two-sided split this kernel is about.
+for small `N` is the one-sided `Y = X * H_N` product, which trades 8x the FLOPs
+for a tile body that touches each pipe once; that lives in `onesided/` rather
+than here, because it is no longer the two-sided split this kernel is about, and
+it is 1.25x - 2.44x faster than this kernel at every `N <= 512`.
 
 ### Why N=256 is the weak case
 
@@ -283,9 +285,9 @@ exactly what they were. Measure renumbering as its own change.
 ### The one-sided kernel (`onesided/`, N = 64..512)
 
 `cube/` applies the balanced Kronecker split and pays two matmuls of about
-sqrt(N) on a side. `onesided/` instead does the whole transform as one dense
-product `Y = X * H_N`. That costs sqrt(N)/2 times as many MACs -- 8x at N=256 --
-and buys a tile body that touches each pipe exactly ONCE:
+sqrt(N) on a side. `onesided/` instead applies `H_N` from the right only, which
+costs `N*N` MACs per sample -- sqrt(N)/2 times as many, 8x at N=256 -- and buys a
+tile body that touches each pipe exactly ONCE:
 
 ```
 GM --MTE2--> L1 --MTE1--> L0A --M--> L0C --FIX--> GM
@@ -295,88 +297,155 @@ which is precisely what the two-sided tile cannot do. Its tile has to turn the
 intermediate around through L1 between the two multiplies, so it visits MTE1 and
 M twice and consecutive tiles serialize behind the second visit -- the effect
 measured above, where a tile costs 340 ns on a core with a short run against
-91 ns on a long one. On the cube a fp16 matmul is nearly free beside the data
-movement, so trading MACs for a straight pipe is the right side of the trade
-while N is small.
+91 ns on a long one. On the cube a fp16 matmul is cheap beside the data
+movement, so trading MACs for a straight pipe is the right side of that trade.
 
-Measured, paired over 3 interleaved passes, with each kernel's own `block_dim`
+#### `H_N` is never materialised: the butterfly, done in the accumulator
+
+Applying `H_N` as one dense `N x N` right operand is what used to cap this
+kernel at 512, because all of H has to be read once per tile. Instead the kernel
+takes the vector butterfly's idea -- a Kronecker factorization applied in stages
+-- and restricts the matmul to a fixed efficient size. With `N = B*M` and
+`H_N = H_B (x) H_M`, blocking the product by M columns gives
+
+```
+Y[:, jM:(j+1)M] = sum_i  X[:, iM:(i+1)M] * (H_B[i,j] * H_M)
+```
+
+and `H_B[i,j]` is `+-1`, so **the only right operands that ever occur are `+H_M`
+and `-H_M`**. Both sit in L0B for the whole kernel at 16 KB total, loaded once
+per core, and `TMATMUL_ACC` sums the B partial products of each output block
+*in the L0C accumulator* -- which is the cube's version of what the vector core
+does across its `log2(N)` stages, at zero traffic. `H_B` is never built or read:
+`H_B[i,j] = (-1)^popcount(i & j)`, computed from the loop indices.
+
+The arithmetic is identical to the dense form (`B*B` matmuls of `S x M` by
+`M x M` is the same `S*N*N` MACs), the rounding is identical (fp32 accumulation,
+one fp16 store), and `B == 1` degenerates exactly to the dense single matmul --
+which is why `N <= 128` is untouched by this.
+
+Measured, paired over 3 interleaved passes, each kernel with its own `block_dim`
 schedule. Ratios above 1.0 mean the one-sided kernel is faster:
 
-| N | batch | bd | one-sided us | GB/s | vector | vs vector | two-sided | vs two-sided |
-|---:|------:|---:|-------------:|-----:|-------:|----------:|----------:|-------------:|
-|  64 |   256 |  3 |   1.90 |   34 |   3.25 |  1.71x | n/a | -- |
-|  64 |  1024 |  6 |   2.02 |  130 |   4.00 |  1.98x | n/a | -- |
-|  64 |  8192 | 16 |   2.74 |  765 |  10.67 |  3.89x | n/a | -- |
-|  64 | 65536 | 24 |   5.51 | 3045 |  63.14 | **11.46x** | n/a | -- |
-| 128 |   256 |  6 |   2.36 |   56 |   3.29 |  1.39x | n/a | -- |
-| 128 |  1024 | 11 |   2.66 |  197 |   4.19 |  1.58x | n/a | -- |
-| 128 |  8192 | 24 |   3.90 | 1076 |  12.73 |  3.26x | n/a | -- |
-| 128 | 65536 | 24 |  10.24 | 3277 |  79.27 |  7.74x | n/a | -- |
-| 256 |   256 |  8 |   3.26 |   80 |   3.38 |  1.04x |  6.88 | **2.11x** |
-| 256 |  1024 | 16 |   3.86 |  272 |   4.06 |  1.05x | 12.16 | **3.15x** |
-| 256 |  8192 | 24 |   8.36 | 1003 |  12.74 |  1.52x | 20.12 | **2.41x** |
-| 256 | 65536 | 24 |  39.63 | 1693 |  81.34 |  2.05x | 42.78 | 1.08x |
-| 512 |   256 |  8 |   6.26 |   84 |   3.66 |  0.58x | 12.08 | 1.93x |
-| 512 |  1024 | 16 |   7.04 |  298 |   5.47 |  0.78x | 17.10 | 2.43x |
-| 512 |  8192 | 24 |  31.12 |  539 |  21.57 |  0.69x | 29.03 | 0.93x |
-| 512 | 65536 | 24 | 208.58 |  644 | 149.29 |  0.72x | 112.72 | 0.54x |
+| N | batch | one-sided us | GB/s | vector | vs vector | two-sided | vs two-sided |
+|---:|------:|-------------:|-----:|-------:|----------:|----------:|-------------:|
+|  64 |    64 |   1.49 |   11 |   3.06 |  2.05x | n/a | -- |
+|  64 |  1024 |   2.04 |  129 |   3.99 |  1.96x | n/a | -- |
+|  64 |  8192 |   2.74 |  765 |  10.60 |  3.87x | n/a | -- |
+|  64 | 65536 |   5.52 | 3039 |  63.12 | **11.44x** | n/a | -- |
+| 128 |    64 |   1.92 |   17 |   3.11 |  1.62x | n/a | -- |
+| 128 |  1024 |   2.62 |  200 |   4.19 |  1.60x | n/a | -- |
+| 128 |  8192 |   3.87 | 1084 |  12.65 |  3.27x | n/a | -- |
+| 128 | 65536 |  10.20 | 3290 |  79.26 |  7.77x | n/a | -- |
+| 256 |    64 |   1.97 |   33 |   3.10 |  1.57x |  2.47 | 1.25x |
+| 256 |  1024 |   2.89 |  363 |   4.14 |  1.43x |  5.80 | **2.01x** |
+| 256 |  8192 |   5.74 | 1461 |  12.68 |  2.21x | 13.85 | **2.41x** |
+| 256 | 65536 |  27.08 | 2478 |  81.29 |  3.00x | 39.21 | 1.45x |
+| 512 |    64 |   2.38 |   55 |   3.26 |  1.37x |  3.62 | 1.52x |
+| 512 |  1024 |   4.32 |  485 |   5.52 |  1.28x | 10.54 | **2.44x** |
+| 512 |  8192 |  15.13 | 1108 |  21.62 |  1.43x | 27.72 | 1.83x |
+| 512 | 65536 |  99.88 | 1343 | 149.34 |  1.50x | 111.33 | 1.11x |
 
-Faster than the vector kernel at **all 12 shapes with `N <= 256`**, geometric mean
-**2.35x**, up to 11.46x. It also adds N=64 and N=128 to the cube path, which the
-two-sided split cannot reach at all (it needs `N = R * C` with both factors
-16-aligned, so `N >= 256`). And at N=256 it is 1.08x to 3.15x faster than the
-two-sided kernel -- exactly the weak case diagnosed above: `N=256` batch 1024
-goes from 0.66x of the vector kernel to 1.05x.
+**Faster than the vector kernel at every one of the 16 shapes** (geometric mean
+2.31x, up to 11.44x) and faster than the two-sided kernel at every shape they
+share (geomean 1.69x). N=512 is the size that changed: it was 0.58x - 0.78x of
+the vector kernel and 0.54x of the two-sided one, and is now 1.28x - 1.50x and
+1.11x - 2.44x. The kernel also covers N=64 and N=128, which the two-sided split
+cannot reach at all (it needs `N = R * C` with both factors 16-aligned).
 
-The GB/s column exceeds HBM at the small sizes because at those batches the
-whole working set is L2-resident (N=64 batch 65536 is 16.8 MB). Both arms read
-the same data, so the comparison is unaffected.
+Against the previous dense-H version of this same kernel, paired with the tile
+geometry and `block_dim` retune the change licensed: **1.33x - 1.56x at N=256,
+1.64x - 2.55x at N=512**, 0.98x - 1.02x at `N <= 128` (no regression beyond 2%
+at any shape; a null control -- the same `.so` under two names -- read 1.00x).
+
+The GB/s column exceeds HBM at the small sizes because the working set is then
+L2-resident (N=64 batch 65536 is 16.8 MB). Both arms read the same data.
 
 It is also the most accurate of the three: fp32 accumulation rounded to fp16
 exactly ONCE, measured 2.16e-4 worst relative RMS against an exact fp64
-transform, against ~3.0e-4 for the two-sided split (two roundings) and 6.3e-4 to
-8.4e-4 for the vector butterfly (`log2(N)` roundings).
+transform, against ~2.9e-4 for the two-sided split (two roundings) and 6.3e-4 to
+8.4e-4 for the vector butterfly (`log2(N)` roundings). Blocking does not cost
+accuracy: products of fp16 values accumulate exactly in fp32 here, so the
+blocked and dense forms agree to every digit measured.
 
-**Where it stops paying, and why 512 is the ceiling.** All of H is read once per
-tile, so H's L1->L0B traffic per sample is `N*N*2 / S` bytes against `4*N` bytes
-of HBM traffic for X and Y. With `S*N` fixed by L0C capacity that ratio grows as
-`N^2`, giving three regimes:
+#### What capped it before, and what caps it now
 
-| N | H size | where H lives | H traffic vs data | result |
+The dense form reads all of H once per tile, so H's L1->L0B traffic per sample is
+`N*N*2 / S` bytes against `4*N` bytes of HBM traffic for X and Y. With `S*N`
+fixed by L0C capacity that ratio grows as `N^2`:
+
+| N | dense H | where it had to live | H traffic vs data | dense result |
 |---:|-------:|---|---|---|
-| <= 128 | <= 32 KB | **L0B, for the whole kernel** | zero | 1.4x - 11.5x vs vector |
+| <= 128 | <= 32 KB | **L0B, whole kernel** | zero | 1.6x - 11.4x vs vector |
 | 256 | 128 KB | L1 (too big for L0B's 64 KB) | ~1:1 | 1.0x - 2.1x vs vector |
-| 512 | 512 KB | nowhere -- it IS all of L1, so it streams from GM per tile | ~4:1 | 0.6x - 0.8x vs vector |
+| 512 | 512 KB | nowhere -- it IS all of L1, so GM per tile | ~4:1 | 0.6x - 0.8x vs vector |
 
-That ratio is also why the two sizes want different tile heights, which is the
-one tuning decision here that does not generalise across `N`. Doubling the tile
-halves H's per-sample traffic but costs the second L0C accumulator: at N=512,
-where H traffic is 4:1, it is worth **1.57x - 1.90x**; at N=256, where it is only
-~1:1, the same change **loses** 0.84x - 0.99x. So `PTO_OS_S512` is 64 while
-`PTO_OS_S256` stays at 16384/256. `S * N = 32768` fills L0C, so N=512 is already
-at the tallest tile the part allows and 4:1 is its floor.
+The blocked form deletes that whole column: `+-H_M` is 16 KB at every N. What
+binds instead is arithmetic. A noop-matmul probe (`PTO_OS_NOMM=1`, matmuls
+deleted, every transfer and handshake kept) says so directly -- dropping the
+matmuls is **3.96x** faster at N=512 batch 65536 and 2.34x at N=256, where
+before the change the same probe read 0% and 7-8%. The kernel moved from
+movement-bound to compute-bound, which is the intended direction: the bound it
+now sits against is `N*N` MACs per sample, not a buffer size.
 
-So N=512 is supported but is not the right kernel there: prefer the vector kernel
-at N=512, except below ~1024 batch where this one is still 1.9x - 2.4x faster
-than `cube/`. A noop-floor probe (`PTO_OS_NOMM=1`,
-matmuls deleted, every transfer kept) confirms the mechanism rather than
-assuming it -- the matmuls are **0%** of N=512's time and 7-8% of N=256's, so
-both are purely movement-bound and no amount of overlapping the chunk moves with
-the matmuls can help. That is also why the chunk-level double buffering is
-allocated but deliberately left unexploited: the probe says there is nothing
-there to win. At N=64/128 the matmuls are 6-33%, and those sizes keep H resident
-so they have no chunk loop at all.
+**That makes 512 a compute crossover rather than a capacity limit.**
+`PTO_OS_BIG=1` compiles N=1024 and 2048, which the blocked form computes
+correctly and the dense form could never attempt (H would be 2 MB and 8 MB).
+They are off by default because the MACs grow 4x per doubling while the bytes
+only double, and measurement agrees:
 
-Guidance, by `N`:
+| N | batch | one-sided us | two-sided us | vector us | verdict |
+|---:|------:|-------------:|-------------:|----------:|---|
+| 1024 |  1024 |   9.56 |  5.71 |  13.54 | two-sided 1.7x |
+| 1024 |  8192 |  52.77 | 26.53 |  84.35 | two-sided 2.0x |
+| 2048 |  1024 |  31.50 |  8.04 |  26.13 | two-sided 3.9x; loses to vector too |
+| 2048 |  8192 | 214.90 | 45.94 | 181.96 | two-sided 4.7x; loses to vector too |
+
+So the guidance is now simple, which it was not before:
 
 | N | use |
 |---:|---|
-| 64, 128 | `onesided/` |
-| 256 | `onesided/` |
-| 512 | `standard/` (vector); `onesided/` below ~1024 batch, `cube/` above ~8192 |
+| 64 .. 512 | `onesided/` |
 | >= 1024 | `cube/` (two-sided) |
 
-**One gotcha worth recording**, because it is the flip side of the whole design.
+#### Two tuning decisions that inverted, and are worth the warning
+
+Both had been measured, were correct, and stopped being correct when the
+bottleneck moved. Neither would have been caught by re-running the old A/B.
+
+**Tile height.** The tall tile at N=512 (`PTO_OS_S512 = 64`) was justified
+*solely* by halving H's per-tile traffic, and was worth 1.57x - 1.90x on that
+basis. With H traffic at zero the justification is gone and the smaller tile's
+deeper buffering wins instead: `S512` goes 64 -> **16** (1.24x at batch 65536)
+and `S256` goes 64 -> **32**. `S256 = 16` is a cliff, not a continuation
+(40.8 us against 27.1 at batch 65536).
+
+**Block size M.** The argument for `M = 128` is that it is the largest that fits
+L0B and that `B*B` matmuls shrink as `B = N/M` falls, so it issues the fewest.
+That argument is wrong:
+
+| N | batch | M=32 | M=64 | M=128 |
+|---:|------:|-----:|-----:|------:|
+| 512 | 65536 | 300.5 | **99.9** | 123.8 |
+| 256 | 65536 |  40.8 | **27.2** |  27.8 |
+
+`M = 64` is 3.01x over M=32 and 1.24x over M=128. Fewer and larger matmuls is
+the wrong objective; what matters is that the `S x M` L0A slice stays small
+enough to double-buffer deeply.
+
+The `block_dim` schedule was refitted for the same reason -- `k` went
+(8, 16, 16, 16) to (7.51, 7.23, 7.51, 22.57). **Sweep every integer `block_dim`,
+not a subset.** A first fit over `{1,2,3,4,6,8,12,16,20,24}` picked constants
+that emit `bd = 15` and `23`, values it had never measured, and scored them
+against their nearest neighbour. It reported 1.013x - 1.031x worst regret; the
+real cost at N=64 batch 8192 was 1.12x, because 32 tiles divide evenly over 16
+cores and badly over 15. Refitted over all 24 values: worst regret 1.000x -
+1.041x, against 1.18x - 1.21x for a constant 24.
+
+#### Three gotchas worth recording
+
+**The straight pipe needs WAR flags the turnaround body got for free** -- the
+flip side of the whole design.
 The straight-pipe body has no edge holding MTE1 back, so MTE1 runs ahead by
 slots and tile `i+2`'s `TMOV` lands on the L0A slot tile `i`'s `TMATMUL` is still
 reading. The two-sided kernel gets that WAR protection for free from its own L1
@@ -387,13 +456,28 @@ helper, whose id 0 collides with `EV_X0` on that very pipe pair -- only the
 streamed-H case runs that Sync inside the tile loop, so it corrupted the X ring's
 credits at N=512 and nowhere else.
 
+**A broken knob is not a rejected technique.** The first `M = 64` A/B computed
+garbage (relative RMS 1.41, i.e. uncorrelated), which reads like "small blocks
+don't work". It was a host/device disagreement: `PTO_OS_BLOCK` sets M in the
+kernel while `_BLOCK` in the wrapper decides which `+-H_M` to build, and only
+one of the two had been changed, so the kernel was multiplying by a wrong-sized
+operand. With both set, M=64 validates -- and then wins by 1.24x. The two are
+now coupled through one env override precisely so the A/B cannot drift again.
+
+**Evaluation order can race the operand buffer.** `hadamard_full` enqueues torch
+ops on a cache miss, and the raw ctypes launch is only ordered after them because
+`resolve_stream_ptr` drains torch_npu's async task queue first. Python evaluates
+call arguments left to right, so building H *inline after* the stream pointer
+enqueues those ops after the drain, and the kernel can read H before it is
+written: `Y = X * 0 = 0`, on the first call for each `n` only. Latent before this
+change and near-certain after it, because a `cat` of three pieces is a wider
+window than one `.to(device)`. Fixed by hoisting the lookup above the call, with
+a cache-clearing regression test -- the correctness sweep cannot catch it,
+because by then every `n` is warm.
+
 Compile-time switches are documented at the top of the kernel;
 `onesided/build_variant.sh` builds one combination and
 `onesided/validate_variant.py` checks a prebuilt variant against the exact fp64
-reference over 168 cases. Validate before timing: a switch that computes the
-wrong answer is a broken lever, not a slow technique.
-
-The cube path is also the more accurate of the two: it accumulates in fp32 and
-rounds to fp16 twice instead of `log2(N)` times, which measures a relative RMS
-error of 2.9e-4 against an exact fp64 reference, versus 6.3e-4 to 8.4e-4 for
-the vector kernel.
+reference over 168 cases (`onesided/bigcheck_variant.py` covers the
+`PTO_OS_BIG` sizes). Validate before timing: a switch that computes the wrong answer is a
+broken lever, not a slow technique.

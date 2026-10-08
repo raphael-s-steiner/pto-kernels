@@ -64,7 +64,7 @@ def main():
 
         if kind == "onesided":
             fn = kernel_for(so, ONESIDED_ARGS)
-            h = hadamard_full(n, x.device)
+            h = hadamard_full(n, x.device, cfg.get("block"))
             args = (block_dim, stream_ptr,
                     ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(y.data_ptr()),
                     ctypes.c_void_p(h.data_ptr()), batch, n)

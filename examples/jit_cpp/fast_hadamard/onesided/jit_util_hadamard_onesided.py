@@ -1,5 +1,6 @@
 import ctypes
 import math
+import os
 
 import torch
 
@@ -16,8 +17,10 @@ from jit_util_common import (
     torch_to_ctypes,
 )
 
-# Y = X * H_N as a single dense product. N must be 16-aligned for the cube, and
-# the ceiling is where H stops fitting near the matmul -- see the kernel header.
+# Y = X * H_N as a single right-multiplication, with H_N factored
+# H_B (x) H_M and applied as fixed-size M x M matmuls accumulated in L0C.
+# N must be 16-aligned for the cube. 512 is a COMPUTE crossover, not a capacity
+# limit -- see the kernel header and validate_onesided_hadamard_args.
 MIN_ONESIDED_N = 64
 MAX_ONESIDED_N = 512
 
@@ -29,31 +32,39 @@ MIN_ONESIDED_BATCH = 16
 _H_CACHE: dict = {}
 _PAD_CACHE: dict = {}
 
-# Samples per tile, mirroring FAST_HADAMARD_ONESIDED_CASES in the kernel:
-# S * N == PTO_OS_TILE_ELEMS, so two L0C accumulators fit 128 KB. Keep in step
-# with the kernel if PTO_OS_TILE_ELEMS or the case table changes.
-# N=512 runs a taller tile than TILE_ELEMS/N would give; see PTO_OS_S512.
+# Samples per tile, mirroring FAST_HADAMARD_ONESIDED_CASES in the kernel. Only
+# N <= 128 follows S * N == PTO_OS_TILE_ELEMS; 256 and 512 run the blocked form
+# and override it with a SMALLER tile (see PTO_OS_S512). Keep in step with the
+# kernel -- the tests import this to place their tile-boundary batches.
 _TILE_ELEMS = 16384
-_SAMPLES_PER_TILE = {64: 256, 128: 128, 256: 64, 512: 64}
+_SAMPLES_PER_TILE = {64: 256, 128: 128, 256: 32, 512: 16}
 
 # Same shape of schedule as the two-sided kernel: cores are only worth adding
 # while each still gets a tile run long enough to keep its pipes full, and
 # bd = sqrt(k * tiles) trades those off.
 #
-# Fitted per N from a block_dim sweep in msprof device time on 910B2, over
-# N x batch in {256, 1024, 8192, 65536}. Last column is what a constant 24
-# costs, i.e. what the schedule buys:
+# REFITTED for the blocked form. The old constants (8, 16, 16, 16) were fitted
+# when the kernel was movement-bound at N>=256 and ran a 2-4x taller tile; the
+# blocked form is matmul-bound there and tiles are smaller, so both the tile
+# count and the per-tile cost moved. Resweep this whenever the tile geometry or
+# PTO_OS_BLOCK changes -- it is calibration, not a rule.
 #
-#    N     k    worst regret   constant-24 worst
-#   64     8        1.033x           1.281x
-#  128    16        1.004x           1.144x
-#  256    16        1.028x           1.157x
-#  512    16        1.013x           1.077x
+# Fitted per N over EVERY integer block_dim in [1, 24] x batch in
+# {64, 256, 1024, 8192, 65536}, msprof device time on 910B2, 15 reps each.
+# Regret is against the best measured block_dim at that shape:
 #
-# The penalty for no schedule is much smaller than the two-sided kernel's 1.91x,
-# because this tile body touches each pipe once and so reaches steady state after
-# very few tiles -- it is far less sensitive to how thinly the work is spread.
-_TILE_RUN_K = {64: 8.0, 128: 16.0, 256: 16.0, 512: 16.0}
+#    N      k    worst regret   mean    constant-24 worst
+#   64    7.51      1.041x     1.012x        1.192x
+#  128    7.23      1.021x     1.006x        1.176x
+#  256    7.51      1.000x     1.000x        1.214x
+#  512   22.57      1.028x     1.014x        1.181x
+#
+# Sweep every integer, not a subset. A first fit over
+# {1,2,3,4,6,8,12,16,20,24} chose constants that emit bd = 15 and 23 -- values
+# it had never measured -- and scored them against their nearest neighbour. The
+# regret it reported was 1.013-1.031x; the real cost at N=64 batch 8192 was
+# 1.12x, because 32 tiles divide evenly over 16 cores and badly over 15.
+_TILE_RUN_K = {64: 7.51, 128: 7.23, 256: 7.51, 512: 22.57}
 # Only reached if the case table grows a size this table has not been fitted
 # for. Then it is an extrapolation -- sweep block_dim and add the entry.
 _DEFAULT_TILE_RUN_K = 8.0
@@ -79,20 +90,45 @@ def hadamard_matrix(size: int, device, dtype=torch.float16):
     return h.to(device=device, dtype=dtype).contiguous()
 
 
-def hadamard_full(n: int, device):
-    """Cached device copy of the whole H_n.
+# Block size M of the kernel's blocked-accumulation form, mirroring
+# PTO_OS_BLOCK. The buffer below carries +-H_M for it, so the two MUST agree:
+# a mismatch hands the kernel the wrong-sized operand and it computes garbage
+# (which is how the first M=64 A/B failed -- a host/device disagreement, not a
+# bad block size). The env override exists so that A/B can set both at once.
+_BLOCK = int(os.environ.get("PTO_OS_BLOCK", 64))
+
+
+def hadamard_operands(n: int, block: int | None = None) -> tuple[int, int]:
+    """(M, B) of the kernel's blocked form: H_n = H_B (x) H_M, M = min(64, n)."""
+    m = min(_BLOCK if block is None else int(block), n)
+    return m, n // m
+
+
+def hadamard_full(n: int, device, block: int | None = None):
+    """Cached device operand buffer: H_n, then H_M, then -H_M, flat.
 
     H_n is symmetric, so the kernel can use it as the right operand with no
     transpose, and row-major order makes each contraction chunk H[kc:kc+Kc, :]
     one contiguous descriptor whatever Kc the kernel picks.
 
+    The +-H_M pair at offset n*n is what the blocked form multiplies by: with
+    H_n = H_B (x) H_M those two are the only right operands it ever needs, since
+    H_B's entries are +-1 (see the kernel header). They are APPENDED rather than
+    substituted so a single host buffer feeds either form of the kernel, which
+    keeps the A/B between them a compile-time switch and nothing else. The tail
+    is 2*M*M <= 32768 halves whatever n is.
+
     Keyed on the torch device object directly: this sits on the per-call path,
     and stringifying the device costs more than the lookup it feeds.
     """
-    key = (n, device)
+    key = (n, device, block)
     cached = _H_CACHE.get(key)
     if cached is None:
-        cached = hadamard_matrix(n, device)
+        m, _ = hadamard_operands(n, block)
+        h_m = hadamard_matrix(m, device)
+        cached = torch.cat(
+            (hadamard_matrix(n, device).view(-1), h_m.view(-1), -h_m.view(-1))
+        ).contiguous()
         _H_CACHE[key] = cached
     return cached
 
@@ -126,9 +162,10 @@ def validate_onesided_hadamard_args(x, y):
     if n < MIN_ONESIDED_N or n > MAX_ONESIDED_N:
         raise ValueError(
             f"n must be in [{MIN_ONESIDED_N}, {MAX_ONESIDED_N}]; got {n}. "
-            "The one-sided product reads all of H per tile, so beyond 512 it "
-            "no longer fits near the matmul -- use the two-sided kernel in "
-            "cube/ instead."
+            "The one-sided product costs n*n MACs per sample however H is "
+            "factored, so past 512 the MACs grow 4x per doubling while the "
+            "bytes only double -- use the two-sided kernel in cube/, which is "
+            "1.7x faster at 1024 and 4.8x at 2048."
         )
     if n & (n - 1):
         raise ValueError(f"n must be a power of two; got {n}.")
@@ -189,12 +226,21 @@ def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE):
             else resolve_launch_block_dim(block_dim, resolved_block_dim)
         )
 
+        # Build H BEFORE resolving the stream pointer, and keep it on its own
+        # line. On a cache miss hadamard_full enqueues torch ops (host->device
+        # copies and a cat), while resolve_stream_ptr is what drains torch_npu's
+        # async task queue so this raw ctypes launch is ordered after them.
+        # Python evaluates call arguments left to right, so writing this inline
+        # after the stream pointer enqueues those ops AFTER the drain and the
+        # kernel can read H before it is written -- Y = X * 0 = 0, on the first
+        # call for each n only, which is exactly as intermittent as it sounds.
+        h = hadamard_full(resolved_n, x.device)
         kernel(
             launch_block_dim,
             resolve_stream_ptr(stream_ptr),
             torch_to_ctypes(x),
             torch_to_ctypes(y),
-            torch_to_ctypes(hadamard_full(resolved_n, x.device)),
+            torch_to_ctypes(h),
             resolved_batch,
             resolved_n,
         )

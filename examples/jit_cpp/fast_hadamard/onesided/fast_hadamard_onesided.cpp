@@ -4,8 +4,15 @@ using namespace pto;
 
 #define DIV_ROUNDUP(x, y) (((x) + (y) - 1) / (y))
 
-// One-sided Hadamard transform on the cube unit: Y = X * H_N, a single dense
-// matrix product with the whole N x N Hadamard matrix.
+// One-sided Hadamard transform on the cube unit: Y = X * H_N, as a single
+// right-multiplication -- no transpose and no intermediate turned around
+// through L1, unlike the two-sided split in cube/.
+//
+// H_N is not applied as one dense (N x N) operand. It is factored
+// H_N = H_B (x) H_M and applied as B*B matmuls of a FIXED size M against a
+// resident +-H_M, with the sum over input blocks accumulated in L0C -- the
+// cube's version of the vector core's butterfly stages. See "BLOCKED
+// ACCUMULATION" below for the derivation; it is what lets N=512 work at all.
 //
 // The companion kernel in cube/ uses the balanced Kronecker split
 // H_N = H_R (x) H_C and pays two matmuls of about sqrt(N) on a side. This one
@@ -23,22 +30,35 @@ using namespace pto;
 // trading MACs for a straight pipe is the right side of the trade while N is
 // small.
 //
-// WHERE IT STOPS PAYING. The whole of H must be read once per tile, so H's
-// L1->L0B traffic per sample is N*N*2 / S bytes against 4*N bytes of HBM
-// traffic for X and Y. With S set by L0C capacity (S*N bounded), that ratio
-// grows as N^2, and there are three regimes:
+// WHAT USED TO CAP IT. Written as one dense product, the whole of H has to be
+// read once per tile, so H's L1->L0B traffic per sample is N*N*2 / S bytes
+// against 4*N bytes of HBM traffic for X and Y. With S bounded by L0C capacity
+// (S*N fixed) that ratio grows as N^2: H is 32 KB at N=128 and sits in L0B for
+// the whole kernel, 128 KB at N=256 and only fits L1, and 512 KB at N=512 --
+// all of L1, so it streams from GM on every tile at 4x the HBM traffic. That
+// last regime ran at 0.6-0.8x of the vector kernel and set the 512 ceiling.
 //
-//   N <= 128   H is at most 128*128*2 = 32 KB, so it sits in L0B for the whole
-//              kernel and the per-tile H cost is exactly zero. One TMATMUL per
-//              tile. This is the regime the kernel is for.
-//   N == 256   H is 128 KB: too big for L0B's 64 KB, small enough to stay
-//              resident in L1. The contraction splits into chunks whose
-//              (Kc x N) slice fits half of L0B, and H moves L1->L0B once per
-//              tile. H traffic is then about equal to the HBM traffic.
-//   N == 512   H is 512 KB, exactly all of L1, so it cannot stay resident at
-//              all and the chunks stream from GM (L2-resident in practice) on
-//              every tile. H traffic is ~4x the HBM traffic. Supported for
-//              completeness; see the README for the measured crossover.
+// The blocked form below removes that term outright rather than managing it:
+// H near the matmul becomes +-H_M at 16 KB for every N, loaded once per core.
+// Against the dense form, paired, 3 passes, null control at 1.00x -- including
+// the tile geometry and block_dim retune that the change licensed:
+//
+//     N=256   1.33-1.56x       N=512   1.64-2.55x
+//
+// N<=128 is untouched (0.98-1.02x): B == 1 there, which IS the single dense
+// matmul. The result is that this kernel now beats the vector butterfly at
+// every size it covers -- N=512 went from 0.72x of it to 1.50x -- and beats the
+// two-sided kernel everywhere the two overlap, 1.11-2.44x.
+//
+// WHAT CAPS IT NOW is arithmetic, not capacity. The one-sided product is N*N
+// MACs per sample however H is factored, and at N=512 that is already most of
+// the time -- dropping the matmuls (PTO_OS_NOMM) is 3.96x faster at batch
+// 65536, against 2.34x at N=256. Past 512 the MACs grow 4x per doubling while
+// the bytes only double, so the two-sided kernel in cube/ -- 2*N*sqrt(N) MACs
+// -- takes over. PTO_OS_BIG compiles 1024 and 2048, which the blocked form is
+// correct at and the dense form could never reach (H would be 2 MB and 8 MB);
+// measured there the two-sided kernel is 1.7x faster at 1024 and 4.8x at 2048,
+// so they stay off. 512 is now a compute crossover, not a capacity limit.
 //
 // H is symmetric, so there is no transpose to worry about: Y = X * H with H as
 // the right operand gives the natural (Sylvester) ordered transform, and the
@@ -50,22 +70,22 @@ using namespace pto;
 //
 // (N, samples per tile)
 
-// Samples per tile, as S * N. 16384 keeps two L0C accumulators (S*N*4 each)
-// inside 128 KB and two L0A slots inside 64 KB, and it must stay >= 16*512 so
-// that S is a multiple of 16 at every N in the table.
+// Samples per tile, as S * N, for the sizes that do not override it below
+// (N <= 128, where B == 1). 16384 keeps two L0C accumulators (S*N*4 each)
+// inside 128 KB and two L0A slots inside 64 KB.
 //
 // Raising it halves H's per-sample traffic and lowering it buys shallower
-// buffers. Measured against 8192: 16384 wins by 1.31-1.94x at N=256/512, where
-// H traffic dominates, and loses by at most 1.12x at N<=128 and batch <= 1024,
-// where the absolute time is ~2 us either way. 16384 ships.
+// buffers. Measured against 8192 while the dense form was shipping: 16384 won
+// by 1.31-1.94x at N=256/512, where H traffic dominated, and lost by at most
+// 1.12x at N<=128. The blocked form makes H traffic zero, so that argument now
+// only applies to N <= 128 -- which is why 256 and 512 override it.
 #ifndef PTO_OS_TILE_ELEMS
 #define PTO_OS_TILE_ELEMS 16384
 #endif
-// Per-N override of samples per tile. The resident-H sizes are capped by L0A,
-// which must hold two (S x N) slots; the chunked sizes are not, because their
-// L0A slot is only (S x Kc), so they can run a tile twice as tall and halve H's
-// per-sample traffic -- at the price of a single L0C accumulator, which Layout
-// derives from capacity. Defaults are PTO_OS_TILE_ELEMS / N.
+// Per-N override of samples per tile. N <= 128 holds all of H in L0B and is
+// capped by L0A, which must hold two (S x N) slots, so it takes
+// PTO_OS_TILE_ELEMS / N. N >= 256 runs the blocked form, whose L0A slot is only
+// (S x M), and it wants a SMALLER tile -- see PTO_OS_S512.
 #ifndef PTO_OS_S64
 #define PTO_OS_S64 (PTO_OS_TILE_ELEMS / 64)
 #endif
@@ -73,15 +93,23 @@ using namespace pto;
 #define PTO_OS_S128 (PTO_OS_TILE_ELEMS / 128)
 #endif
 #ifndef PTO_OS_S256
-#define PTO_OS_S256 (PTO_OS_TILE_ELEMS / 256)
+#define PTO_OS_S256 32
 #endif
-// 64, not PTO_OS_TILE_ELEMS/512 = 32: N=512 is the one size whose H traffic
-// (4:1 against the data at S=64) still dominates, so the taller tile is worth
-// 1.57-1.90x there even though it costs the second L0C accumulator. At N=256,
-// where H traffic is only ~1:1, the same change LOSES 0.84-0.99x. S*N = 32768
-// fills L0C, so this is the tallest tile the part allows.
+// 16 and 32, not TILE_ELEMS/N = 32 and 64.
+//
+// These two inverted when the blocked form landed, and the reason is worth
+// keeping: the tall tile used to be justified SOLELY by halving H's per-tile
+// L1->L0B traffic, which the blocked form makes zero. With that gone the
+// smaller tile's deeper buffering wins instead -- measured over S512 in
+// {16,32,64} x S256 in {16,32,64,128} x M in {32,64,128}, paired:
+//
+//     N=512   S=64 -> 16   1.24x at batch 65536, 1.31x at 8192
+//     N=256   S=64 -> 32   1.07x at batch 8192, 1.00x at 65536, 0.95x at 1024
+//
+// S256=16 is a cliff, not a continuation (40.8 us against 27.1 at batch
+// 65536): below 32 the tile stops covering the fan-out over B output blocks.
 #ifndef PTO_OS_S512
-#define PTO_OS_S512 64
+#define PTO_OS_S512 16
 #endif
 
 // Split the per-core work by whole tiles rather than by samples, so at most one
@@ -97,11 +125,77 @@ using namespace pto;
 #define PTO_OS_NOMM 0
 #endif
 
+// BLOCKED ACCUMULATION -- the vector butterfly's staging, done on the cube.
+//
+// Everywhere H does not already fit L0B, replace the single dense (N x N) right
+// operand by a Kronecker factorization and let the L0C accumulator do the
+// butterfly's add/subtract. With N = B*M and H_N = H_B (x) H_M, blocking the
+// product by M columns gives
+//
+//     Y[:, jM:(j+1)M] = sum_i  X[:, iM:(i+1)M] * (H_B[i,j] * H_M)
+//
+// and H_B[i,j] is +-1, so the ONLY right operands that ever occur are +H_M and
+// -H_M. That is the whole idea: the matmul is restricted to a fixed efficient
+// size M, the sum over i is accumulated in L0C by TMATMUL_ACC exactly as the
+// vector core accumulates its log2(N) butterfly stages, and H near the matmul
+// shrinks from N*N to 2*M*M -- which is resident in L0B for every N, so the per
+// tile H traffic that caps the dense form is exactly zero. (Zero, not merely
+// less: the two operands are loaded once per core.)
+//
+// Same MAC count as the dense form, B*B matmuls instead of one, same single
+// fp32 rounding, and still one pass over each pipe per block with no L1
+// turnaround. H_B is never materialized: H_B[i,j] = (-1)^popcount(i & j).
+#ifndef PTO_OS_BLOCKED
+#define PTO_OS_BLOCKED 1
+#endif
+// M above, and it MUST match _BLOCK in the host wrapper, which builds +-H_M --
+// a mismatch just hands the kernel a wrong-sized operand and it computes
+// garbage. 128 is the largest that fits L0B's 64 KB, and the argument for it is
+// that B = N/M matmuls shrink as B*B, so the largest M issues the fewest.
+//
+// That argument is WRONG, and measurably so. Swept paired at the shipped tile
+// geometry, M=64 against M=128 and M=32:
+//
+//     N=512 batch 65536    M=32 300.5us   M=64 99.9us   M=128 123.8us
+//     N=256 batch 65536    M=32  40.8us   M=64 27.2us   M=128  27.8us
+//
+// M=64 is 3.01x over M=32 and 1.24x over M=128 at N=512. Fewer, larger matmuls
+// is the wrong objective here: what matters is that the (S x M) L0A slice stays
+// small enough to double-buffer deeply, and 64 is where that balances. Resweep
+// this if the tile geometry changes -- it did not survive a geometry change
+// once already.
+#ifndef PTO_OS_BLOCK
+#define PTO_OS_BLOCK 64
+#endif
+
+// Sizes above 512, which only the blocked form can reach at all -- the dense
+// form's H would be 2 MB. Off by default: the capacity ceiling is gone but an
+// arithmetic one takes its place (the one-sided product is N*N MACs per sample
+// whatever the form), so past 512 the two-sided kernel in cube/ wins. On for
+// the probe that measured where that crossover is; see the README.
+#ifndef PTO_OS_BIG
+#define PTO_OS_BIG 0
+#endif
+#ifndef PTO_OS_S1024
+#define PTO_OS_S1024 16
+#endif
+#ifndef PTO_OS_S2048
+#define PTO_OS_S2048 16
+#endif
+#if PTO_OS_BIG
+#define FAST_HADAMARD_ONESIDED_BIG_CASES(X) \
+  X(1024, PTO_OS_S1024)                     \
+  X(2048, PTO_OS_S2048)
+#else
+#define FAST_HADAMARD_ONESIDED_BIG_CASES(X)
+#endif
+
 #define FAST_HADAMARD_ONESIDED_CASES(X) \
   X(64, PTO_OS_S64)                     \
   X(128, PTO_OS_S128)                   \
   X(256, PTO_OS_S256)                   \
-  X(512, PTO_OS_S512)
+  X(512, PTO_OS_S512)                   \
+  FAST_HADAMARD_ONESIDED_BIG_CASES(X)
 
 #if defined(__CHECK_FEATURE_AT_PRECOMPILE) || \
     (__CCE_AICORE__ == 220 && defined(__DAV_C220_CUBE__))
@@ -167,29 +261,42 @@ struct Layout {
   static constexpr unsigned kAccBytes = kTileElems * sizeof(float);
   static constexpr unsigned kHBytes = N * N * sizeof(half);
 
-  // Contraction chunk. One chunk when all of H fits half of L0B, so the single
-  // resident copy is also double-bufferable; otherwise the largest Kc whose
-  // (Kc x N) slice fits half of L0B, so chunk kc+1 can load under chunk kc's
-  // matmul. Kc stays a multiple of 16 -- it indexes whole fractal columns.
+  // All of H fits half of L0B, so the single resident copy is also
+  // double-bufferable: one dense matmul per tile and no H traffic at all.
+  static constexpr bool kResident = (kHBytes * 2 <= L0AB_BYTES);  // N <= 128
+
+  // Otherwise: blocked accumulation against a resident +-H_M (see PTO_OS_BLOCK),
+  // or, with that switched off, the dense product split into contraction chunks
+  // of the largest Kc whose (Kc x N) slice fits half of L0B.
+  static constexpr uint32_t kM = (N < PTO_OS_BLOCK) ? N : (uint32_t)PTO_OS_BLOCK;
+  static constexpr uint32_t kBlk = N / kM;  // B, the number of M-column blocks
+  static constexpr bool kBlocked =
+      (PTO_OS_BLOCKED != 0) && !kResident && (kBlk > 1);
+  static_assert(!kBlocked || kBlk * kM == N, "M must divide N");
+
+  // Contraction chunk, which both non-resident forms walk: the blocked form's
+  // is one M-column block of X, the chunked form's is a Kc-row slice of H. Kc
+  // stays a multiple of 16 -- it indexes whole fractal columns.
   static constexpr uint32_t kKc =
-      (kHBytes * 2 <= L0AB_BYTES)
-          ? N
-          : (L0AB_BYTES / 2) / (N * sizeof(half));
+      kResident ? N
+                : (kBlocked ? kM : (L0AB_BYTES / 2) / (N * sizeof(half)));
   static constexpr uint32_t kChunks = N / kKc;
   static_assert(kKc * kChunks == N && kKc % 16 == 0, "Kc must tile N by 16s");
 
   // H placement. Resident in L0B when there is only one chunk: loaded once per
   // core and never touched again, which is the whole point at small N.
   static constexpr bool kHInL0B = (kChunks == 1);
-  // Otherwise resident in L1 if it fits beside the X ring, else streamed from GM
-  // into a two-slot L1 ring on every tile.
+  // The blocked form is resident too -- +-H_M, two M x M tiles, loaded once per
+  // core. Otherwise H is resident in L1 if it fits beside the X ring, else
+  // streamed from GM into a two-slot L1 ring on every tile.
   static constexpr unsigned kXSlots = 4;
   static constexpr bool kHInL1 =
-      !kHInL0B && (kHBytes + kXSlots * kTileBytes <= L1_BYTES);
+      !kHInL0B && !kBlocked && (kHBytes + kXSlots * kTileBytes <= L1_BYTES);
 
-  // L1: H (all of it, or a 2-slot chunk ring), then the X ring.
+  // L1: H (all of it, +-H_M, or a 2-slot chunk ring), then the X ring.
   static constexpr unsigned kL1H = 0;
-  static constexpr unsigned kL1HChunk = kKc * N * sizeof(half);
+  static constexpr unsigned kL1HChunk =
+      kBlocked ? kM * kM * sizeof(half) : kKc * N * sizeof(half);
   static constexpr unsigned kL1HBytes =
       kHInL0B ? kHBytes : (kHInL1 ? kHBytes : 2 * kL1HChunk);
   static constexpr unsigned kL1X = kL1H + kL1HBytes;
@@ -229,9 +336,12 @@ struct Layout {
     return xSlot(slot) + kc * kKc * S * sizeof(half);
   }
 
-  // L0B: H, resident in full or a two-slot chunk ring.
+  // L0B: H, resident in full, as the resident +-H_M pair, or a two-slot chunk
+  // ring. The blocked pair and the chunk ring index the same way -- slot 0/1 --
+  // so l0bH serves both; for the pair the index is the SIGN, not a chunk.
   static constexpr unsigned kL0bH = 0;
-  static constexpr unsigned kL0bChunk = kKc * N * sizeof(half);
+  static constexpr unsigned kL0bChunk =
+      kBlocked ? kM * kM * sizeof(half) : kKc * N * sizeof(half);
   static_assert(kHInL0B ? (kHBytes <= L0AB_BYTES)
                         : (2 * kL0bChunk <= L0AB_BYTES),
                 "L0B overflow");
@@ -244,17 +354,56 @@ struct Layout {
   static constexpr unsigned l0cAcc(bool par) {
     return (kAccSlots == 2u && par) ? kAccBytes : 0;
   }
+  // Output block j: columns [j*M, (j+1)*M) of the accumulator. An L0C tile is
+  // block-column-major like an L1 Mat tile, so whole 16-column groups are one
+  // contiguous range and each block is an (S x M) accumulator in its own right.
+  static constexpr unsigned l0cBlock(unsigned base, uint32_t j) {
+    return base + j * kM * S * sizeof(float);
+  }
 };
+
+// H_B[i,j] = (-1)^popcount(i & j) for the Sylvester matrix, so the sign of
+// block (i,j) is a parity, and H_B itself is never built or read. Returns 1 for
+// -H_M and 0 for +H_M, which are also their L0B slot indices.
+AICORE inline uint32_t blockSign(uint32_t i, uint32_t j) {
+  uint32_t v = i & j;
+  v ^= v >> 8;
+  v ^= v >> 4;
+  v ^= v >> 2;
+  v ^= v >> 1;
+  return v & 1u;
+}
 
 // GM -> L1, and for the resident case on to L0B. Done once per core.
 //
 // h holds kChunks consecutive (Kc x N) row chunks of H, which for a row-major
 // (N x N) matrix is just H itself; the host lays it out that way so each chunk
-// is one contiguous descriptor whatever Kc is.
+// is one contiguous descriptor whatever Kc is. The blocked form's +H_M and
+// -H_M follow it, two (M x M) matrices at offset N*N -- appended rather than
+// substituted so that one host buffer feeds either form of the kernel and the
+// A/B between them is a compile-time switch and nothing else.
 template <uint32_t N, uint32_t S>
 AICORE void loadHadamard(__gm__ half *h) {
   using L = Layout<N, S>;
-  if constexpr (L::kHInL0B) {
+  if constexpr (L::kBlocked) {
+    for (uint32_t s = 0; s < 2; ++s) {  // s = 0 is +H_M, s = 1 is -H_M
+      MatTile<L::kM, L::kM> h_l1;
+      TASSIGN(h_l1, L::l1HChunk(s));
+      __gm__ half *src = h + N * N + s * L::kM * L::kM;
+      GmTile<L::kM, L::kM> h_gm(src);
+      TASSIGN(h_gm, src);
+      TLOAD(h_l1, h_gm);
+    }
+    Sync<PIPE_MTE2, PIPE_MTE1>();
+    for (uint32_t s = 0; s < 2; ++s) {
+      MatTile<L::kM, L::kM> h_l1;
+      TileRight<half, L::kM, L::kM> h_l0b;
+      TASSIGN(h_l1, L::l1HChunk(s));
+      TASSIGN(h_l0b, L::l0bH(s));
+      TMOV(h_l0b, h_l1);
+    }
+    Sync<PIPE_MTE1, PIPE_M>();
+  } else if constexpr (L::kHInL0B) {
     MatTile<N, N> h_l1;
     TASSIGN(h_l1, L::kL1H);
     GmTile<N, N> h_gm(h);
@@ -365,6 +514,49 @@ AICORE void chunkStep(__gm__ half *h, AccT &acc, uint32_t kc,
   set_flag(PIPE_M, PIPE_MTE1, EvA);  // slot free for chunk kc+2
 }
 
+// One input block of the blocked form: move X's M-column block i to L0A, then
+// fan it out over all B output blocks, each against +H_M or -H_M.
+//
+// This is the cube's version of one butterfly stage. The vector core walks
+// log2(N) stages, reading and rewriting the whole sample each time; here the B
+// partial products that make output block j land in the SAME L0C accumulator
+// and TMATMUL_ACC sums them in place, so the combination costs no traffic at
+// all -- block i is read from L1 once and never written back.
+template <uint32_t N, uint32_t S, uint32_t XSlot, bool APar, event_t EvA>
+AICORE void blockStep(unsigned accBase, uint32_t i) {
+  using L = Layout<N, S>;
+
+  // Columns [i*M, (i+1)*M) of the L1 X tile. An L1 Mat tile is
+  // block-column-major, so whole 16-column groups are one contiguous range --
+  // the slice an L0A Left tile canNOT do, being fractal-ROW-major.
+  MatTile<S, L::kM> x_l1;
+  TileLeft<half, S, L::kM> x_l0a;
+  TASSIGN(x_l1, L::xChunk(XSlot, i));
+  TASSIGN(x_l0a, L::l0aX(APar ? 1u : 0u));
+
+  wait_flag(PIPE_M, PIPE_MTE1, EvA);  // block i-2 has finished with the slot
+  TMOV(x_l0a, x_l1);
+  Sync<PIPE_MTE1, PIPE_M>();
+
+#if !PTO_OS_NOMM
+  for (uint32_t j = 0; j < L::kBlk; ++j) {
+    TileAcc<float, S, L::kM> acc_j;
+    TASSIGN(acc_j, L::l0cBlock(accBase, j));
+    TileRight<half, L::kM, L::kM> h_j;
+    TASSIGN(h_j, L::l0bH(blockSign(i, j)));
+    // i == 0 initializes every output block; every later block accumulates.
+    // Both run on PIPE_M in order, so the read-after-write between them needs
+    // no flag.
+    if (i == 0) {
+      TMATMUL(acc_j, x_l0a, h_j);
+    } else {
+      TMATMUL_ACC(acc_j, x_l0a, h_j);
+    }
+  }
+#endif
+  set_flag(PIPE_M, PIPE_MTE1, EvA);  // slot free for block i+2
+}
+
 template <uint32_t N, uint32_t S, uint32_t Slot, bool Par, event_t EvX,
           event_t EvA>
 AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample) {
@@ -394,6 +586,19 @@ AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample) {
     TMATMUL(acc, x_l0a, h_l0b);
 #endif
     set_flag(PIPE_M, PIPE_MTE1, EvA);  // slot free for tile i+2
+  } else if constexpr (L::kBlocked) {
+    // +-H_M is already in L0B and stays there, so a block costs one TMOV and B
+    // matmuls, and the tile never touches MTE2 for H at all.
+    wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // the slot's previous store drained
+    const unsigned accBase = L::l0cAcc(Par);
+    for (uint32_t i = 0; i < L::kBlk; ++i) {
+      if (i & 1u) {
+        blockStep<N, S, Slot, true, EV_A1>(accBase, i);
+      } else {
+        blockStep<N, S, Slot, false, EV_A0>(accBase, i);
+      }
+    }
+    set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // last block has read the X slot
   } else {
     wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // the slot's previous store drained
     for (uint32_t kc = 0; kc < L::kChunks; ++kc) {
@@ -457,7 +662,8 @@ AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
     }
     set_flag(PIPE_M, PIPE_MTE1, EV_A0);  // both L0A/L0B slots start free
     set_flag(PIPE_M, PIPE_MTE1, EV_A1);
-    if constexpr (!Layout<N, S>::kHInL0B && !Layout<N, S>::kHInL1) {
+    if constexpr (!Layout<N, S>::kHInL0B && !Layout<N, S>::kHInL1 &&
+                  !Layout<N, S>::kBlocked) {
       set_flag(PIPE_MTE1, PIPE_MTE2, EV_H0);  // both H L1 slots start free
       set_flag(PIPE_MTE1, PIPE_MTE2, EV_H1);
     }
@@ -500,7 +706,8 @@ AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
     }
     wait_flag(PIPE_M, PIPE_MTE1, EV_A0);
     wait_flag(PIPE_M, PIPE_MTE1, EV_A1);
-    if constexpr (!Layout<N, S>::kHInL0B && !Layout<N, S>::kHInL1) {
+    if constexpr (!Layout<N, S>::kHInL0B && !Layout<N, S>::kHInL1 &&
+                  !Layout<N, S>::kBlocked) {
       wait_flag(PIPE_MTE1, PIPE_MTE2, EV_H0);
       wait_flag(PIPE_MTE1, PIPE_MTE2, EV_H1);
     }

@@ -7,17 +7,19 @@ from onesided.jit_util_hadamard_onesided import (
     MIN_ONESIDED_N,
     hadamard_full,
     hadamard_matrix,
+    hadamard_operands,
     onesided_block_dim_schedule,
     validate_onesided_hadamard_args,
 )
 # Deliberately the wrapper's own table rather than TILE_ELEMS // N: S is a
-# per-N override in the kernel (N=512 runs a taller tile than the capacity
-# formula gives), and a test that recomputed it would silently start probing
-# the wrong boundaries the next time that override moves.
+# per-N override in the kernel (256 and 512 run SMALLER tiles than the capacity
+# formula gives, because the blocked form prefers depth to height), and a test
+# that recomputed it would silently start probing the wrong boundaries the next
+# time that override moves.
 from onesided.jit_util_hadamard_onesided import _SAMPLES_PER_TILE
 
-# The one-sided kernel reads the whole of H per tile, so its case table stops at
-# 512; everything larger belongs to the two-sided kernel in cube/.
+# The one-sided product costs n*n MACs per sample however H is factored, so its
+# case table stops at 512 on compute grounds; larger belongs to cube/.
 TEST_HIDDEN_DIMS = [64, 128, 256, 512]
 # Straddles both boundaries that matter: the S-sample tile (256/128/64/64
 # across the grid) and the 16-sample tail the kernel mops up by backing one more
@@ -280,6 +282,69 @@ def test_hadamard_full_is_cached_and_orthogonal(npu_device):
     assert torch.equal(h64 @ h64, 64 * torch.eye(64, dtype=torch.float64))
 
 
+@pytest.mark.parametrize("n", TEST_HIDDEN_DIMS)
+def test_operand_buffer_layout(npu_device, n):
+    """The kernel reads H_n at offset 0 and +-H_M at offset n*n.
+
+    Those offsets are hard-coded in loadHadamard, so this is the host half of
+    that contract. A silent change here does not fail loudly -- it feeds the
+    matmul a wrong-sized operand, which is how the first M=64 experiment
+    produced garbage.
+    """
+    m, b = hadamard_operands(n)
+    assert m * b == n and m == min(64, n), f"unexpected split M={m} B={b}"
+
+    h = hadamard_full(n, torch.device(npu_device)).cpu()
+    assert h.numel() == n * n + 2 * m * m, "operand buffer is the wrong size"
+
+    h_n = hadamard_matrix(n, "cpu")
+    h_m = hadamard_matrix(m, "cpu")
+    assert torch.equal(h[: n * n].view(n, n), h_n), "H_n is not at offset 0"
+    assert torch.equal(
+        h[n * n : n * n + m * m].view(m, m), h_m
+    ), "+H_M is not at offset n*n"
+    assert torch.equal(
+        h[n * n + m * m :].view(m, m), -h_m
+    ), "-H_M does not follow +H_M"
+
+
+@pytest.mark.parametrize("n", TEST_HIDDEN_DIMS)
+def test_kronecker_block_identity(n):
+    """The identity the blocked form computes, checked exactly in fp64.
+
+        Y[:, jM:(j+1)M] = sum_i X[:, iM:(i+1)M] @ (H_B[i,j] * H_M)
+
+    and H_B[i,j] == (-1)**popcount(i & j), which is why the kernel never builds
+    or reads H_B at all. If this ever fails the kernel is computing a different
+    transform than its header claims, whatever the end-to-end tests say.
+    """
+    m, b = hadamard_operands(n)
+    h_m = hadamard_matrix(m, "cpu", dtype=torch.float64)
+    h_b = hadamard_matrix(b, "cpu", dtype=torch.float64)
+
+    for i in range(b):
+        for j in range(b):
+            assert h_b[i, j] == (-1) ** bin(i & j).count("1"), (
+                f"sign rule wrong at ({i},{j}) for B={b}"
+            )
+
+    # Small integers, so every product and partial sum is exact in fp64 and the
+    # identity can be asserted bitwise. With randn it holds only to a few ULP,
+    # because the two sides accumulate in different orders -- which would make
+    # the test about rounding rather than about the decomposition.
+    torch.manual_seed(0)
+    x = torch.randint(-8, 9, (5, n)).to(torch.float64)
+    want = x @ hadamard_matrix(n, "cpu", dtype=torch.float64)
+
+    got = torch.zeros_like(want)
+    for j in range(b):
+        for i in range(b):
+            got[:, j * m : (j + 1) * m] += x[:, i * m : (i + 1) * m] @ (
+                h_b[i, j] * h_m
+            )
+    assert torch.equal(got, want), "block-Kronecker decomposition is not exact"
+
+
 # --- argument rejection ---------------------------------------------------
 
 
@@ -382,3 +447,31 @@ def test_block_dim_does_not_change_result(onesided_hadamard_kernel, npu_device, 
         onesided_hadamard_kernel(x, y, block_dim=block_dim)
         torch.npu.synchronize()
         assert torch.equal(y, reference), f"block_dim={block_dim} changed the result"
+
+
+def test_first_call_for_a_size_is_ordered_after_h_is_built(
+    onesided_hadamard_kernel, npu_device
+):
+    """The very first call for a given n must not race the H buffer.
+
+    hadamard_full enqueues torch ops on a cache miss, and the raw ctypes launch
+    is only ordered after them because resolve_stream_ptr drains torch_npu's
+    task queue first. Evaluating the two in the wrong order let the kernel read
+    H as zeros and return Y = X * 0 = 0, on the first call for each n only.
+
+    Clearing the cache is what makes this a regression test rather than a
+    repeat of the correctness sweep: without it every n is already warm.
+    """
+    from onesided import jit_util_hadamard_onesided as ju
+
+    for n in TEST_HIDDEN_DIMS:
+        ju._H_CACHE.clear()
+        ju._PAD_CACHE.clear()
+        torch.manual_seed(0)
+        x_cpu = torch.randn(1, n, dtype=DTYPE)
+        y = run_onesided_hadamard(onesided_hadamard_kernel, x_cpu.to(npu_device))
+        assert y.abs().sum().item() != 0.0, (
+            f"N={n}: output is all zeros on the first call, so the kernel read "
+            "H before it was written"
+        )
+        assert_matches_exact(y, x_cpu, f"first call, batch=1, N={n}")
