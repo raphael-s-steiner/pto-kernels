@@ -187,6 +187,34 @@ batches each, against an exact fp64 transform, and asserts the dispatcher's
 output is **bit-identical** to calling the chosen back end directly -- the
 dispatcher must add nothing but the choice.
 
+**Batch is unrestricted everywhere.** The two-sided kernel splits by whole
+tiles, then `runTiles<R, C, S>` recurses into `runTiles<R, C, S / 2>` for the
+remainder, so any count decomposes into tiles of S, S/2, ... 1 samples. The
+one-sided kernel needs at least 16 samples -- its smallest tile is 16 rows and
+its tail trick backs a tile up to `end` -- so its host pads shorter batches
+through a cached scratch pair and discards the extra rows. Either way the
+caller sees no constraint: batches 0, 1, 2, 3, 5, 7, 15, 16, 17, 31, 33, 63,
+65, 127, 129, 1000 and 1023 all pass at N = 128, 512, 1024, 8192 and 32768,
+`batch = 0` included as a no-op.
+
+#### Where the restrictions live
+
+In each kernel's own host wrapper, which is the only place that can report
+them. **None of the three kernels can diagnose a bad argument**: the vector one
+guards only `n == 0 || n > ELEMENTS_PER_TILE` and that returns silently with the
+input untouched, while a non-power-of-two `n` or a `log2_n` that disagrees with
+it falls through to the generic body and quietly computes the wrong transform --
+`log2_n` is passed in, never derived, and the specialised dispatch treats a
+mismatch as a reason to fall through rather than to fail.
+
+`cube/` and `onesided/` validated in their wrappers already. The vector
+kernel's checks used to sit in `standard/test_hadamard.py`, where nothing in the
+shipped path called them; they now live in `standard/jit_util_hadamard.py`
+beside `MAX_HADAMARD_N`, are applied by the wrapper on every call, and
+`batch`/`n`/`log2_n` are derived from `x` when omitted. Two tests go through the
+wrapper rather than the validator, so the checks cannot quietly stop being
+wired -- which is exactly the state they were moved out of.
+
 #### Against the vector kernel
 
 msprof `op_summary`, median of 15 launches after 4 warmups, 910B2, device time.
