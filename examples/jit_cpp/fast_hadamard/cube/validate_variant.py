@@ -34,7 +34,7 @@ def main():
     torch.npu.set_device("npu:0")
     # batches: 1 tile, exact multiples, ragged tails, fallback chains, deep runs
     # the whole FAST_HADAMARD_CUBE_CASES table, not just the benchmarked sizes
-    SHAPES = [(b, n) for n in (256, 512, 1024, 2048, 4096, 8192, 16384)
+    SHAPES = [(b, n) for n in (256, 512, 1024, 2048, 4096, 8192, 16384, 32768)
               for b in (1, 3, 31, 32, 33, 64, 96, 97, 127, 256, 1000, 1024)]
     worst = {}
     for so in sys.argv[1:]:

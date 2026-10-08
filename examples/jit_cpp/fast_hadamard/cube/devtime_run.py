@@ -54,7 +54,16 @@ def main():
         kind = cfg.get("kind", "cube")
         so = str(BASE / cfg.get("so", "cube/outputs/so/fast_hadamard_cube_jit.so"))
 
-        x = torch.randn(batch, n, device=device, dtype=torch.float16)
+        # The vector kernel is IN PLACE, so relaunching it on one buffer makes
+        # the values diverge (H*H = n*I, so magnitude grows by n every two
+        # launches and fp16 saturates to inf within a few reps). Cycle a pool
+        # of pre-filled buffers instead -- allocated OUTSIDE the timed loop, so
+        # no torch op lands between launches. The established benchmark in
+        # bench_common does the same thing for the same reason.
+        pool = int(cfg.get("pool", 1))
+        xs = [torch.randn(batch, n, device=device, dtype=torch.float16)
+              for _ in range(max(1, pool))]
+        x = xs[0]
         y = torch.empty_like(x)
 
         # Drains torch_npu's async task queue so the raw ctypes launches below
@@ -70,7 +79,7 @@ def main():
                     ctypes.c_void_p(h.data_ptr()), batch, n)
         elif kind == "cube":
             fn = kernel_for(so, CUBE_ARGS)
-            h_left, h_right = hadamard_factors(n, x.device)
+            h_left, h_right = hadamard_factors(n, x.device, cfg.get("block"))
             args = (block_dim, stream_ptr,
                     ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(y.data_ptr()),
                     ctypes.c_void_p(h_left.data_ptr()),
@@ -81,11 +90,20 @@ def main():
             args = (block_dim, stream_ptr, ctypes.c_void_p(x.data_ptr()),
                     batch, n, int(math.log2(n)))
 
-        for _ in range(warmup):
-            fn(*args)
+        # Pre-build one argument tuple per pool slot so the loop stays free of
+        # any work beyond the launch itself.
+        if len(xs) > 1:
+            arg_sets = [tuple(ctypes.c_void_p(xs[k].data_ptr()) if j == 2 else a
+                              for j, a in enumerate(args))
+                        for k in range(len(xs))]
+        else:
+            arg_sets = [args]
+
+        for i in range(warmup):
+            fn(*arg_sets[i % len(arg_sets)])
         torch.npu.synchronize()
-        for _ in range(reps):
-            fn(*args)
+        for i in range(reps):
+            fn(*arg_sets[i % len(arg_sets)])
         torch.npu.synchronize()
         print(f"CFG {cfg.get('tag', '')} batch={batch} n={n} bd={block_dim} "
               f"kind={kind} warmup={warmup} reps={reps}", flush=True)

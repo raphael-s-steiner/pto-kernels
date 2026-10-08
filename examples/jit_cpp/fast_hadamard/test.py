@@ -8,6 +8,7 @@ TARGET_TESTS = {
     "standard": ("standard/test_hadamard.py",),
     "cube": ("cube/test_hadamard_cube.py",),
     "onesided": ("onesided/test_hadamard_onesided.py",),
+    "auto": ("auto/test_hadamard_auto.py",),
     "quantize_int8": ("fuse_int8_quant/test_quantize.py",),
     "hadamard_quant_int8": ("fuse_int8_quant/test_hadamard_quant.py",),
     "quantize_int4": ("fuse_int4_quant/test_quantize.py",),

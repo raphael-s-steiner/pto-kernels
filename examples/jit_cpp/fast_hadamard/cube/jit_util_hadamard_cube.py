@@ -1,5 +1,6 @@
 import ctypes
 import math
+import os
 
 import torch
 
@@ -18,7 +19,7 @@ from jit_util_common import (
 
 # The cube path needs N = R * C with both factors 16-aligned, so N >= 256.
 MIN_CUBE_HADAMARD_N = 256
-MAX_CUBE_HADAMARD_N = 16384
+MAX_CUBE_HADAMARD_N = 32768
 
 _FACTOR_CACHE: dict = {}
 
@@ -26,7 +27,7 @@ _FACTOR_CACHE: dict = {}
 # S consecutive samples, so a launch has ceil(batch / S) tiles to spread over
 # the cores. Keep in step with the kernel if that table changes.
 _SAMPLES_PER_TILE = {256: 32, 512: 16, 1024: 8, 2048: 4, 4096: 2, 8192: 1,
-                     16384: 1}
+                     16384: 1, 32768: 1}
 
 # Cores are only worth adding while each still gets a tile run long enough to
 # keep its pipes full. Measured on 910B2: at N=256 a core moves 94 GB/s with
@@ -35,25 +36,37 @@ _SAMPLES_PER_TILE = {256: 32, 512: 16, 1024: 8, 2048: 4, 4096: 2, 8192: 1,
 # and k is where a size sits on that curve: small k means high per-tile latency,
 # so few cores with long runs.
 #
-# Fitted per N rather than by a rule, because the two R == 16 sizes do not
-# behave like the rest and nothing about N predicts which way: N=512 wants k=1
-# where N=1024 wants 8, and assuming 8 for it cost 1.51x. N=512's tile is 16
-# TEXTRACTs plus 16 TSTOREs, the most per-tile work in the table, which is the
-# likely reason -- but it was found by measuring, not by that argument.
+# Fitted per N rather than by a rule, because nothing about N predicts which
+# way a size behaves: N=512 wants k well below 1 where N=1024 wants 8, and
+# assuming 8 for it cost 1.51x.
 #
-# Last column is what the old constant 24 cost at that size, i.e. what the
-# schedule buys:
+# REFITTED for the two-phase deep path now that it runs at every size (see
+# PTO_HAD_DBUF_GEN in the kernel). The deep body changes per-tile cost, so the
+# shallow-fitted constants went stale: they cost the deep path up to 1.05x at
+# N=512 and 1.045x at N=2048. Only those two moved; 1024, 4096 and 8192 were
+# already within 0.005x of their own optimum.
 #
-#     N      k     shapes   worst regret   constant-24 worst
-#   256   0.49        6         1.025x           1.834x
-#   512   1.00        6         1.005x           1.908x
-#  1024   8.00        6         1.000x           1.207x
-#  2048  16.00        6         1.000x           1.085x
-#  4096   8.00        6         1.000x           1.093x
-#  8192   8.00        5         1.000x           1.000x
-# 16384   8.00        5         1.000x           1.000x
-_TILE_RUN_K = {256: 0.49, 512: 1.0, 1024: 8.0, 2048: 16.0, 4096: 8.0,
-               8192: 8.0, 16384: 8.0}
+# Fitted over EVERY integer block_dim in [1, 24] x batch in {64, 256, 1024,
+# 8192}, msprof device time on 910B2, minimising worst-case regret against the
+# best measured block_dim and then mean regret as a tiebreak. Sweep every
+# integer, not a subset: a subset lets the fit emit values it never measured
+# and score them against a neighbour.
+#
+#     N      k     worst regret   mean    constant-24 worst
+#   256   0.49         1.025x       --         1.834x
+#   512   0.60         1.016x     1.004x       1.908x
+#  1024   8.00         1.000x     1.000x       1.207x
+#  2048   8.27         1.029x     1.007x       1.085x
+#  4096   8.00         1.000x     1.000x       1.093x
+#  8192   8.00         1.145x     1.036x       1.000x
+# 16384   8.00            --         --        1.000x
+# 32768  16.54         1.029x     1.007x       1.074x
+#
+# N=8192's 1.145x is irreducible in this schedule's form: its best block_dim
+# over the four batches is 23, 24, 24, 22 -- non-monotonic, so no single k
+# reproduces it. It is the one size where a lookup would beat the formula.
+_TILE_RUN_K = {256: 0.49, 512: 0.6, 1024: 8.0, 2048: 8.27, 4096: 8.0,
+               8192: 8.0, 16384: 8.0, 32768: 16.54}
 # Only reached if FAST_HADAMARD_CUBE_CASES grows a size this table has not been
 # fitted for. Then it is an extrapolation -- sweep block_dim and add the entry.
 _DEFAULT_TILE_RUN_K = 8.0
@@ -91,20 +104,52 @@ def hadamard_matrix(size: int, device, dtype=torch.float16):
     return h.to(device=device, dtype=dtype).contiguous()
 
 
-def hadamard_factors(n: int, device):
-    """Cached (H_rows, H_cols) device tensors for the balanced split of H_n.
+# Mat-factor of each stage, mirroring PTO_HAD_BLOCK in the kernel. Each factor
+# H_f is applied as H_f = H_acc (x) H_mat with H_mat of size min(_BLOCK, f), so
+# the matmul and its data slice are M-sized while the accumulation over blocks
+# runs in L0C. The two MUST agree or the kernel multiplies by a wrong-sized
+# operand and computes garbage; the env override exists so an A/B sets both.
+_BLOCK = int(os.environ.get("PTO_HAD_BLOCK", 64))
+
+
+def hadamard_mat_factor(f: int, block: int | None = None) -> int:
+    """Size of the matmul sub-factor of H_f. A factor already at or below the
+    block size is not split (M == f), which is the dense case."""
+    return min(_BLOCK if block is None else int(block), f)
+
+
+def _factor_buffer(f: int, device, block: int | None = None):
+    """H_f, then +H_M and -H_M, flat -- the layout loadHadamardFactors reads.
+
+    Appended rather than substituted so one buffer feeds either form and the
+    A/B between them stays a compile-time switch. The tail is 2*M*M <= 32768
+    halves whatever f is, and is unused when M == f.
+    """
+    m = hadamard_mat_factor(f, block)
+    h_m = hadamard_matrix(m, device)
+    return torch.cat(
+        (hadamard_matrix(f, device).view(-1), h_m.view(-1), -h_m.view(-1))
+    ).contiguous()
+
+
+def hadamard_factors(n: int, device, block: int | None = None):
+    """Cached (H_rows, H_cols) device operand buffers for the split of H_n.
+
+    `block` MUST match whatever the kernel was compiled with (PTO_HAD_BLOCK):
+    the buffers carry +-H_M, so a disagreement hands the kernel the wrong-sized
+    operand and it computes garbage -- a broken switch, not a bad block size.
+    The env default exists so one setting drives both sides.
 
     Keyed on the torch device object directly: this sits on the per-call path,
     and stringifying the device costs more than the lookup it feeds.
     """
-    key = (n, device)
+    b = _BLOCK if block is None else int(block)
+    key = (n, device, b)
     cached = _FACTOR_CACHE.get(key)
     if cached is None:
         rows, cols = hadamard_split(n)
-        cached = (
-            hadamard_matrix(rows, device),
-            hadamard_matrix(cols, device),
-        )
+        cached = (_factor_buffer(rows, device, b),
+                  _factor_buffer(cols, device, b))
         _FACTOR_CACHE[key] = cached
     return cached
 

@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from auto.jit_util_hadamard_auto import jit_compile as jit_compile_auto
 from cube.jit_util_hadamard_cube import jit_compile as jit_compile_cube
 from jit_util_common import normalize_npu_device
 from onesided.jit_util_hadamard_onesided import jit_compile as jit_compile_onesided
@@ -48,3 +49,10 @@ def onesided_hadamard_kernel(npu_device):
     base = Path(__file__).resolve().parent
     src = base / "onesided" / "fast_hadamard_onesided.cpp"
     return jit_compile_onesided(str(src), verbose=True, device=npu_device)
+
+
+@pytest.fixture(scope="session")
+def auto_hadamard_kernel(npu_device):
+    """The size-dispatching entry point; compiles each back end on demand."""
+    base = Path(__file__).resolve().parent
+    return jit_compile_auto(base_dir=base, verbose=True, device=npu_device)

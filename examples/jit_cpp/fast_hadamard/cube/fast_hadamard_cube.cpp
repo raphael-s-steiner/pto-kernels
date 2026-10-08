@@ -71,11 +71,7 @@ using namespace pto;
 #endif
 // Split the per-core work by whole tiles rather than by samples, so at most
 // one core walks the power-of-two fallback down to single-sample tiles.
-#ifndef PTO_HAD_TILE_SPLIT
-#define PTO_HAD_TILE_SPLIT 1
-#endif
-// Run the C == 16 tile as two interleaved phases instead of one straight-line
-// body. The straight-line body visits MTE1 -> M -> FIX -> MTE1 -> M -> FIX, and
+// Run the tile as two interleaved phases instead of one straight-line body. The straight-line body visits MTE1 -> M -> FIX -> MTE1 -> M -> FIX, and
 // because each pipe is in-order its SECOND MTE1 use cannot start until its own
 // first matmul and L0C->L1 move have retired -- which also pins the next tile's
 // first MTE1 behind it. So only the GM->L1 load ever overlapped, and a core
@@ -87,8 +83,74 @@ using namespace pto;
 // intermediate (L0B X, L0C stack and cat, L1 T, L0A T) and a 4-deep X ring to
 // keep the prefetch two tiles ahead; Layout::kDbuf gates it on all of that
 // fitting. Set to 0 for the single-buffered control.
+//
+// Worth 1.17-1.29x at N=256 and 1.15-1.70x at N=512..8192, measured paired
+// against this switch off, with null controls at 1.00x.
 #ifndef PTO_HAD_DBUF
 #define PTO_HAD_DBUF 1
+#endif
+// Run the GENERAL (C != 16) tile as two phases as well.
+//
+// The phase split was written for C == 16 and gated on it, which read like a
+// dependency on the free NZ reinterpret that case enjoys. It is not: the
+// reinterpret is what makes the C == 16 TURNAROUND cheap, while the split is
+// about pipe ORDER and needs nothing but a cut at the turnaround and two of
+// every intermediate. The general body already pays its reshape (S TEXTRACTs
+// plus S TSTOREs) in both forms.
+//
+// So the general body is the case that should gain MORE, not less: it visits
+// each pipe twice like the C == 16 body, and has far more work queued behind
+// the second visit. All four of kDbuf's capacity conditions already hold for
+// every size from 512 to 8192; only N=16384 fails them, its two tile slots
+// being 100% of L0A and L0B on their own.
+#ifndef PTO_HAD_DBUF_GEN
+#define PTO_HAD_DBUF_GEN 1
+#endif
+// Apply each stage's factor as H_f = H_acc (x) H_mat with H_mat of size M, so
+// the matmul is M-sized and the sum over blocks runs in the L0C accumulator --
+// the same trick the one-sided kernel in onesided/ uses, applied to each of the
+// two one-sided stages this kernel is made of.
+//
+// The MAC count is unchanged: B*B matmuls of (rows x M) by (M x M) is the same
+// rows*f*f as one dense product, whatever M is. What changes is footprint, and
+// the term that matters is the SLOT, not the operand:
+//
+//     phase A's X slice in L0A    2*S*R*C  ->  2*S*R*M_b
+//     phase B's T slice in L0B    2*S*R*C  ->  2*M_a*S*C
+//     phase B's operand in L0A    2*R*R    ->  4*M_a*M_a
+//     phase A's operand in L0B    2*C*C    ->  4*M_b*M_b
+//
+// At N=16384 that takes the deep path's L0A and L0B from 96 KB each -- over the
+// 64 KB budget, which is why it was locked out -- to 48 KB at M=64. It does NOT
+// shrink the accumulators, so PTO_HAD_ACCALIAS is needed with it.
+//
+// M must divide its factor and be at least 16, the cube's fractal size, so
+// N=256 and N=512 cannot be blocked at all: their factors are already 16.
+// 0 means dense everywhere.
+#ifndef PTO_HAD_BLOCK
+#define PTO_HAD_BLOCK 64
+#endif
+// Block every size that CAN be blocked, not just the ones that must be. Off by
+// default, and the default is not a guess: blocking a single phase into two
+// blocks costs 1.78-1.86x on the deep path at N=8192 (measured against the
+// dense deep body at bd 16/20/24, with two null controls reading 0.996-1.008x),
+// because the blocked body walks MTE1 -> M -> MTE1 -> M and so uses each pipe
+// kC1 times per phase -- re-serializing consecutive tiles, which is the exact
+// thing the two-phase interleave exists to prevent. On for A/B only.
+#ifndef PTO_HAD_BLOCK_ALWAYS
+#define PTO_HAD_BLOCK_ALWAYS 0
+#endif
+// Let the concatenated accumulator share the stacked one's L0C space. It is
+// dead the moment phase A's TEXTRACTs have run, and the FIX -> MTE1 -> M chain
+// between the phases already orders that, so WITHIN a tile the reuse is free.
+// ACROSS tiles it is not: with the phases interleaved, A(i+2) writes the slot
+// B(i) is still storing from, so the deep path needs one extra FIX -> M edge
+// per slot -- which is exactly the EV_ACC edge the deep path had dropped.
+//
+// Halves L0C, which is what lets N=16384 hold two tiles in flight (256 -> 128
+// KB) and what makes N=32768 representable at all.
+#ifndef PTO_HAD_ACCALIAS
+#define PTO_HAD_ACCALIAS 1
 #endif
 // Diagnostic only: drop both TMATMULs, keeping every transfer and handshake,
 // to measure the data-movement floor of this tile geometry. Output is wrong.
@@ -111,7 +173,8 @@ using namespace pto;
   X(2048, 32, 64, 4)                \
   X(4096, 64, 64, 2)                \
   X(8192, 64, 128, 1)               \
-  X(16384, 128, 128, 1)
+  X(16384, 128, 128, 1)             \
+  X(32768, 128, 256, 1)
 
 #if defined(__CHECK_FEATURE_AT_PRECOMPILE) || \
     (__CCE_AICORE__ == 220 && defined(__DAV_C220_CUBE__))
@@ -135,6 +198,16 @@ constexpr uint32_t L0C_BYTES = 128 * 1024;
 #define EV_X0 EVENT_ID1   // shallow: L1 X slot 0
 #define EV_X1 EVENT_ID2   // shallow: L1 X slot 1
 #define EV_ACC EVENT_ID3  // shallow: output accumulator
+// Shallow blocked bodies. Every id below is distinct WITHIN its source pipe,
+// which is the invariant that matters: two channels out of the same pipe under
+// one id let the wrong waiter take a credit -- see the README section on it.
+// EV_SWB shares id 3 with EV_ACC, but EV_ACC's source is FIX and this one's is
+// M, so they are different channels either way the hardware keys them.
+#define EV_SWB  EVENT_ID3  // (M  -> MTE1) left multiply, slice free
+#define EV_SWA0 EVENT_ID4  // (M  -> MTE1) right multiply, slot 0 free
+#define EV_SWA1 EVENT_ID5  // (M  -> MTE1) right multiply, slot 1 free
+#define EV_SRA0 EVENT_ID6  // (MTE1 -> M)  right multiply, slot 0 staged
+#define EV_SRA1 EVENT_ID7  // (MTE1 -> M)  right multiply, slot 1 staged
 
 #define EV_D0 EVENT_ID0   // deep: L1 X ring slot 0
 #define EV_D1 EVENT_ID1   // deep: L1 X ring slot 1
@@ -177,23 +250,98 @@ struct Layout {
   static constexpr unsigned kTileBytes = kTileElems * sizeof(half);
   static constexpr unsigned kAccBytes = kTileElems * sizeof(float);
 
+  // Mat-factor of each stage, and the matching accumulation factor. A factor
+  // at or below the block size is left dense (kMa == R, kR1 == 1).
+  // Does the DENSE SHALLOW path fit? That is the fallback every size has, so it
+  // -- not the deep path -- is what decides whether blocking is needed at all.
+  // L0A carries H_R plus one X slice, L0B carries H_C plus one T slice, L0C the
+  // two accumulators. Blocking to reach the DEEP path instead is a measured
+  // 1.28x regression at N=16384 (56.86 us blocked-deep against 44.30 us
+  // dense-shallow, batch 1024, and the same 1.28-1.33x at all 24 block_dims),
+  // because blocking's serialization cost exceeds what the interleave buys.
+  // The deep path's own fit is the same four conditions with double buffering,
+  // so kDbuf below repeats these with the slot counts doubled.
+  static constexpr bool kDenseShallowFits =
+      R * R * sizeof(half) + kTileBytes <= L0AB_BYTES &&
+      C * C * sizeof(half) + kTileBytes <= L0AB_BYTES &&
+      2 * kAccBytes <= L0C_BYTES;
+  static constexpr bool kBlockIt =
+      (PTO_HAD_BLOCK_ALWAYS != 0) || !kDenseShallowFits;
+  static constexpr uint32_t kMa =
+      (!kBlockIt || PTO_HAD_BLOCK == 0 || PTO_HAD_BLOCK >= R)
+          ? R
+          : (uint32_t)PTO_HAD_BLOCK;
+  static constexpr uint32_t kMb =
+      (!kBlockIt || PTO_HAD_BLOCK == 0 || PTO_HAD_BLOCK >= C)
+          ? C
+          : (uint32_t)PTO_HAD_BLOCK;
+  static constexpr uint32_t kR1 = R / kMa;   // blocks of H_R
+  static constexpr uint32_t kC1 = C / kMb;   // blocks of H_C
+  static_assert(kR1 * kMa == R && kC1 * kMb == C, "M must divide its factor");
+  static_assert(kMa % 16 == 0 && kMb % 16 == 0, "M must be 16-aligned");
+  static constexpr bool kBlkA = (kC1 > 1);   // phase A (right multiply) blocked
+  static constexpr bool kBlkB = (kR1 > 1);   // phase B (left multiply) blocked
+
+  // Only where blocking is active. Aliasing buys nothing without it (the
+  // slots, not the accumulators, are what overflow), and leaving it off keeps
+  // every unblocked size's L0C offsets -- and so its codegen -- untouched.
+  static constexpr bool kAlias = (PTO_HAD_ACCALIAS != 0) && (kC1 > 1 || kR1 > 1);
+
+  // Operands, resident for the whole kernel: +-H_M when blocked, else H itself.
+  static constexpr unsigned kOpABytes = kBlkB ? 2 * kMa * kMa * sizeof(half)
+                                              : R * R * sizeof(half);
+  static constexpr unsigned kOpBBytes = kBlkA ? 2 * kMb * kMb * sizeof(half)
+                                              : C * C * sizeof(half);
+  // Per-matmul data slices.
+  static constexpr unsigned kSliceA = S * R * kMb * sizeof(half);  // L0A, phase A
+  static constexpr unsigned kSliceB = kMa * S * C * sizeof(half);  // L0B, phase B
+
+  // Block-level double buffering for the blocked SHALLOW right multiply: with
+  // two L0A slices MTE1 can stage block i+1 while M is still working on block
+  // i, which is exactly the overlap blocking otherwise gives up (blocking
+  // measured 1.49-1.53x on this path at N=8192/16384, bd 20 and 24, against a
+  // 0.995-1.000x null control). Phase A only -- phase B's slice is kMa*S*C,
+  // twice as wide here, and two of those plus the operand overflow L0B.
+  static constexpr uint32_t kSlotsA =
+      (kBlkA && kOpABytes + 2 * kSliceA <= L0AB_BYTES) ? 2u : 1u;
+
   // Two of every intermediate plus a 4-deep X ring. Every case in the table
   // holds S * N <= 16384, so all of them fit except the widest, whose two
   // accumulators already fill L0C; that one keeps the shallow path.
+  //
+  // `!kBlockIt` is the load-bearing term: a blocked size takes the SHALLOW
+  // path, always. Blocking a single stage costs 1.49-1.86x (it makes the body
+  // walk MTE1 -> M -> MTE1 -> M, so consecutive tiles stop overlapping), and no
+  // size that NEEDS blocking can reach the deep path regardless -- what
+  // overflows at N=32768 is the accumulator, which double buffering doubles.
+  // So the deep path stays dense, and with kMa == R and kMb == C its operands
+  // and slices are exactly the dense ones: H whole, and full-tile slices.
   static constexpr bool kDbuf =
-      PTO_HAD_DBUF && C == 16 &&
+      PTO_HAD_DBUF && !kBlockIt && (C == 16 || PTO_HAD_DBUF_GEN) &&
       R * R * sizeof(half) + 2 * kTileBytes <= L0AB_BYTES &&
       C * C * sizeof(half) + 2 * kTileBytes <= L0AB_BYTES &&
       4 * kAccBytes <= L0C_BYTES &&
-      R * R * sizeof(half) + C * C * sizeof(half) + 6 * kTileBytes <= L1_BYTES;
+      (R * R + C * C) * sizeof(half) + 6 * kTileBytes <= L1_BYTES;
 
   static constexpr unsigned kXSlots = kDbuf ? 4 : 2;
   static constexpr unsigned kBuf = kDbuf ? 2 : 1;
 
+  // Both the deep and the shallow general bodies have blocked forms, so a
+  // blocked size no longer has to reach the deep path -- which matters, because
+  // the sizes that MUST block are exactly the ones too wide for it. The C == 16
+  // bodies are the only dense ones left, and M is clamped to the factor there,
+  // so kC1 and kR1 are 1 and this cannot fire; it is here to catch a future
+  // case-table entry that breaks that. The L0C assert below is what enforces
+  // the other half: a blocked shallow size needs kAlias to fit its two
+  // accumulators, and without it this is a compile error, not a wrong answer.
+  static_assert(!(kC1 > 1 || kR1 > 1) || C != 16,
+                "the C == 16 bodies are dense and would read +-H_M as H");
+
   // L1: the two factors, the X ring, then the T turnaround slots.
+
   static constexpr unsigned kL1Hl = 0;
-  static constexpr unsigned kL1Hc = kL1Hl + R * R * sizeof(half);
-  static constexpr unsigned kL1X = kL1Hc + C * C * sizeof(half);
+  static constexpr unsigned kL1Hc = kL1Hl + kOpABytes;
+  static constexpr unsigned kL1X = kL1Hc + kOpBBytes;
   static constexpr unsigned kL1XSlot = kTileBytes;
   static constexpr unsigned kL1T = kL1X + kXSlots * kL1XSlot;
   static_assert(kL1T + kBuf * kTileBytes <= L1_BYTES, "L1 overflow");
@@ -207,61 +355,153 @@ struct Layout {
 
   // L0A: H_R, then the stacked X tile
   static constexpr unsigned kL0aHl = 0;
-  static constexpr unsigned kL0aX = kL0aHl + R * R * sizeof(half);
-  static_assert(kL0aX + kBuf * kTileBytes <= L0AB_BYTES, "L0A overflow");
+  static constexpr unsigned kL0aX = kL0aHl + kOpABytes;
+  static constexpr unsigned kL0aSlot = (C == 16) ? kTileBytes : kSliceA;
+  static_assert(kL0aX + kBuf * kL0aSlot <= L0AB_BYTES, "L0A overflow");
   static constexpr unsigned l0aX(bool par) {
-    return kL0aX + (par ? kTileBytes : 0);
+    return kL0aX + (par ? kL0aSlot : 0);
+  }
+  // Operand slot: 0 is +H_Ma, 1 is -H_Ma (and 0 is H_R when dense).
+  static constexpr unsigned l0aOp(uint32_t neg) {
+    return kL0aHl + (kBlkB ? neg * kMa * kMa * sizeof(half) : 0u);
   }
 
   // L0B: H_C, then the concatenated T tile
   static constexpr unsigned kL0bHc = 0;
-  static constexpr unsigned kL0bT = kL0bHc + C * C * sizeof(half);
-  static_assert(kL0bT + kBuf * kTileBytes <= L0AB_BYTES, "L0B overflow");
+  static constexpr unsigned kL0bT = kL0bHc + kOpBBytes;
+  static constexpr unsigned kL0bSlot = (C == 16) ? kTileBytes : kSliceB;
+  static_assert(kL0bT + kBuf * kL0bSlot <= L0AB_BYTES, "L0B overflow");
   static constexpr unsigned l0bT(bool par) {
-    return kL0bT + (par ? kTileBytes : 0);
+    return kL0bT + (par ? kL0bSlot : 0);
+  }
+  static constexpr unsigned l0bOp(uint32_t neg) {
+    return kL0bHc + (kBlkA ? neg * kMb * kMb * sizeof(half) : 0u);
   }
 
   // L0C: the stacked accumulator, then the concatenated one -- as a pair, so
   // the deep path's two tiles in flight get [stack|cat][stack|cat].
   static constexpr unsigned kL0cStack = 0;
   static constexpr unsigned kL0cCat = kL0cStack + kAccBytes;
-  static_assert(kBuf * 2 * kAccBytes <= L0C_BYTES, "L0C overflow");
+  // With kAlias the cat accumulator shares the stack one's space, halving L0C.
+  static constexpr unsigned kAccPair = (kAlias ? 1u : 2u) * kAccBytes;
+  static_assert(kBuf * kAccPair <= L0C_BYTES, "L0C overflow");
   static constexpr unsigned l0cStack(bool par) {
-    return (par ? 2 * kAccBytes : 0);
+    return (par ? kAccPair : 0);
   }
   static constexpr unsigned l0cCat(bool par) {
-    return (par ? 2 * kAccBytes : 0) + kAccBytes;
+    return (par ? kAccPair : 0) + (kAlias ? 0u : kAccBytes);
+  }
+  // Output block a of the blocked phase B: rows [a*Ma, (a+1)*Ma) of the (R x
+  // S*C) result, laid out as kR1 separate contiguous (Ma x S*C) accumulators --
+  // an L0C tile is block-COLUMN-major, so a row slice of one tall tile would be
+  // strided, while kR1 short tiles are each contiguous and together occupy the
+  // same bytes.
+  static constexpr unsigned l0cCatBlock(bool par, uint32_t a) {
+    return l0cCat(par) + a * kMa * S * C * sizeof(float);
+  }
+  // Column block j of phase A's accumulator: whole 16-column groups, which ARE
+  // contiguous in an L0C tile.
+  static constexpr unsigned l0cStackBlock(bool par, uint32_t j) {
+    return l0cStack(par) + j * kMb * kStackRows * sizeof(float);
   }
 };
 
 // GM -> L1 -> L0A/L0B for the two Hadamard factors. Done once per core; both
 // stay resident for the whole kernel.
-template <uint32_t R, uint32_t C>
+// S is a template parameter although no address here depends on it: the block
+// decision does (kDenseShallowFits weighs the tile size), and loading the
+// factors under a different decision from the one the tile bodies make would
+// stage dense H where they expect +-H_M.
+template <uint32_t R, uint32_t C, uint32_t S>
 AICORE void loadHadamardFactors(__gm__ half *h_left, __gm__ half *h_right) {
-  using L = Layout<R, C, 1>;
+  using L = Layout<R, C, S>;
 
-  MatTile<R, R> hl_l1;
-  MatTile<C, C> hc_l1;
-  TASSIGN(hl_l1, L::kL1Hl);
-  TASSIGN(hc_l1, L::kL1Hc);
-
-  GmTile<R, R> hl_gm(h_left);
-  GmTile<C, C> hc_gm(h_right);
-  TASSIGN(hl_gm, h_left);
-  TASSIGN(hc_gm, h_right);
-
-  TLOAD(hl_l1, hl_gm);
-  TLOAD(hc_l1, hc_gm);
+  // Each buffer is H_f followed by +H_M and -H_M (see _factor_buffer on the
+  // host). A blocked stage reads the pair at offset f*f and never touches the
+  // dense prefix; a dense stage reads the prefix and never touches the pair.
+  if constexpr (L::kBlkB) {
+    for (uint32_t neg = 0; neg < 2; ++neg) {
+      MatTile<L::kMa, L::kMa> hl_l1;
+      TASSIGN(hl_l1, L::kL1Hl + neg * L::kMa * L::kMa * sizeof(half));
+      __gm__ half *src = h_left + R * R + neg * L::kMa * L::kMa;
+      GmTile<L::kMa, L::kMa> hl_gm(src);
+      TASSIGN(hl_gm, src);
+      TLOAD(hl_l1, hl_gm);
+    }
+  } else {
+    MatTile<R, R> hl_l1;
+    TASSIGN(hl_l1, L::kL1Hl);
+    GmTile<R, R> hl_gm(h_left);
+    TASSIGN(hl_gm, h_left);
+    TLOAD(hl_l1, hl_gm);
+  }
+  if constexpr (L::kBlkA) {
+    for (uint32_t neg = 0; neg < 2; ++neg) {
+      MatTile<L::kMb, L::kMb> hc_l1;
+      TASSIGN(hc_l1, L::kL1Hc + neg * L::kMb * L::kMb * sizeof(half));
+      __gm__ half *src = h_right + C * C + neg * L::kMb * L::kMb;
+      GmTile<L::kMb, L::kMb> hc_gm(src);
+      TASSIGN(hc_gm, src);
+      TLOAD(hc_l1, hc_gm);
+    }
+  } else {
+    MatTile<C, C> hc_l1;
+    TASSIGN(hc_l1, L::kL1Hc);
+    GmTile<C, C> hc_gm(h_right);
+    TASSIGN(hc_gm, h_right);
+    TLOAD(hc_l1, hc_gm);
+  }
   Sync<PIPE_MTE2, PIPE_MTE1>();
 
-  TileLeft<half, R, R> hl_l0;
-  TileRight<half, C, C> hc_l0;
-  TASSIGN(hl_l0, L::kL0aHl);
-  TASSIGN(hc_l0, L::kL0bHc);
-
-  TMOV(hl_l0, hl_l1);
-  TMOV(hc_l0, hc_l1);
+  if constexpr (L::kBlkB) {
+    for (uint32_t neg = 0; neg < 2; ++neg) {
+      MatTile<L::kMa, L::kMa> hl_l1;
+      TileLeft<half, L::kMa, L::kMa> hl_l0;
+      TASSIGN(hl_l1, L::kL1Hl + neg * L::kMa * L::kMa * sizeof(half));
+      TASSIGN(hl_l0, L::l0aOp(neg));
+      TMOV(hl_l0, hl_l1);
+    }
+  } else {
+    MatTile<R, R> hl_l1;
+    TileLeft<half, R, R> hl_l0;
+    TASSIGN(hl_l1, L::kL1Hl);
+    TASSIGN(hl_l0, L::kL0aHl);
+    TMOV(hl_l0, hl_l1);
+  }
+  if constexpr (L::kBlkA) {
+    for (uint32_t neg = 0; neg < 2; ++neg) {
+      MatTile<L::kMb, L::kMb> hc_l1;
+      TileRight<half, L::kMb, L::kMb> hc_l0;
+      TASSIGN(hc_l1, L::kL1Hc + neg * L::kMb * L::kMb * sizeof(half));
+      TASSIGN(hc_l0, L::l0bOp(neg));
+      TMOV(hc_l0, hc_l1);
+    }
+  } else {
+    MatTile<C, C> hc_l1;
+    TileRight<half, C, C> hc_l0;
+    TASSIGN(hc_l1, L::kL1Hc);
+    TASSIGN(hc_l0, L::kL0bHc);
+    TMOV(hc_l0, hc_l1);
+  }
   Sync<PIPE_MTE1, PIPE_M>();
+}
+
+// H_f[i,j] = (-1)^popcount(i & j) for the Sylvester matrix, so the sign of
+// block (i,j) is a parity and H_acc itself is never built or read. Returns 1
+// for -H_M and 0 for +H_M, which are also their operand slot indices.
+// One column block of the blocked shallow right multiply. Slot and flag ids
+// are template arguments because bisheng requires a literal EVENT_ID*, so the
+// caller branches on i & 1 rather than indexing.
+template <uint32_t R, uint32_t C, uint32_t S, uint32_t Slot, uint32_t P,
+          event_t EvRdy, event_t EvWar>
+AICORE void shallowBlockA(uint32_t i);
+
+AICORE inline uint32_t blockSign(uint32_t i, uint32_t j) {
+  uint32_t v = i & j;
+  v ^= v >> 4;
+  v ^= v >> 2;
+  v ^= v >> 1;
+  return v & 1u;
 }
 
 // Issue the GM->L1 load for one tile into slot `pong` and signal MTE2->MTE1.
@@ -371,6 +611,101 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
       TSTORE(y_gm, acc_out);
     }
     set_flag(PIPE_FIX, PIPE_M, EV_ACC);
+  } else if constexpr (L::kBlkA || L::kBlkB) {
+    // Blocked shallow body: the same two multiplies as below, each applied as
+    // blocks against a resident +-H_M so that neither factor is ever in L0A or
+    // L0B whole. Blocking costs 1.8x per two-way split on the deep path, so it
+    // is only ever worth paying where there is no dense form at all -- a size
+    // whose H_C alone would fill L0B. Then it is not a speedup, it is the
+    // difference between running and not compiling.
+    constexpr uint32_t kSlot = Pong ? 1u : 0u;
+
+    if constexpr (L::kAlias) {
+      // The two accumulators share one L0C range here, so the previous tile's
+      // stores must have drained before this tile's FIRST matmul -- not merely
+      // before the left multiply, as in the unaliased form below.
+      wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
+    }
+
+    // --- right multiply: X * H_C, as kC1 column blocks summed in L0C ---
+    for (uint32_t i = 0; i < L::kC1; ++i) {
+      if constexpr (L::kSlotsA == 2) {
+        if (i & 1u) {
+          shallowBlockA<R, C, S, kSlot, 1, EV_SRA1, EV_SWA1>(i);
+        } else {
+          shallowBlockA<R, C, S, kSlot, 0, EV_SRA0, EV_SWA0>(i);
+        }
+      } else {
+        shallowBlockA<R, C, S, kSlot, 0, EV_SRA0, EV_SWA0>(i);
+      }
+    }
+    set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // X slot free (all blocks read)
+    Sync<PIPE_M, PIPE_FIX>();
+
+    // --- vertical stack -> horizontal concatenation, in L1 ---
+    // Grouped by the left multiply's ROW blocks, so each of its kR1 slices is
+    // one contiguous (Ma x S*C) tile rather than a strided row slice.
+    TileAcc<float, kStackRows, C> acc_stack;
+    TASSIGN(acc_stack, L::l0cStack(false));
+    for (uint32_t a = 0; a < L::kR1; ++a) {
+      for (uint32_t sm = 0; sm < S; ++sm) {
+        MatTile<L::kMa, C> t_block;
+        TASSIGN(t_block, L::kL1T + (a * S + sm) * L::kMa * C * sizeof(half));
+        TEXTRACT(t_block, acc_stack, sm * R + a * L::kMa, 0);
+      }
+    }
+    Sync<PIPE_FIX, PIPE_MTE1>();
+
+    // --- left multiply: H_R * T, as kR1 row blocks summed in L0C ---
+    // Under kAlias this writes over acc_stack. The extracts have drained it and
+    // M is ordered behind them transitively: FIX -> MTE1 by the Sync just made,
+    // then MTE1 -> M by the one inside the loop.
+    TileRight<half, L::kMa, S * C> t_l0;
+    TASSIGN(t_l0, L::kL0bT);
+    for (uint32_t ap = 0; ap < L::kR1; ++ap) {
+      MatTile<L::kMa, S * C> t_l1_ap;
+      TASSIGN(t_l1_ap, L::kL1T + ap * S * L::kMa * C * sizeof(half));
+      if (ap > 0) {
+        wait_flag(PIPE_M, PIPE_MTE1, EV_SWB);
+      }
+      TMOV(t_l0, t_l1_ap);
+      Sync<PIPE_MTE1, PIPE_M>();
+      if constexpr (!L::kAlias) {
+        if (ap == 0) {
+          wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous tile's stores drained
+        }
+      }
+#if !PTO_HAD_NOMM
+      for (uint32_t a = 0; a < L::kR1; ++a) {
+        TileAcc<float, L::kMa, S * C> acc_a;
+        TASSIGN(acc_a, L::l0cCatBlock(false, a));
+        TileLeft<half, L::kMa, L::kMa> h_a;
+        TASSIGN(h_a, L::l0aOp(blockSign(ap, a)));
+        if (ap == 0) {
+          TMATMUL(acc_a, h_a, t_l0);
+        } else {
+          TMATMUL_ACC(acc_a, h_a, t_l0);
+        }
+      }
+#endif
+      if (ap + 1 < L::kR1) {
+        set_flag(PIPE_M, PIPE_MTE1, EV_SWB);
+      }
+    }
+    Sync<PIPE_M, PIPE_FIX>();
+
+    for (uint32_t a = 0; a < L::kR1; ++a) {
+      for (uint32_t sm = 0; sm < S; ++sm) {
+        TileAcc<float, L::kMa, C> acc_block;
+        TASSIGN(acc_block,
+                L::l0cCatBlock(false, a) + sm * L::kMa * C * sizeof(float));
+        __gm__ half *y_row = y + (sample + sm) * L::kN + a * L::kMa * C;
+        GmTile<L::kMa, C> y_gm(y_row);
+        TASSIGN(y_gm, y_row);
+        TSTORE(y_gm, acc_block);
+      }
+    }
+    set_flag(PIPE_FIX, PIPE_M, EV_ACC);
   } else {
     // --- right multiply: X * H_C, S samples stacked vertically ---
     TileLeft<half, kStackRows, C> x_l0;
@@ -435,7 +770,50 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
   }
 }
 
-// --- deep pipeline (C == 16 only) ----------------------------------------
+template <uint32_t R, uint32_t C, uint32_t S, uint32_t Slot, uint32_t P,
+          event_t EvRdy, event_t EvWar>
+AICORE void shallowBlockA(uint32_t i) {
+  using L = Layout<R, C, S>;
+  constexpr uint32_t kStackRows = L::kStackRows;
+
+  TileLeft<half, kStackRows, L::kMb> x_l0;
+  TASSIGN(x_l0, L::kL0aX + P * L::kSliceA);
+  MatTile<kStackRows, L::kMb> x_l1_i;
+  TASSIGN(x_l1_i, L::xSlot(Slot) + i * L::kMb * kStackRows * sizeof(half));
+
+  // Only the block kSlotsA back shared this slot, so with two slots MTE1 stages
+  // block i+1 while M is still on block i.
+  if (i >= L::kSlotsA) {
+    wait_flag(PIPE_M, PIPE_MTE1, EvWar);
+  }
+  TMOV(x_l0, x_l1_i);
+  set_flag(PIPE_MTE1, PIPE_M, EvRdy);
+
+  wait_flag(PIPE_MTE1, PIPE_M, EvRdy);
+#if !PTO_HAD_NOMM
+  for (uint32_t j = 0; j < L::kC1; ++j) {
+    TileAcc<float, kStackRows, L::kMb> acc_j;
+    TASSIGN(acc_j, L::l0cStackBlock(false, j));
+    TileRight<half, L::kMb, L::kMb> h_j;
+    TASSIGN(h_j, L::l0bOp(blockSign(i, j)));
+    if (i == 0) {
+      TMATMUL(acc_j, x_l0, h_j);
+    } else {
+      TMATMUL_ACC(acc_j, x_l0, h_j);
+    }
+  }
+#endif
+  if (i + L::kSlotsA < L::kC1) {
+    set_flag(PIPE_M, PIPE_MTE1, EvWar);
+  }
+}
+
+// --- deep pipeline --------------------------------------------------------
+//
+// Both phase bodies branch on C internally. The C == 16 pair uses that case's
+// free NZ reinterpret so its turnaround is two TMOVs; the general pair pays the
+// same S TEXTRACTs plus S TSTOREs the shallow body pays. The SPLIT itself is
+// independent of either -- it is about pipe order, not about the reshape.
 //
 // The straight-line tile above is split here at the L1 turnaround. Phase A
 // takes the loaded X slot to L0B, left-multiplies by H_R and parks the result
@@ -455,6 +833,44 @@ template <uint32_t R, uint32_t C, uint32_t S, uint32_t Slot, bool Par,
           event_t EvX, event_t EvPA>
 AICORE void tilePhaseA() {
   using L = Layout<R, C, S>;
+
+  if constexpr (C != 16) {
+    // General body, same cut: right multiply, then park T in L1. X is the LEFT
+    // operand here (and T the right one in phase B), the mirror of the C == 16
+    // case, so the two share Layout's slot helpers and capacity asserts.
+    MatTile<L::kStackRows, C> x_l1;
+    TileLeft<half, L::kStackRows, C> x_l0a;
+    TileRight<half, C, C> hc_l0;
+    TileAcc<float, L::kStackRows, C> acc_stack;
+    TASSIGN(x_l1, L::xSlot(Slot));
+    TASSIGN(x_l0a, L::l0aX(Par));
+    TASSIGN(hc_l0, L::kL0bHc);
+    TASSIGN(acc_stack, L::l0cStack(Par));
+
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);  // this tile's load has landed
+    TMOV(x_l0a, x_l1);
+    set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // X slot free for the load 4 tiles on
+    set_flag(PIPE_MTE1, PIPE_M, EvPA);
+
+    wait_flag(PIPE_MTE1, PIPE_M, EvPA);
+#if !PTO_HAD_NOMM
+    TMATMUL(acc_stack, x_l0a, hc_l0);
+#endif
+    set_flag(PIPE_M, PIPE_FIX, EvPA);
+
+    // Vertical stack -> horizontal concatenation, in L1. Block-columns are
+    // contiguous in NZ, so sample s's (R x C) result lands at s * R * C and the
+    // S writes read back as one (R x S*C) tile in phase B.
+    wait_flag(PIPE_M, PIPE_FIX, EvPA);
+    for (uint32_t s = 0; s < S; ++s) {
+      MatTile<R, C> t_block;
+      TASSIGN(t_block, L::l1T(Par) + s * R * C * sizeof(half));
+      TEXTRACT(t_block, acc_stack, s * R, 0);
+    }
+    set_flag(PIPE_FIX, PIPE_MTE1, EvPA);
+    return;
+  }
+
   constexpr uint32_t kCat = S * R;
 
   MatTile<R, kCat> x_cat;
@@ -492,6 +908,46 @@ template <uint32_t R, uint32_t C, uint32_t S, bool Par, event_t EvPA,
           event_t EvPB>
 AICORE void tilePhaseB(__gm__ half *y, uint32_t sample) {
   using L = Layout<R, C, S>;
+
+  if constexpr (C != 16) {
+    // General body: left multiply on the concatenated view, then store each
+    // sample separately. The fixpipe L0C->GM path is 2D-to-2D only, so these
+    // cannot be folded into one strided descriptor -- a 5D scatter faults.
+    MatTile<R, S * C> t_l1;
+    TileRight<half, R, S * C> t_l0b;
+    TileLeft<half, R, R> hl_l0;
+    TileAcc<float, R, S * C> acc_cat;
+    TASSIGN(t_l1, L::l1T(Par));
+    TASSIGN(t_l0b, L::l0bT(Par));
+    TASSIGN(hl_l0, L::kL0aHl);
+    TASSIGN(acc_cat, L::l0cCat(Par));
+
+    wait_flag(PIPE_FIX, PIPE_MTE1, EvPA);  // phase A parked T in L1
+    TMOV(t_l0b, t_l1);
+    set_flag(PIPE_MTE1, PIPE_M, EvPB);
+
+    wait_flag(PIPE_MTE1, PIPE_M, EvPB);
+#if !PTO_HAD_NOMM
+    TMATMUL(acc_cat, hl_l0, t_l0b);
+#endif
+    set_flag(PIPE_M, PIPE_FIX, EvPB);
+
+    // No EV_ACC edge, as in the C == 16 phase body: with two cat accumulators
+    // the write-after-read on slot Par is already ordered, because B(i+2)'s
+    // TMOV waits on A(i+2)'s FIX->MTE1 flag and A(i+2)'s TEXTRACTs follow
+    // B(i)'s TSTOREs on the in-order FIX pipe.
+    wait_flag(PIPE_M, PIPE_FIX, EvPB);
+    for (uint32_t s = 0; s < S; ++s) {
+      TileAcc<float, R, C> acc_block;
+      TASSIGN(acc_block, L::l0cCat(Par) + s * R * C * sizeof(float));
+      __gm__ half *y_row = y + (sample + s) * L::kN;
+      GmTile<R, C> y_gm(y_row);
+      TASSIGN(y_gm, y_row);
+      TSTORE(y_gm, acc_block);
+    }
+    return;
+  }
+
   constexpr uint32_t kStackRows = L::kStackRows;
 
   MatTile<kStackRows, C> t_l1;
@@ -668,25 +1124,17 @@ AICORE void runCubeHadamard(__gm__ half *x, __gm__ half *y,
   // up to whole tiles instead leaves at most one ragged core and is worth 2x
   // at shapes where batch/cores lands just above a tile boundary, even though
   // it can idle the last few cores.
-#if PTO_HAD_TILE_SPLIT
   const uint32_t tiles_per_core = DIV_ROUNDUP(DIV_ROUNDUP(batch, S), num_cores);
   const uint32_t begin = tiles_per_core * S * core_id;
-#else
-  const uint32_t begin = DIV_ROUNDUP(batch, num_cores) * core_id;
-#endif
   if (begin >= batch) {
     return;
   }
-#if PTO_HAD_TILE_SPLIT
   uint32_t end = begin + tiles_per_core * S;
-#else
-  uint32_t end = begin + DIV_ROUNDUP(batch, num_cores);
-#endif
   if (end > batch) {
     end = batch;
   }
 
-  loadHadamardFactors<R, C>(h_left, h_right);
+  loadHadamardFactors<R, C, S>(h_left, h_right);
 #if PTO_HAD_STOP >= 2
   return;
 #endif

@@ -7,6 +7,8 @@
 - `onesided/`: cube-unit Hadamard as a single right-multiplication `Y = X * H_N`,
   with `H_N = H_B (x) H_M` applied as fixed-size matmuls accumulated in L0C, for
   `N` in 64..512 -- benchmark, plot, and test files
+- `auto/`: **the entry point to use.** One `fn(x, y)` that branches on `N` to
+  whichever of the above is fastest, covering `N` in 64..32768
 - `fuse_int8_quant/`: int8 quantize and fused Hadamard+int8 quant files
 - `fuse_int4_quant/`: int4 quantize and fused Hadamard+int4 quant files
 - shared helpers stay at the top level:
@@ -66,6 +68,7 @@ python plot.py --target all
 python test.py --target standard -v --npu "npu:0"
 python test.py --target cube -v --npu "npu:0"
 python test.py --target onesided -v --npu "npu:0"
+python test.py --target auto -v --npu "npu:0"
 python test.py --target quantize_int8 -v --npu "npu:0"
 python test.py --target quantize_int4 -v --npu "npu:0"
 python test.py --target hadamard_quant_int8 -v --npu "npu:0"
@@ -113,7 +116,7 @@ torch packed-int4 reference, also reported as `torch_unfused_*` in the fused CSV
 In `benchmark.py --target cube`, the cube kernel applies the balanced
 Kronecker split `H_n = H_R (x) H_C` as `Y = H_R * X * H_C`, i.e. two matmuls
 on the cube unit per tile of samples instead of `log2(N)` vector butterfly
-stages. It is out-of-place (`fn(x, y)`) and supports `N` in `[256, 16384]`,
+stages. It is out-of-place (`fn(x, y)`) and supports `N` in `[256, 32768]`,
 so its hidden-dimension grid starts at 256 instead of 128. The same shapes
 are also timed with the `standard/` vector kernel, reported as `vector_*` in
 the CSV and plots alongside the `cube_speedup_vs_vector` column.
@@ -141,6 +144,86 @@ cat > /tmp/cfg.json <<'EOF'
 EOF
 python cube/devtime_bench.py /tmp/cfg.json
 ```
+
+### The combined entry point (`auto/`)
+
+`auto/jit_util_hadamard_auto.py` exposes one out-of-place `fn(x, y)` that picks
+the kernel from `N`:
+
+| `N` | kernel | why |
+|---|---|---|
+| 64 .. 512 | `onesided/` | `N*N` MACs per sample, but one pipe pass per tile |
+| 1024 .. 32768 | `cube/` | `N*(R+C)` MACs, at the cost of a turnaround |
+
+The one-sided product's MACs grow 4x per doubling of `N` against 2x for its
+bytes, so it wins while `N` is small and loses once arithmetic dominates; the
+split's extra turnaround costs more than it saves while `N` is small. They cross
+between 512 and 1024. Each back end is compiled the first time a size needs it,
+and `pick_implementation(n)` answers the routing question without compiling
+anything.
+
+**The vector kernel is not one of the branches, because it is never the fastest
+choice in this range** -- see the table below. It stays in `standard/` as the
+baseline, and as the only kernel that runs `N < 64`.
+
+#### Required sizes, and what covers them
+
+The grid this example holds itself to is `bench_common.BENCH_HIDDEN_DIMS`:
+
+```
+128, 256, 512, 1024, 2048, 4096, 8192, 16384
+```
+
+which is also `standard/test_hadamard.py`'s own grid; the fused quantize suites
+use the subset `{128, 1024, 16384}`. **All eight are covered**, and the
+dispatcher reaches two sizes beyond them -- `N=64`, which only the one-sided
+kernel takes, and `N=32768`, which only the two-sided one does (the vector
+kernel caps at 16384, where one row fills its 32 KB UB tile). `N=32768` is the
+ceiling for all of them: at 65536 the split's accumulator would be 256 KB
+against a 128 KB L0C.
+
+`auto/test_hadamard_auto.py` runs the required grid plus both extremes, 4
+batches each, against an exact fp64 transform, and asserts the dispatcher's
+output is **bit-identical** to calling the chosen back end directly -- the
+dispatcher must add nothing but the choice.
+
+#### Against the vector kernel
+
+msprof `op_summary`, median of 15 launches after 4 warmups, 910B2, device time.
+Each kernel runs at its own best `block_dim` (the two cube kernels use their
+shipped schedules; the vector kernel was swept and 24 is its best at every `N`,
+since `blockDim=24` already gives it all 48 AIV cores). One input buffer for
+every kernel, so all three see the same footprint. Above 1.0 means the combined
+entry point is faster:
+
+| batch | N=128 | N=256 | N=512 | N=1024 | N=2048 | N=4096 | N=8192 | N=16384 |
+|------:|------:|------:|------:|------:|------:|------:|------:|------:|
+|     1 | 1.59x | 1.61x | 1.17x | 1.82x | 1.55x | 1.41x | 1.65x | 2.11x |
+|    16 | 1.81x | 1.86x | 1.42x | 1.66x | 1.69x | 1.87x | 1.97x | 1.84x |
+|    64 | 1.62x | 1.63x | 1.27x | 1.55x | 1.73x | 1.89x | 2.06x | 2.27x |
+|   256 | 1.41x | 1.47x | 1.24x | 1.62x | 1.80x | 2.21x | 2.81x | 2.55x |
+|  1024 | 1.62x | 1.42x | 1.26x | 1.81x | 2.47x | 2.98x | 3.58x | 2.71x |
+
+**Geometric mean 1.79x over the 40 cells, faster in every one**, from 1.17x to
+3.58x. Per `N` the geomeans are 1.60 / 1.59 / 1.27 / 1.69 / 1.82 / 2.01 / 2.32 /
+2.28x -- the gap widens with `N`, because the vector kernel pays `log2(N)`
+passes over UB while the split pays two matmuls. At batch 1024 that is
+120.5 -> 44.4 us at N=16384 and 57.6 -> 16.1 us at N=8192.
+
+`N=512` is the weakest column at 1.27x, which is the crossover sitting there:
+the one-sided kernel is already arithmetic-bound and the split's turnaround is
+still not amortised. The single cell where the size rule is not optimal is
+`N=512` with batch < 16, where the split read 1.96 us against the one-sided
+kernel's padded 2.18 us -- 0.22 us at a 2 us shape, inside what a per-library
+offset produces, so it is not worth a batch condition.
+
+Two measurement notes. The vector kernel is **in place**, so relaunching it on
+one buffer makes its values diverge (`H*H = n*I`, and fp16 saturates to inf
+within a few reps); a control at N=4096 with a fresh buffer per launch read
+1.005x, so inf costs nothing and the reuse is fair. Cycling a 19-buffer pool
+instead *did* cost 1.028x at N=16384 -- but that is the 608 MB pool spilling L2,
+not the values, which is why the comparison uses one buffer for all three
+kernels rather than a pool.
 
 ### Measured device time
 
@@ -206,7 +289,7 @@ worst possible depth.
 
 Two fixes follow, and they are both in the shipped kernel:
 
-- **`PTO_HAD_DBUF`** splits the C==16 tile body at its L1 turnaround into two
+- **`PTO_HAD_DBUF`** splits the tile body at its L1 turnaround into two
   phases and issues `A(i+1)` before `B(i)`. The straight-line body walks
   MTE1 -> M -> FIX -> MTE1 -> M -> FIX, and because each pipe is in-order its
   *second* MTE1 use cannot start until its own first matmul and L0C->L1 move
@@ -228,6 +311,7 @@ Two fixes follow, and they are both in the shipped kernel:
   |  4096 |  8.00 |      6 |       1.000x |            1.093x |
   |  8192 |  8.00 |      5 |       1.000x |            1.000x |
   | 16384 |  8.00 |      5 |       1.000x |            1.000x |
+  | 32768 | 16.54 |      6 |       1.029x |            1.074x |
 
   `k` is fitted per `N` rather than from a rule because nothing about `N`
   predicts it: **N=512 wants `k = 1` where N=1024 wants 8**, and an earlier
@@ -268,8 +352,61 @@ likely cause. Anything inside that band at `block_dim=24` and `N > 256`, where
 both builds compile the same shallow path, is noise -- the shallow buffer
 offsets are mechanically identical and the shallow event ids unchanged.
 
-Both are gated: build with `-DPTO_HAD_DBUF=0` for the single-buffered control,
-and pass `block_dim=` to override the schedule. `cube/build_variant.sh` builds
+#### The phase split applies at every size, not just N=256 (`PTO_HAD_DBUF_GEN`)
+
+The split was written for the `C == 16` body and gated on `C == 16`, which reads
+like a dependency on the free NZ reinterpret that case enjoys. **It is not.** The
+reinterpret is what makes the `C == 16` *turnaround* cheap -- two TMOVs instead
+of `S` TEXTRACTs plus `S` TSTOREs. The *split* is about pipe ORDER, and needs
+nothing but a cut at the turnaround and two of every intermediate. The general
+body already pays its reshape either way, so extending the split adds no work.
+
+It is also the case that should gain MORE: it visits each pipe twice exactly as
+the `C == 16` body does, with far more queued behind the second visit. Measured
+paired against the switch off, with N=256 (deep in both builds) and N=16384
+(fits in neither) as built-in null controls, both reading 1.00x:
+
+| N | b=1024 | b=8192 |
+|---:|---:|---:|
+| 512 | 1.15x | 1.17x |
+| 1024 | 1.21x | 1.42x |
+| 2048 | 1.33x | 1.55x |
+| 4096 | 1.50x | **1.70x** |
+| 8192 | 1.59x | see below |
+
+The gain holds until the working set outgrows L2 (~192 MB), after which the
+kernel is HBM-bound and pipe order cannot help -- neutral there, not harmful.
+Swept at N=8192 against a byte-identical copy of the same `.so`:
+
+| batch | footprint | deep/flat | null/deep |
+|------:|----------:|----------:|----------:|
+| 1024 | 34 MB | **1.59x** | 1.00x |
+| 2048 | 67 MB | **1.67x** | 1.00x |
+| 4096 | 134 MB | **1.70x** | 1.00x |
+| 8192 | 268 MB | 0.95x | **0.86x** |
+| 16384 | 537 MB | 1.04x | 1.01x |
+
+The 0.95x is not a regression: the null control reads 0.86x from *zero* code
+difference at that shape. Always run one before believing a large-shape delta.
+
+**Before/after over the whole range** -- previously shipped (split at N=256
+only, shallow-fitted schedule) against now (split wherever it fits, refitted
+schedule), 32 shapes, 3 interleaved passes: **0.99x to 1.71x, geometric mean
+1.16x, no regression beyond 2%**. By `N`: 1.00x, 1.20x, 1.16x, 1.21x, 1.38x,
+1.25x, 1.01x for 256 .. 16384.
+
+The two unchanged sizes are unchanged for different reasons. N=256 already had
+the split. **N=16384 is locked out by capacity**: its tile is one whole sample,
+32 KB, so two slots are 100% of L0A and 100% of L0B on their own, whatever else
+is evicted. Blocking each stage internally does shrink those slots by `C/M` at
+no MAC cost, and it does let N=16384 reach the deep path -- and it is a
+**1.28x regression** there, because blocking costs more than the interleave
+buys. That was built, measured, and then deleted; see **Blocking each stage
+internally** below.
+
+All three are gated: `-DPTO_HAD_DBUF=0` for the single-buffered control,
+`-DPTO_HAD_DBUF_GEN=0` to restrict the split back to `C == 16`, and
+`block_dim=` to override the schedule. `cube/build_variant.sh` builds
 one switch combination and `cube/validate_variant.py` checks a prebuilt variant
 against an exact fp64 reference -- run it before timing anything, since a switch
 that computes the wrong answer is a broken lever, not a slow technique. `block_dim` must not change
@@ -281,6 +418,110 @@ event ids, and renumbering the *existing* ids -- in a path that was otherwise
 untouched -- cost a reproducible 0.92x at N=1024 batch 65536. The two drivers
 now keep separate id names over a shared pool so the shallow path's flags are
 exactly what they were. Measure renumbering as its own change.
+
+#### Blocking each stage internally (`PTO_HAD_BLOCK`): costs 1.5x, buys N=32768
+
+The two-sided kernel is two one-sided products, and each of those can be split
+again: `H_C = H_{C,acc} (x) H_{C,mat}`, applied as `kC1` column blocks of the
+data against a resident `+-H_M`, with the sum over blocks taken in the L0C
+accumulator. `H_{C,acc}` is never built -- its entries are `(-1)^popcount(i&j)`,
+so the only operands that ever occur are `+H_M` and `-H_M`. The MAC count is
+unchanged (`kC1^2` matmuls of `rows x M` by `M x M` is the same product), there
+is still exactly one fp32 rounding, and results are **bit-identical**: all three
+of dense, blocked-deep and blocked-shallow report the same `rel_rms` to three
+figures at every size. This is the same identity the one-sided kernel uses, and
+there it was worth 1.3-2.6x.
+
+**Here it costs 1.5x and is off by default.** Blocking shrinks the per-matmul
+slot, which is the point, but the blocked body walks `MTE1 -> M -> MTE1 -> M`
+and so uses each pipe `kC1` times per phase -- re-serializing consecutive tiles,
+which is exactly what the deep path's two-phase interleave exists to prevent.
+Measured with everything else held fixed (batch 1024, msprof device time):
+
+| arm | N=8192 | N=16384 | what differs |
+|---|---:|---:|---|
+| dense, deep path | 16.16 us | -- | -- |
+| blocked, deep path | 28.76 us | -- | **1.78x** |
+| dense, shallow path | 26.16 us | 44.72 us | -- |
+| blocked, shallow path | 38.86 us | 67.88 us | **1.49x / 1.52x** |
+
+Null controls for those: the two arms at N=4096 (where `M=64` equals both
+factors, so neither blocks) read 0.996-1.008x, and at N=32768 (where both arms
+block) 0.995-1.000x. So the effect is 50-80x the harness's resolution here.
+
+Consequently `kBlockIt` is gated on whether the **dense shallow** path fits --
+the fallback every size has -- and not on whether the deep path fits. Gating it
+on the deep path instead makes N=16384 blocked-deep at 56.86 us against
+44.30 us dense-shallow, a 1.28x regression that holds at all 24 `block_dim`
+values (1.28-1.33x). With the shipped gate, every size that worked before
+compiles to a **byte-identical** `.so`.
+
+`kDbuf` therefore carries a `!kBlockIt` term: **blocking implies the shallow
+path, always.** That is not just a policy, it is what makes the deep path's
+capacity expressions revert to the dense ones (`kMa == R`, `kMb == C`, so the
+operands are `H` whole and the slices are full tiles) -- and it made the blocked
+*deep* phase bodies unreachable, so they were deleted along with the four event
+ids and the accumulator-aliasing edge that only they used. The kernel lost 166
+lines (1354 -> 1188) at 0.995-1.018x on five sizes x two batches, i.e. no
+measurable change. `PTO_HAD_BLOCK_ALWAYS=1` still forces blocking on for the
+A/B; it now routes to the blocked *shallow* body, which is the arm the 1.49x
+and 1.52x rows above were measured with.
+
+**What it does buy is a size that could not run at all.** N=32768 splits as
+`128 x 256`, and `H_C` alone is 128 KB against a 64 KB L0B, so there is no dense
+form of it -- blocking is not a speedup there, it is the difference between
+running and not compiling. With `M=64` the operands are 16 KB, and with the two
+accumulators aliased (they are live in disjoint phases) L0C lands at exactly
+128 KB. 288 validation cases pass at `rel_rms` 2.94e-04, the same fp16 floor as
+every other size, and `cube/race_probe.py` reports 0 bad in 40 repeats at three
+shapes. At batch 1024 `block_dim` 24 it runs **133.1 us, 1009 GB/s**.
+
+Two things were worth tuning on it. **Block-level double buffering of the right
+multiply** gives MTE1 a second L0A slice so it can stage block `i+1` while the
+cube is still on block `i`; that recovers 1.07-1.09x (133.06 vs 145.18 us at
+batch 1024, nulls 0.999x and 1.010x). The left multiply cannot have it -- its
+slice is `kMa * S * C`, twice as wide, and two of those plus the operand
+overflow L0B. And the **block size was swept rather than reasoned**: `kMa = 64`
+beats 32 by 1.03-1.04x, while `kMb = 32` is fastest at all three batches tested
+but only by 1.004-1.017x, inside the null band, so the simpler `64/64` default
+ships.
+
+#### The defect this found: one event id must not carry two channels out of one pipe
+
+The first blocked build passed all 252 validation cases and then failed 4 times
+in 30 repeats of a single shape -- a race. It is worth recording because the
+credit arithmetic that hides it looks correct.
+
+The blocked loop needs two edges out of `PIPE_M`: a per-block write-after-read
+edge `(M -> MTE1)` so the next `TMOV` does not overwrite the slice the cube is
+still reading, and the end-of-phase handoff `(M -> FIX)`. Both were given the
+phase's own event id. Credits balance **per channel**, and the PTO library
+budgets them per `EventIdCounter<SrcPipe, DstPipe>`, so that reads as safe --
+but if the hardware flag is keyed on `(src pipe, id)` rather than the ordered
+pair, the `FIX` wait can take a *mid-loop* credit and run `TEXTRACT`/`TSTORE`
+before the last matmul lands. Giving the write-after-read edge its own ids fixed
+it: 0 bad in 60 repeats per config against a 4/30 control, probability ~e^-17
+under the control rate.
+
+Three things made it findable, and all three generalise:
+
+- **The error magnitude named the stage.** Dropping one of `k` accumulation
+  terms in an orthogonal transform leaves relative RMS `sqrt(1/k)`. Every
+  failure read 0.7071, i.e. exactly one of two terms missing -- which says a
+  store ran ahead of a matmul, not that data was corrupt. `cube/race_probe.py`
+  exists for this and prints the value.
+- **The reproducer had no shared buffers.** It failed on a core with two tiles,
+  whose parities use disjoint slots, so nothing cross-tile could be at fault and
+  the search collapsed to one tile's own flags.
+- **Three extra edges were built and measured before being believed.** Forcing
+  the `FIX -> M` accumulator edge, and draining `M` at the end of each phase,
+  left the rate at 4/30 unchanged -- which is what ruled out the missing-edge
+  explanations and pointed at the ids. Two further probe bits deadlocked on an
+  unprimed credit and were discarded as mis-wired rather than scored.
+
+The rest of the kernel was audited against this: the shallow path, the unblocked
+deep path and `loadHadamardFactors` each use at most one `src = PIPE_M` channel
+per id, which is why they always validated.
 
 ### The one-sided kernel (`onesided/`, N = 64..512)
 
