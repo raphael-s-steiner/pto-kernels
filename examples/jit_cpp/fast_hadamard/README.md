@@ -380,6 +380,172 @@ likely cause. Anything inside that band at `block_dim=24` and `N > 256`, where
 both builds compile the same shallow path, is noise -- the shallow buffer
 offsets are mechanically identical and the shallow event ids unchanged.
 
+#### The NZ view is not a reinterpret trick, it is a symmetry of the transform (`PTO_HAD_NZGM`)
+
+Both GM transfers of a 16-column tile go through a `Layout::NZ` view
+(`PTO_HAD_NZLOAD` / `PTO_HAD_NZSTORE`), which is worth 4.5-8.7x at N=256: the
+default ND2NZ path writes L1 in C0-sized **32-byte** pieces, and the NZ view
+makes the whole tile one contiguous burst. The obvious reading is that this is a
+*byte reinterpret* and so needs `C == 16` -- one block-column, where ND and NZ
+bytes coincide. That reading is too weak, and it had the kernel leaving the win
+on the table at every other size.
+
+NZ position is a **permutation of the bit fields** of ND position:
+
+    ND:  [ row>>4 | row&15 | col>>4 | col&15 ]
+    NZ:  [ col>>4 | row>>4 | row&15 | col&15 ]
+
+and a Sylvester Hadamard is *invariant* under any bit permutation of its index,
+because `H[i][j] = (-1)^popcount(i & j)` and `popcount` does not care which bit
+positions the set bits occupy: `popcount(sigma(i) & sigma(j)) = popcount(i & j)`.
+So feeding the cube the ND bytes read as NZ computes the transform of a permuted
+input, which *is* the permuted transform -- and reading the accumulator back out
+through the same NZ view undoes the permutation exactly. The two legs must flip
+**together**; either alone emits a permuted result, at `rel_rms` sqrt(2).
+
+Checked exactly in integer arithmetic for (R,C) = (16,16), (16,32), (32,16),
+(32,32), (16,64), (32,64), (64,64) and (64,128), then on hardware over the
+validator's 288 cases.
+
+**The one restriction is the sample axis.** The permutation lifts `col>>4` above
+the row index, and for a tile of `S` stacked samples that is above the *sample*
+index too -- but the kernel's operator is `I_S (x) H_N`, which is only invariant
+under permutations that leave the sample bits fixed. So the tile must hold one
+sample. That is `S == 1`, i.e. N >= 8192. (N=32768 is excluded for a second,
+unrelated reason: its blocked body stores row SUB-BLOCKS of the output, and
+`TStoreAccNz2nz` derives the destination block-column stride from the shape
+rather than from `gStride1`, so it can only write a whole NZ tile.)
+
+**Measured: 1.017x geometric mean, and that is the honest number.** Paired A/B,
+`block_dim` 12 and 24, batch 16..4096, with N=32768 as a built-in null control
+(blocked, so the switch cannot reach it) reading 0.997-1.005x across five cells:
+
+| N | b=16 | b=64 | b=256 | b=1024 | b=4096 |
+|---:|---:|---:|---:|---:|---:|
+| 8192 (bd 24) | 1.006x | 0.992x | 1.017x | 1.018x | 1.154x |
+| 8192 (bd 12) | 1.028x | 1.009x | 1.018x | 1.018x | 1.019x |
+| 16384 (bd 24) | 1.022x | 1.023x | 1.007x | 1.002x | 0.968x |
+| 16384 (bd 12) | 1.018x | 1.004x | 1.007x | 1.013x | 1.009x |
+
+18 of 20 cells sit at or above 1.0 and the modal value is 1.017-1.018x, which is
+clear of the null band; the two outliers are both >60 us shapes, where this
+harness is known to read 0.86-1.14x from zero code difference.
+
+**Why so much smaller than the 4.5-8.7x at N=256?** Because the prize scales
+with how *narrow* the tile is, and it is the sizes that cannot use the trick
+that would want it most. At `C == 16` the ND descriptor row is 32 bytes; at
+`C == 128` it is 256 bytes, and these sizes are L2-resident anyway -- the GB/s
+column reads 1500-2100 GB/s against a ~920 GB/s streaming ceiling, so the GM leg
+is simply not the constraint. A `PTO_HAD_NOMM` floor probe says the same thing
+from the other side: dropping both matmuls saves only 1-5% at N <= 8192, so
+95-99% of the time is movement -- but it is *on-chip* movement (L1->L0 `TMOV`,
+L0C->L1 `TEXTRACT`) and pipe serialization, not GM descriptors.
+
+**How much is left on the table, and where.** `PTO_HAD_NZUNSAFE` drops the
+`S == 1` guard, which computes wrong answers but moves exactly the bytes a
+restructure would. Measured on the movement floor (`PTO_HAD_NOMM=1`, so the
+matmuls cannot mask it -- the most favourable framing available):
+
+| N | b=1024 | b=4096 |
+|---:|---:|---:|
+| 512 | 1.012x | 1.034x |
+| 1024 | **1.092x** | **1.146x** |
+| 2048 | 1.014x | 1.012x |
+| 4096 | 1.007x | 1.006x |
+
+So the entire remaining prize is ~1.1x at **N=1024**, and essentially nothing
+elsewhere. N=512 has the narrowest tile in this group (`C == 32`, 64-byte
+descriptor rows) and still gains only 1.01-1.03x, because it is bound by its 16
+`TEXTRACT`s plus 16 `TSTORE`s rather than by the load -- the same thing that
+makes its `block_dim` constant `k = 1` where every neighbour wants 8.
+
+**Why reaching it is a restructure and not a switch.** There is a layout tension
+with no free side. The *load* wants the horizontal concatenation `(R x S*C)`,
+which is one contiguous NZ descriptor because sample `s` lands exactly in
+block-columns `[s*C/16, (s+1)*C/16)`. The *store* needs the concatenated
+accumulator too, because that is the only view in which sample `s` is a
+contiguous byte range of L0C and can be re-`TASSIGN`ed as its own `(R x C)` Acc
+tile -- a row sub-block of the vertical stack cannot be stored at all, for the
+same `TStoreAccNz2nz` reason that excludes N=32768. But the concatenated view
+comes from the *left* multiply and the stacked view from the *right* one, so
+only one of the two legs can have it: putting `H_R` first (verified correct in
+exact arithmetic for S = 2, 4, 8 and 16) buys the contiguous load and loses the
+store. Breaking the tension needs the load to scatter `S` per-sample NZ images
+into the strided row blocks of a stacked L1 tile, which is a 5D-descriptor
+question that has not been tried.
+
+So: kept, because it is correct, costs nothing and regresses nothing, but it is
+worth ~1.7% rather than the large win the descriptor-width argument suggests,
+and the only size with a further ~1.1x in it is N=1024.
+
+#### The bit-plan tile: conversion-free transfers at any S, because H is a constant (2.47x at N=512)
+
+The `S == 1` restriction above is not a property of the layouts. It is a
+property of insisting the operand be a *Hadamard matrix*. Drop that and the
+restriction goes away.
+
+`H_N` is a tensor power of `H_2`, so the transform applies `H_2` to each index
+bit **independently**. A matmul against a compile-time operand applies whatever
+we like to one FIELD of the byte index, and a contiguous NZ load of an `(A x B)`
+view groups the GM byte index `p` as
+
+    p = [ col_hi | row_hi | row_lo | col_lo ]
+          t-1..a+4  a+3..8   7..4     3..0
+
+so the left operand owns `p[4, a+4)` and the right operand owns
+`p[0,4) u p[a+4, t)` -- together they partition `p`. Correctness is then pure
+bit accounting:
+
+> **every transform bit gets `H_2` exactly once; every sample bit gets `I_2`.**
+
+The operand for a field is the tensor product, in that field's bit order, of
+`H_2` for a transform bit and `I_2` for a sample bit. Sample bits sit at the top
+of `p`, so they land in `col_hi` and are simply skipped. At N=512 with a T=8192
+tile the plan is view `(64 x 128)` with
+
+    OpA = I_2 (x) H_32   (64 x 64,   the row field p[9..4],  p9 is a sample bit)
+    OpB = I_8 (x) H_16   (128 x 128, the col field p[12..10] u p[3..0])
+
+Verified in exact integer arithmetic for every entry in the case table, then on
+hardware. **This needs no new kernel code**: view `(64 x 128)` with `S == 1` is
+byte for byte the configuration the kernel already runs at N=8192, so the
+bit-plan is the existing, already-validated body driven with `T`-element rows
+and these operands substituted for `H_64` / `H_128`. It lives in
+`bitplan_operands` in `cube/jit_util_hadamard_cube.py` (`PTO_HAD_BITPLAN=0`
+disables it); a batch that does not fill whole tiles sends its remainder to the
+classic path in a second launch.
+
+**What it buys, and why only at N=512.** The tile drops from `2S+5` descriptors
+to **7 at any size** -- one contiguous NZ load, one `TEXTRACT` with no reshape,
+one contiguous NZ store -- which is what the `C == 16` body already enjoys at
+N=256. Measured against the classic path, each at its own best `block_dim`:
+
+| N=512 | classic | bit-plan | |
+|---|---:|---:|---:|
+| batch 256 | 4.940 us | 2.850 us | **1.73x** |
+| batch 1024 | 8.640 us | 3.870 us | **2.23x** |
+| batch 4096 | 15.730 us | 6.380 us | **2.47x** |
+| batch 16384 | 30.291 us | 16.140 us | **1.88x** |
+
+The price is MACs. Both operands span the whole index, so the cost is
+`A + B = 2*sqrt(T)` per value instead of `2*sqrt(N)`, i.e. `sqrt(S)` more --
+6x at N=256 falling to 1x at N >= 8192. That only pays where the per-tile
+descriptor count dominates, and N=512 is the only size where it does: it is the
+one tile that is 16 `TEXTRACT`s plus 16 `TSTORE`s plus a 64-byte-row gather,
+with matmuls at 0.7% of its time. Everywhere else the trade is a wash or a loss,
+measured 0.94-1.11x at N=1024 through 4096, so the table has one entry.
+
+This was priced *before* being built, by noticing that the N=512 plan compiles
+to the existing N=8192 configuration: comparing the two at matched values and
+matched tile counts predicted 1.76/2.23/2.50/1.91x against the 1.73/2.23/2.47/
+1.88x finally measured. A free forecast from a measurement already in hand.
+
+**It moved a routing decision.** N=512 was the one size where the one-sided
+kernel beat the two-sided one, which is why `auto` branched there. With the
+bit-plan the two-sided kernel wins from batch 256 up -- 1.01x at 256 to 1.69x at
+16384 -- while one-sided keeps a flat 1.04-1.06x below it. So N=512 is now the
+only size whose dispatch reads batch as well as N; see `BITPLAN_BATCH_MIN`.
+
 #### The phase split applies at every size, not just N=256 (`PTO_HAD_DBUF_GEN`)
 
 The split was written for the `C == 16` body and gated on `C == 16`, which reads

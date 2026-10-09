@@ -14,7 +14,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 import torch_npu  # noqa: F401
 
-from cube.jit_util_hadamard_cube import hadamard_factors
+from cube.jit_util_hadamard_cube import (bitplan_operands,
+                                            hadamard_factors)
 from onesided.jit_util_hadamard_onesided import hadamard_full
 from jit_util_common import get_current_stream_ptr, load_cdll, load_required_symbol
 
@@ -84,6 +85,19 @@ def main():
                     ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(y.data_ptr()),
                     ctypes.c_void_p(h_left.data_ptr()),
                     ctypes.c_void_p(h_right.data_ptr()), batch, n)
+        elif kind == "bitplan":
+            # The conversion-free single-view tile: `batch` samples of width n
+            # are driven as batch/samples_per_tile rows of T = A*B elements,
+            # against the tensor-product operands. Same .so and same entry
+            # point as `cube` -- only the operands and the declared shape move.
+            fn = kernel_for(so, CUBE_ARGS)
+            op_a, op_b, spt = bitplan_operands(n, x.device)
+            tiles, tile_n = batch // spt, spt * n
+            assert tiles, f"batch {batch} is below one bit-plan tile ({spt})"
+            args = (block_dim, stream_ptr,
+                    ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(y.data_ptr()),
+                    ctypes.c_void_p(op_a.data_ptr()),
+                    ctypes.c_void_p(op_b.data_ptr()), tiles, tile_n)
         else:
             so = str(BASE / "standard" / "outputs" / "so" / "fast_hadamard_jit.so")
             fn = kernel_for(so, STD_ARGS)

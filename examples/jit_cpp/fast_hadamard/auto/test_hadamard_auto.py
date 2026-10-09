@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from auto.jit_util_hadamard_auto import (
+    BITPLAN_BATCH_MIN,
     MAX_AUTO_N,
     MIN_AUTO_N,
     ONESIDED_MAX_N,
@@ -69,6 +70,26 @@ def _assert_matches_reference(y, ref):
 def test_routing_is_the_measured_crossover(n):
     expected = "onesided" if n <= ONESIDED_MAX_N else "cube"
     assert pick_implementation(n) == expected
+
+
+@pytest.mark.parametrize("batch,expected", [
+    (1, "onesided"), (16, "onesided"), (128, "onesided"),
+    (BITPLAN_BATCH_MIN, "cube"), (1024, "cube"), (16384, "cube"),
+])
+def test_n512_routing_follows_batch(batch, expected):
+    """N=512 is the one size where batch moves the choice.
+
+    The two-sided kernel's bit-plan tile wins there from batch 256 up, by
+    1.01x to 1.69x; below it the one-sided kernel holds a flat 1.04-1.06x.
+    """
+    assert pick_implementation(512, batch) == expected
+
+
+@pytest.mark.parametrize("n", [64, 128, 256])
+def test_batch_does_not_move_routing_below_512(n):
+    """Only N=512 is a crossover; the rest are decided by N alone."""
+    for batch in (1, 16, 1024, 16384):
+        assert pick_implementation(n, batch) == "onesided"
 
 
 def test_required_grid_is_inside_the_supported_range():

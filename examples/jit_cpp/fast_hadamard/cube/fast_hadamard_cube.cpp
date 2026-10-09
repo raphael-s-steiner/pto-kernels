@@ -69,6 +69,38 @@ using namespace pto;
 #ifndef PTO_HAD_NZSTORE
 #define PTO_HAD_NZSTORE 1
 #endif
+// Take the SAME contiguous burst at C > 16, where ND and NZ are no longer the
+// same bytes. It still works, for a different reason: NZ position is a
+// PERMUTATION OF THE BIT FIELDS of ND position,
+//
+//   ND:  [ row>>4 | row&15 | col>>4 | col&15 ]
+//   NZ:  [ col>>4 | row>>4 | row&15 | col&15 ]
+//
+// and a Sylvester Hadamard is invariant under any bit permutation of its
+// index, because H[i][j] = (-1)^popcount(i & j) and popcount is blind to which
+// bit positions the set bits sit in. So feeding the cube the ND bytes read as
+// NZ computes the transform of a permuted input, which IS the permuted
+// transform -- and reading the accumulator back out through the same NZ view
+// undoes the permutation exactly. Load and store must therefore flip TOGETHER:
+// either alone emits a permuted result.
+//
+// The one restriction is that the permutation lifts col>>4 above the row
+// index, which for a tile of S stacked samples lifts it above the SAMPLE index
+// too -- so it would mix samples unless the tile holds one. Hence S == 1,
+// which is the top of the size table (N >= 8192) and exactly where the
+// transfers are largest.
+#ifndef PTO_HAD_NZGM
+#define PTO_HAD_NZGM 1
+#endif
+// DIAGNOSTIC, COMPUTES WRONG ANSWERS. Drops the S == 1 guard above so the
+// contiguous NZ descriptor is used at every size. The results are permuted
+// across samples and meaningless, exactly like PTO_HAD_NOMM's; the point is to
+// price the GM leg at the NARROW tiles (C = 32 and 64), which are the ones a
+// restructure would have to reach and the only ones where the ND descriptor row
+// is still small enough to hurt. Never ship this on.
+#ifndef PTO_HAD_NZUNSAFE
+#define PTO_HAD_NZUNSAFE 0
+#endif
 // Split the per-core work by whole tiles rather than by samples, so at most
 // one core walks the power-of-two fallback down to single-sample tiles.
 // Run the tile as two interleaved phases instead of one straight-line body. The straight-line body visits MTE1 -> M -> FIX -> MTE1 -> M -> FIX, and
@@ -229,10 +261,14 @@ template <uint32_t Rows, uint32_t Cols>
 using MatTile = Tile<TileType::Mat, half, Rows, Cols, BLayout::ColMajor, Rows,
                      Cols, SLayout::RowMajor, 512>;
 
-// NZ view of a 16-column tile: Shape<1, 1, Rows/16, 16, C0>, contiguous.
+// NZ view of a tile: Shape<1, Cols/16, Rows/16, 16, C0> with the canonical
+// strides, i.e. block-column major over 16x16 row-major fractals. At Cols == 16
+// that is one block-column and the bytes coincide with ND; above it the two
+// differ by the bit permutation described at PTO_HAD_NZGM. Either way the
+// descriptor is contiguous over the whole tile.
 template <uint32_t Rows, uint32_t Cols>
-using GmNz = GlobalTensor<half, Shape<1, 1, Rows / 16, 16, 16>,
-                          Stride<Rows * Cols, Rows * Cols, 256, 16, 1>,
+using GmNz = GlobalTensor<half, TileShape2D<half, Rows, Cols, Layout::NZ>,
+                          BaseShape2D<half, Rows, Cols, Layout::NZ>,
                           Layout::NZ>;
 
 template <uint32_t Rows, uint32_t Cols>
@@ -267,6 +303,28 @@ struct Layout {
       2 * kAccBytes <= L0C_BYTES;
   static constexpr bool kBlockIt =
       (PTO_HAD_BLOCK_ALWAYS != 0) || !kDenseShallowFits;
+
+  // Move both GM transfers onto the contiguous NZ descriptor. At C == 16 the
+  // two layouts are the same bytes and each leg is independent
+  // (PTO_HAD_NZLOAD / PTO_HAD_NZSTORE); above it they differ by a bit
+  // permutation that only cancels if BOTH legs use the NZ view, and only
+  // stays inside one sample if the tile holds one. See PTO_HAD_NZGM.
+  //
+  // Not on the blocked path: its stores are row SUB-BLOCKS of the output, and
+  // TStoreAccNz2nz derives the destination block-column stride from the shape
+  // (gShape2 * gShape3 * C0) rather than from gStride1, so it can only write a
+  // whole NZ tile.
+  static constexpr bool kNzGm = (PTO_HAD_NZGM != 0) && (C > 16) &&
+                                (S == 1 || PTO_HAD_NZUNSAFE != 0) && !kBlockIt;
+
+  // Which GM view each leg uses. EVERY load and store site reads these two,
+  // so the pair cannot drift apart: kNzGm makes both true at once, which is
+  // what the permutation needs, while at C == 16 the bytes coincide and the two
+  // switches are free to differ. A store site that forgets them emits a
+  // permuted result -- rel_rms sqrt(2), which validate_variant.py reports at
+  // every shape of that size.
+  static constexpr bool kNzLoad = (C == 16 && PTO_HAD_NZLOAD != 0) || kNzGm;
+  static constexpr bool kNzStore = (C == 16 && PTO_HAD_NZSTORE != 0) || kNzGm;
   static constexpr uint32_t kMa =
       (!kBlockIt || PTO_HAD_BLOCK == 0 || PTO_HAD_BLOCK >= R)
           ? R
@@ -516,11 +574,12 @@ AICORE void issueTileLoad(__gm__ half *x, uint32_t sample) {
   TASSIGN(x_l1, L::xSlot(Slot));
   __gm__ half *x_tile = x + sample * L::kN;
 
-  if constexpr (C == 16 && PTO_HAD_NZLOAD) {
-    // A 16-column ND tile is a single block-column, so its NZ image is
-    // byte-identical to the GM bytes. Declaring the source Layout::NZ turns
-    // the default ND2NZ gather -- which reads C*sizeof(half) = 32 BYTES per
-    // descriptor row -- into one contiguous burst over the whole tile.
+  if constexpr (L::kNzLoad) {
+    // Declaring the source Layout::NZ turns the default ND2NZ gather -- which
+    // writes L1 in C0-sized 32-BYTE pieces however wide the tile is -- into one
+    // contiguous burst over the whole tile. At C == 16 that is a pure
+    // reinterpret; above it the permutation it introduces is undone by the
+    // matching NZ store, which L::kNzGm guarantees is in use.
     GmNz<L::kStackRows, C> x_gm(x_tile);
     TASSIGN(x_gm, x_tile);
     TLOAD(x_l1, x_gm);
@@ -601,7 +660,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
     Sync<PIPE_M, PIPE_FIX>();
 
     __gm__ half *y_tile = y + sample * L::kN;
-    if constexpr (PTO_HAD_NZSTORE) {
+    if constexpr (L::kNzStore) {
       GmNz<kStackRows, C> y_gm(y_tile);
       TASSIGN(y_gm, y_tile);
       TSTORE(y_gm, acc_out);
@@ -700,6 +759,10 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
         TASSIGN(acc_block,
                 L::l0cCatBlock(false, a) + sm * L::kMa * C * sizeof(float));
         __gm__ half *y_row = y + (sample + sm) * L::kN + a * L::kMa * C;
+        // Always ND here: these are row SUB-BLOCKS of the output, and
+        // TStoreAccNz2nz takes the destination block-column stride from the
+        // shape, so it can only write a whole NZ tile. kNzGm is false on this
+        // path for exactly that reason.
         GmTile<L::kMa, C> y_gm(y_row);
         TASSIGN(y_gm, y_row);
         TSTORE(y_gm, acc_block);
@@ -762,9 +825,20 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
       TASSIGN(acc_block, L::kL0cCat + s * R * C * sizeof(float));
 
       __gm__ half *y_row = y + (sample + s) * L::kN;
-      GmTile<R, C> y_gm(y_row);
-      TASSIGN(y_gm, y_row);
-      TSTORE(y_gm, acc_block);
+      if constexpr (L::kNzStore) {
+        // The second half of the pair: writing the accumulator out through the
+        // NZ view undoes the permutation the NZ load introduced, so the result
+        // lands in natural order. Unlike the ND path (TStoreAccNz2nd, which
+        // asserts the three outer GlobalTensor dims are 1) this one carries a
+        // real block-column stride, so a wide tile is one descriptor.
+        GmNz<R, C> y_gm(y_row);
+        TASSIGN(y_gm, y_row);
+        TSTORE(y_gm, acc_block);
+      } else {
+        GmTile<R, C> y_gm(y_row);
+        TASSIGN(y_gm, y_row);
+        TSTORE(y_gm, acc_block);
+      }
     }
     set_flag(PIPE_FIX, PIPE_M, EV_ACC);
   }
@@ -941,9 +1015,15 @@ AICORE void tilePhaseB(__gm__ half *y, uint32_t sample) {
       TileAcc<float, R, C> acc_block;
       TASSIGN(acc_block, L::l0cCat(Par) + s * R * C * sizeof(float));
       __gm__ half *y_row = y + (sample + s) * L::kN;
-      GmTile<R, C> y_gm(y_row);
-      TASSIGN(y_gm, y_row);
-      TSTORE(y_gm, acc_block);
+      if constexpr (L::kNzStore) {  // must match the load -- see PTO_HAD_NZGM
+        GmNz<R, C> y_gm(y_row);
+        TASSIGN(y_gm, y_row);
+        TSTORE(y_gm, acc_block);
+      } else {
+        GmTile<R, C> y_gm(y_row);
+        TASSIGN(y_gm, y_row);
+        TSTORE(y_gm, acc_block);
+      }
     }
     return;
   }
@@ -970,7 +1050,7 @@ AICORE void tilePhaseB(__gm__ half *y, uint32_t sample) {
 
   __gm__ half *y_tile = y + sample * L::kN;
   wait_flag(PIPE_M, PIPE_FIX, EvPB);
-  if constexpr (PTO_HAD_NZSTORE) {
+  if constexpr (L::kNzStore) {
     GmNz<kStackRows, C> y_gm(y_tile);
     TASSIGN(y_gm, y_tile);
     TSTORE(y_gm, acc_out);

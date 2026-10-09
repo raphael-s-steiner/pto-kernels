@@ -441,9 +441,22 @@ AICORE void issueTileLoad(__gm__ half *x, uint32_t sample) {
   __gm__ half *x_tile = x + sample * N;
 
   // The descriptor row here is N * sizeof(half) bytes, 128 at the smallest N in
-  // the table. That is narrow, but unlike the two-sided kernel's 16-column tile
-  // there is no NZ view that fixes it: an NZ image equals the row-major bytes
-  // only when the tile is exactly one block-column wide.
+  // the table. That is narrow, and there are two ways an NZ view could fix it:
+  // as a pure byte reinterpret, which needs the tile to be exactly one
+  // block-column wide, or through the bit-permutation identity the two-sided
+  // kernel uses at S == 1 (see PTO_HAD_NZGM there) -- NZ position is a
+  // permutation of the bit fields of ND position, and a Sylvester H is blind to
+  // bit permutations of its index, so an NZ load and an NZ store cancel.
+  //
+  // NEITHER applies here, and the second one is the interesting no. This tile
+  // is (S x N) with the SAMPLE on the row axis, and the operator is
+  // I_S (x) H_N -- a right multiplication that treats each row independently.
+  // The NZ permutation lifts col>>4 above the row index, i.e. it moves
+  // transform bits into the sample position, and I_S (x) H_N is only invariant
+  // under permutations that leave the sample bits fixed. So the permutation
+  // would genuinely mix samples rather than being undone on the way out. The
+  // two-sided kernel escapes this only where its tile holds ONE sample, and
+  // this kernel needs S > 1 to amortize H's L1->L0B traffic.
   GmTile<S, N> x_gm(x_tile);
   TASSIGN(x_gm, x_tile);
   TLOAD(x_l1, x_gm);
