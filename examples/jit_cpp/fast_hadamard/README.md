@@ -290,7 +290,7 @@ at N=256 it is 0.629 ns/sample against the vector kernel's 1.196, i.e. 1.90x
 leaner. What it carried was a ~13 us intercept. Four candidate causes were
 measured and all four refuted -- block dispatch is 0.90 us at `block_dim=24`,
 the per-core Hadamard-factor prologue is free (0.90 us, identical to an empty
-kernel), deleting both `TMATMUL`s saves 2-13% (`PTO_HAD_NOMM`), and reps=20 and
+kernel), deleting both `TMATMUL`s saves 2-13%, and reps=20 and
 reps=2000 give identical times, so it is not a clock ramp either.
 
 It is **pipeline depth per core**, and two sweeps isolate it. Holding the work
@@ -317,7 +317,7 @@ worst possible depth.
 
 Two fixes follow, and they are both in the shipped kernel:
 
-- **`PTO_HAD_DBUF`** splits the tile body at its L1 turnaround into two
+- **The two-phase tile body** splits the tile at its L1 turnaround into two
   phases and issues `A(i+1)` before `B(i)`. The straight-line body walks
   MTE1 -> M -> FIX -> MTE1 -> M -> FIX, and because each pipe is in-order its
   *second* MTE1 use cannot start until its own first matmul and L0C->L1 move
@@ -366,7 +366,7 @@ batch, the deep pipeline at large batch -- and superadditive where they meet
 (at batch 1024, 1.60x and 1.03x alone, 1.89x together), because the deep
 pipeline only has something to overlap once a core has a run of tiles to give
 it. Together, measured against the kernel as it stood before both changes (built
-from git HEAD, not from the `PTO_HAD_DBUF=0` switch) over all 7 sizes x 5
+from git HEAD) over all 7 sizes x 5
 batches: **1.00x to 1.96x, geometric mean 1.12x, no regression**. The largest
 single wins are N=256 batch 1024 (1.96x) and N=512 batch 256 (1.91x).
 
@@ -380,10 +380,10 @@ likely cause. Anything inside that band at `block_dim=24` and `N > 256`, where
 both builds compile the same shallow path, is noise -- the shallow buffer
 offsets are mechanically identical and the shallow event ids unchanged.
 
-#### The NZ view is not a reinterpret trick, it is a symmetry of the transform (`PTO_HAD_NZGM`)
+#### The NZ view is not a reinterpret trick, it is a symmetry of the transform
 
 Both GM transfers of a 16-column tile go through a `Layout::NZ` view
-(`PTO_HAD_NZLOAD` / `PTO_HAD_NZSTORE`), which is worth 4.5-8.7x at N=256: the
+which is worth 4.5-8.7x at N=256: the
 default ND2NZ path writes L1 in C0-sized **32-byte** pieces, and the NZ view
 makes the whole tile one contiguous burst. The obvious reading is that this is a
 *byte reinterpret* and so needs `C == 16` -- one block-column, where ND and NZ
@@ -436,14 +436,14 @@ with how *narrow* the tile is, and it is the sizes that cannot use the trick
 that would want it most. At `C == 16` the ND descriptor row is 32 bytes; at
 `C == 128` it is 256 bytes, and these sizes are L2-resident anyway -- the GB/s
 column reads 1500-2100 GB/s against a ~920 GB/s streaming ceiling, so the GM leg
-is simply not the constraint. A `PTO_HAD_NOMM` floor probe says the same thing
+is simply not the constraint. A noop-matmul floor probe says the same thing
 from the other side: dropping both matmuls saves only 1-5% at N <= 8192, so
 95-99% of the time is movement -- but it is *on-chip* movement (L1->L0 `TMOV`,
 L0C->L1 `TEXTRACT`) and pipe serialization, not GM descriptors.
 
-**How much is left on the table, and where.** `PTO_HAD_NZUNSAFE` drops the
+**How much is left on the table, and where.** A probe that drops the
 `S == 1` guard, which computes wrong answers but moves exactly the bytes a
-restructure would. Measured on the movement floor (`PTO_HAD_NOMM=1`, so the
+restructure would. Measured on the movement floor (matmuls dropped, so the
 matmuls cannot mask it -- the most favourable framing available):
 
 | N | b=1024 | b=4096 |
@@ -511,9 +511,8 @@ hardware. **This needs no new kernel code**: view `(64 x 128)` with `S == 1` is
 byte for byte the configuration the kernel already runs at N=8192, so the
 bit-plan is the existing, already-validated body driven with `T`-element rows
 and these operands substituted for `H_64` / `H_128`. It lives in
-`bitplan_operands` in `cube/jit_util_hadamard_cube.py` (`PTO_HAD_BITPLAN=0`
-disables it); a batch that does not fill whole tiles sends its remainder to the
-classic path in a second launch.
+`bitplan_operands` in `cube/jit_util_hadamard_cube.py`; a batch that does not
+fill whole tiles sends its remainder to the classic path in a second launch.
 
 **What it buys, and why only at N=512.** The tile drops from `2S+5` descriptors
 to **7 at any size** -- one contiguous NZ load, one `TEXTRACT` with no reshape,
@@ -545,7 +544,7 @@ matched tile counts predicted 1.76/2.23/2.50/1.91x against the 1.73/2.23/2.47/
 The tile size `T` is a free parameter, and the MAC cost `2*sqrt(T)` falls as `T`
 does -- at `T == N` it is `2*sqrt(N)`, i.e. **conversion-free transfers at zero
 MAC penalty**. That looks like the obvious choice and it is the worst one.
-`PTO_HAD_FORCE_S1` builds exactly that configuration (correct answers, one
+A one-sample-per-tile build is exactly that configuration (correct answers, one
 sample per tile), and the full grid, device time at each point's own best
 `block_dim`, measured against the shipped converting-load kernel:
 
@@ -597,7 +596,7 @@ The one-sided kernel's `no` is a counting argument, not a layout accident: every
 one of its operands is a RIGHT operand, so it can cover only one of the two
 fields the layout offers, and the other keeps live transform bits
 (`p[4, a+4)` under NZ, `p[0,4)` under ND). Covering both means a left *and* a
-right multiply, which is the two-sided kernel. This is not free: a `PTO_OS_NOMM`
+right multiply, which is the two-sided kernel. This is not free: a noop-matmul
 split shows the one-sided kernel is **51-91% movement** (matmuls are 9.0% at
 N=64 rising to 48.8% at N=512 batch 4096), so it spends most of its time on
 movement it cannot reduce this way. It keeps N=64-256 regardless, because the
@@ -627,7 +626,7 @@ bit-plan the two-sided kernel wins from batch 256 up -- 1.01x at 256 to 1.69x at
 16384 -- while one-sided keeps a flat 1.04-1.06x below it. So N=512 is now the
 only size whose dispatch reads batch as well as N; see `BITPLAN_BATCH_MIN`.
 
-#### The phase split applies at every size, not just N=256 (`PTO_HAD_DBUF_GEN`)
+#### The phase split applies at every size, not just N=256
 
 The split was written for the `C == 16` body and gated on `C == 16`, which reads
 like a dependency on the free NZ reinterpret that case enjoys. **It is not.** The
@@ -679,14 +678,9 @@ no MAC cost, and it does let N=16384 reach the deep path -- and it is a
 buys. That was built, measured, and then deleted; see **Blocking each stage
 internally** below.
 
-All three are gated: `-DPTO_HAD_DBUF=0` for the single-buffered control,
-`-DPTO_HAD_DBUF_GEN=0` to restrict the split back to `C == 16`, and
-`block_dim=` to override the schedule. `cube/build_variant.sh` builds
-one switch combination and `cube/validate_variant.py` checks a prebuilt variant
-against an exact fp64 reference -- run it before timing anything, since a switch
-that computes the wrong answer is a broken lever, not a slow technique. `block_dim` must not change
-results, and `test_block_dim_does_not_change_result` asserts bit-identical
-output across eight values of it.
+All three were gated behind compile-time switches while they were being
+A/B-ed; the switches were removed for release once each had shipped (see
+"Switches removed for release" below).
 
 One caution learned here: the deep path needed extra `set_flag`/`wait_flag`
 event ids, and renumbering the *existing* ids -- in a path that was otherwise
@@ -738,7 +732,7 @@ operands are `H` whole and the slices are full tiles) -- and it made the blocked
 *deep* phase bodies unreachable, so they were deleted along with the four event
 ids and the accumulator-aliasing edge that only they used. The kernel lost 166
 lines (1354 -> 1188) at 0.995-1.018x on five sizes x two batches, i.e. no
-measurable change. `PTO_HAD_BLOCK_ALWAYS=1` still forces blocking on for the
+measurable change. A build that forces blocking on everywhere was used for the
 A/B; it now routes to the blocked *shallow* body, which is the arm the 1.49x
 and 1.52x rows above were measured with.
 
@@ -797,6 +791,40 @@ Three things made it findable, and all three generalise:
 The rest of the kernel was audited against this: the shallow path, the unblocked
 deep path and `loadHadamardFactors` each use at most one `src = PIPE_M` channel
 per id, which is why they always validated.
+
+### Switches removed for release
+
+Every measurement in this file was taken with a compile-time switch holding the
+two arms apart. Once an arm had shipped, keeping the other one cost clarity and
+bought nothing, so the switches are gone and only the two genuine tuning
+constants remain -- `PTO_HAD_BLOCK` / `PTO_OS_BLOCK` (the M of the blocked
+accumulation) and the per-N samples-per-tile overrides. Removed:
+
+| removed | was | why it is gone |
+|---|---|---|
+| `PTO_HAD_NZLOAD`, `PTO_HAD_NZSTORE`, `PTO_HAD_NZGM` | three switches over the NZ GM legs | folded into one `Layout::kNzGm`; the legs must agree, so one predicate is also safer than three |
+| `PTO_HAD_DBUF`, `PTO_HAD_DBUF_GEN` | the two-phase tile body, and its extension past `C == 16` | both always on; `kDbuf` is now decided by capacity alone |
+| `PTO_HAD_BLOCK_ALWAYS` | force blocking where it is not needed | blocking costs 1.5-1.9x; only ever on for the A/B |
+| `PTO_HAD_ACCALIAS` | accumulator aliasing | the off arm does not compile at N=32768, so it was never a choice |
+| `PTO_HAD_NOMM`, `PTO_HAD_STOP`, `PTO_HAD_NZUNSAFE`, `PTO_OS_NOMM` | movement-floor and truncation probes | **all compute wrong answers**; not something to ship a switch for |
+| `PTO_HAD_FORCE_S1` | one sample per tile | a probe for the tile-size sweep, now recorded above |
+| `PTO_OS_BLOCKED` | blocked accumulation on/off | always on; the dense form it falls back to was 0.6-0.8x of the vector kernel |
+| `PTO_OS_BIG`, `PTO_OS_S1024`, `PTO_OS_S2048` | one-sided N=1024/2048 | correct but 1.7-4.8x slower than the two-sided kernel |
+| `PTO_OS_TILE_SPLIT` | split per-core work by samples instead of tiles | the sample split walks the halving chain on most cores |
+| `PTO_HAD_BITPLAN` (host) | bit-plan on/off | always on; it is 2.19-2.42x at the one size it applies to |
+
+Two whole code paths went with them, both **provably** dead rather than merely
+slow, and the proof is that deleting each one left a **byte-identical `.so`**:
+
+- the two-sided kernel's blocked DEEP bodies, unreachable because `kDbuf`
+  requires `!kBlockIt`;
+- the one-sided kernel's CHUNKED body and its H ring, unreachable because every
+  N in the table is either resident (N <= 128) or blocked (N = 256, 512) -- the
+  chunked form needs `!kResident && !kBlocked`, i.e. `N > 128` and `N <= 64`.
+
+Byte-identical codegen is a stronger no-regression result than any timing, and
+it is the only evidence worth having for a change that is meant to be neutral.
+The A/B arms themselves are in git history.
 
 ### The one-sided kernel (`onesided/`, N = 64..512)
 
@@ -897,7 +925,7 @@ fixed by L0C capacity that ratio grows as `N^2`:
 | 512 | 512 KB | nowhere -- it IS all of L1, so GM per tile | ~4:1 | 0.6x - 0.8x vs vector |
 
 The blocked form deletes that whole column: `+-H_M` is 16 KB at every N. What
-binds instead is arithmetic. A noop-matmul probe (`PTO_OS_NOMM=1`, matmuls
+binds instead is arithmetic. A noop-matmul probe (matmuls
 deleted, every transfer and handshake kept) says so directly -- dropping the
 matmuls is **3.96x** faster at N=512 batch 65536 and 2.34x at N=256, where
 before the change the same probe read 0% and 7-8%. The kernel moved from
@@ -905,7 +933,7 @@ movement-bound to compute-bound, which is the intended direction: the bound it
 now sits against is `N*N` MACs per sample, not a buffer size.
 
 **That makes 512 a compute crossover rather than a capacity limit.**
-`PTO_OS_BIG=1` compiles N=1024 and 2048, which the blocked form computes
+The blocked form also computes N=1024 and 2048 correctly, which
 correctly and the dense form could never attempt (H would be 2 MB and 8 MB).
 They are off by default because the MACs grow 4x per doubling while the bytes
 only double, and measurement agrees:
@@ -991,9 +1019,8 @@ window than one `.to(device)`. Fixed by hoisting the lookup above the call, with
 a cache-clearing regression test -- the correctness sweep cannot catch it,
 because by then every `n` is warm.
 
-Compile-time switches are documented at the top of the kernel;
+The two tuning constants are documented at the top of the kernel;
 `onesided/build_variant.sh` builds one combination and
 `onesided/validate_variant.py` checks a prebuilt variant against the exact fp64
-reference over 168 cases (`onesided/bigcheck_variant.py` covers the
-`PTO_OS_BIG` sizes). Validate before timing: a switch that computes the wrong answer is a
-broken lever, not a slow technique.
+reference over 168 cases. Validate before timing: a variant that computes the
+wrong answer is a broken lever, not a slow technique.

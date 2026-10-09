@@ -49,7 +49,7 @@ using namespace pto;
 // (S * N = 8192 throughout the table), so N=256 yields the fewest tiles for a
 // given batch, and a core needs a RUN of tiles to fill its pipes: measured, a
 // tile costs 340 ns when it is one of two on a core and 91 ns on a long run.
-// That is what PTO_HAD_DBUF below and the host-side block_dim schedule in
+// That is what the two-phase tile body and the host-side block_dim schedule in
 // jit_util_hadamard_cube.py are for; the README derives both.
 //
 // (N, R, C, samples per tile)
@@ -59,85 +59,35 @@ using namespace pto;
 #ifndef PTO_HAD_S256
 #define PTO_HAD_S256 32
 #endif
-// Load and store a 16-column tile through a Layout::NZ view, i.e. as one
-// contiguous burst instead of the default ND2NZ gather, which reads only
-// C * sizeof(half) = 32 bytes per descriptor row. Worth 4.5x at N=256 and is
-// the single largest win in this kernel; only valid when C == 16.
-#ifndef PTO_HAD_NZLOAD
-#define PTO_HAD_NZLOAD 1
-#endif
-#ifndef PTO_HAD_NZSTORE
-#define PTO_HAD_NZSTORE 1
-#endif
-// Take the SAME contiguous burst at C > 16, where ND and NZ are no longer the
-// same bytes. It still works, for a different reason: NZ position is a
-// PERMUTATION OF THE BIT FIELDS of ND position,
+// Both GM legs of a tile go through a Layout::NZ view wherever that is
+// correct, which makes each one a single contiguous burst instead of the
+// default ND2NZ path -- that path writes L1 in C0-sized 32-BYTE pieces however
+// wide the tile is, and removing it is the single largest win in this kernel
+// (4.5-8.7x at N=256). Two separate things make it correct, and Layout::kNzGm
+// below is true when either does:
 //
-//   ND:  [ row>>4 | row&15 | col>>4 | col&15 ]
-//   NZ:  [ col>>4 | row>>4 | row&15 | col&15 ]
+//   C == 16   One block-column, so the NZ image IS the row-major bytes. A pure
+//             reinterpret, and each leg would be valid on its own.
 //
-// and a Sylvester Hadamard is invariant under any bit permutation of its
-// index, because H[i][j] = (-1)^popcount(i & j) and popcount is blind to which
-// bit positions the set bits sit in. So feeding the cube the ND bytes read as
-// NZ computes the transform of a permuted input, which IS the permuted
-// transform -- and reading the accumulator back out through the same NZ view
-// undoes the permutation exactly. Load and store must therefore flip TOGETHER:
-// either alone emits a permuted result.
+//   S == 1    ND and NZ differ, but only by a PERMUTATION OF THE BIT FIELDS of
+//             the byte index,
 //
-// The one restriction is that the permutation lifts col>>4 above the row
-// index, which for a tile of S stacked samples lifts it above the SAMPLE index
-// too -- so it would mix samples unless the tile holds one. Hence S == 1,
-// which is the top of the size table (N >= 8192) and exactly where the
-// transfers are largest.
-#ifndef PTO_HAD_NZGM
-#define PTO_HAD_NZGM 1
-#endif
-// DIAGNOSTIC, COMPUTES WRONG ANSWERS. Drops the S == 1 guard above so the
-// contiguous NZ descriptor is used at every size. The results are permuted
-// across samples and meaningless, exactly like PTO_HAD_NOMM's; the point is to
-// price the GM leg at the NARROW tiles (C = 32 and 64), which are the ones a
-// restructure would have to reach and the only ones where the ND descriptor row
-// is still small enough to hurt. Never ship this on.
-#ifndef PTO_HAD_NZUNSAFE
-#define PTO_HAD_NZUNSAFE 0
-#endif
-// Split the per-core work by whole tiles rather than by samples, so at most
-// one core walks the power-of-two fallback down to single-sample tiles.
-// Run the tile as two interleaved phases instead of one straight-line body. The straight-line body visits MTE1 -> M -> FIX -> MTE1 -> M -> FIX, and
-// because each pipe is in-order its SECOND MTE1 use cannot start until its own
-// first matmul and L0C->L1 move have retired -- which also pins the next tile's
-// first MTE1 behind it. So only the GM->L1 load ever overlapped, and a core
-// moved 94 GB/s with a short tile run against 359 GB/s with a long one.
+//               ND:  [ row>>4 | row&15 | col>>4 | col&15 ]
+//               NZ:  [ col>>4 | row>>4 | row&15 | col&15 ]
 //
-// Splitting the body at the L1 turnaround and issuing A(i+1) BEFORE B(i) makes
-// the MTE1 order A0 A1 B0 A2 B1 ..., so MTE1 always has the next tile's work
-// queued while the current tile is in M/FIX. That needs two of every
-// intermediate (L0B X, L0C stack and cat, L1 T, L0A T) and a 4-deep X ring to
-// keep the prefetch two tiles ahead; Layout::kDbuf gates it on all of that
-// fitting. Set to 0 for the single-buffered control.
+//             and a Sylvester Hadamard is invariant under any bit permutation
+//             of its index, because H[i][j] = (-1)^popcount(i & j) and popcount
+//             is blind to which positions the set bits occupy. So the cube
+//             transforms a permuted input, which IS the permuted transform, and
+//             reading the accumulator back through the same NZ view undoes it.
+//             Both legs must therefore flip TOGETHER -- hence one predicate for
+//             the pair, not two -- and the permutation lifts col>>4 above the
+//             row index, so it would cross samples unless the tile holds one.
 //
-// Worth 1.17-1.29x at N=256 and 1.15-1.70x at N=512..8192, measured paired
-// against this switch off, with null controls at 1.00x.
-#ifndef PTO_HAD_DBUF
-#define PTO_HAD_DBUF 1
-#endif
-// Run the GENERAL (C != 16) tile as two phases as well.
+// A tile of S > 1 samples at C > 16 reaches the same contiguous descriptor by
+// choosing the OPERANDS instead: see bitplan_operands in
+// jit_util_hadamard_cube.py, which is what N=512 ships.
 //
-// The phase split was written for C == 16 and gated on it, which read like a
-// dependency on the free NZ reinterpret that case enjoys. It is not: the
-// reinterpret is what makes the C == 16 TURNAROUND cheap, while the split is
-// about pipe ORDER and needs nothing but a cut at the turnaround and two of
-// every intermediate. The general body already pays its reshape (S TEXTRACTs
-// plus S TSTOREs) in both forms.
-//
-// So the general body is the case that should gain MORE, not less: it visits
-// each pipe twice like the C == 16 body, and has far more work queued behind
-// the second visit. All four of kDbuf's capacity conditions already hold for
-// every size from 512 to 8192; only N=16384 fails them, its two tile slots
-// being 100% of L0A and L0B on their own.
-#ifndef PTO_HAD_DBUF_GEN
-#define PTO_HAD_DBUF_GEN 1
-#endif
 // Apply each stage's factor as H_f = H_acc (x) H_mat with H_mat of size M, so
 // the matmul is M-sized and the sum over blocks runs in the L0C accumulator --
 // the same trick the one-sided kernel in onesided/ uses, applied to each of the
@@ -152,72 +102,22 @@ using namespace pto;
 //     phase B's operand in L0A    2*R*R    ->  4*M_a*M_a
 //     phase A's operand in L0B    2*C*C    ->  4*M_b*M_b
 //
-// At N=16384 that takes the deep path's L0A and L0B from 96 KB each -- over the
-// 64 KB budget, which is why it was locked out -- to 48 KB at M=64. It does NOT
-// shrink the accumulators, so PTO_HAD_ACCALIAS is needed with it.
-//
-// M must divide its factor and be at least 16, the cube's fractal size, so
-// N=256 and N=512 cannot be blocked at all: their factors are already 16.
-// 0 means dense everywhere.
+// Blocking a stage COSTS 1.5-1.9x (the blocked body walks MTE1 -> M -> MTE1 ->
+// M, so consecutive tiles stop overlapping), so it is applied only where there
+// is no dense form at all -- N=32768, whose H_C alone would fill L0B. M must
+// divide its factor and be at least 16, the cube's fractal size.
 #ifndef PTO_HAD_BLOCK
 #define PTO_HAD_BLOCK 64
 #endif
-// Block every size that CAN be blocked, not just the ones that must be. Off by
-// default, and the default is not a guess: blocking a single phase into two
-// blocks costs 1.78-1.86x on the deep path at N=8192 (measured against the
-// dense deep body at bd 16/20/24, with two null controls reading 0.996-1.008x),
-// because the blocked body walks MTE1 -> M -> MTE1 -> M and so uses each pipe
-// kC1 times per phase -- re-serializing consecutive tiles, which is the exact
-// thing the two-phase interleave exists to prevent. On for A/B only.
-#ifndef PTO_HAD_BLOCK_ALWAYS
-#define PTO_HAD_BLOCK_ALWAYS 0
-#endif
-// Let the concatenated accumulator share the stacked one's L0C space. It is
-// dead the moment phase A's TEXTRACTs have run, and the FIX -> MTE1 -> M chain
-// between the phases already orders that, so WITHIN a tile the reuse is free.
-// ACROSS tiles it is not: with the phases interleaved, A(i+2) writes the slot
-// B(i) is still storing from, so the deep path needs one extra FIX -> M edge
-// per slot -- which is exactly the EV_ACC edge the deep path had dropped.
-//
-// Halves L0C, which is what lets N=16384 hold two tiles in flight (256 -> 128
-// KB) and what makes N=32768 representable at all.
-#ifndef PTO_HAD_ACCALIAS
-#define PTO_HAD_ACCALIAS 1
-#endif
-// Diagnostic only: drop both TMATMULs, keeping every transfer and handshake,
-// to measure the data-movement floor of this tile geometry. Output is wrong.
-// It is what showed the matmuls were nearly free and the N=256 cost was all
-// in the load descriptor shape.
-#ifndef PTO_HAD_NOMM
-#define PTO_HAD_NOMM 0
-#endif
-// Diagnostic only: truncate the kernel to measure what the fixed cost is made
-// of. 1 = return at once (block dispatch floor), 2 = also load the Hadamard
-// factors and return (adds the per-core prologue). Output is wrong.
-#ifndef PTO_HAD_STOP
-#define PTO_HAD_STOP 0
-#endif
 
-// DIAGNOSTIC. Forces one sample per tile at every size. With S == 1 there are
-// no sample bits in the byte index, so kNzGm turns both GM legs conversion-free
-// and the operands are just the balanced Hadamard split -- i.e. this IS the
-// bit-plan configuration for a tile of T == N, at NO MAC cost. The only thing
-// it trades is tile size, so it exists to price that trade (the T column of the
-// bit-plan grid in the README). Answers stay CORRECT here, unlike
-// PTO_HAD_NZUNSAFE; only the tile geometry moves.
-#ifndef PTO_HAD_FORCE_S1
-#define PTO_HAD_FORCE_S1 0
-#endif
-#define PTO_HAD_S(s) ((PTO_HAD_FORCE_S1 != 0) ? 1 : (s))
-
-#define FAST_HADAMARD_CUBE_CASES(X)      \
-  X(256, 16, 16, PTO_HAD_S(PTO_HAD_S256)) \
-  X(512, 16, 32, PTO_HAD_S(16))           \
-  X(1024, 32, 32, PTO_HAD_S(8))           \
-  X(2048, 32, 64, PTO_HAD_S(4))           \
-  X(4096, 64, 64, PTO_HAD_S(2))           \
-  X(8192, 64, 128, 1)                     \
-  X(16384, 128, 128, 1)                   \
+#define FAST_HADAMARD_CUBE_CASES(X) \
+  X(256, 16, 16, PTO_HAD_S256)      \
+  X(512, 16, 32, 16)                \
+  X(1024, 32, 32, 8)                \
+  X(2048, 32, 64, 4)                \
+  X(4096, 64, 64, 2)                \
+  X(8192, 64, 128, 1)               \
+  X(16384, 128, 128, 1)             \
   X(32768, 128, 256, 1)
 
 #if defined(__CHECK_FEATURE_AT_PRECOMPILE) || \
@@ -276,7 +176,7 @@ using MatTile = Tile<TileType::Mat, half, Rows, Cols, BLayout::ColMajor, Rows,
 // NZ view of a tile: Shape<1, Cols/16, Rows/16, 16, C0> with the canonical
 // strides, i.e. block-column major over 16x16 row-major fractals. At Cols == 16
 // that is one block-column and the bytes coincide with ND; above it the two
-// differ by the bit permutation described at PTO_HAD_NZGM. Either way the
+// differ by the bit-field permutation noted at PTO_HAD_BLOCK. Either way the
 // descriptor is contiguous over the whole tile.
 template <uint32_t Rows, uint32_t Cols>
 using GmNz = GlobalTensor<half, TileShape2D<half, Rows, Cols, Layout::NZ>,
@@ -313,30 +213,17 @@ struct Layout {
       R * R * sizeof(half) + kTileBytes <= L0AB_BYTES &&
       C * C * sizeof(half) + kTileBytes <= L0AB_BYTES &&
       2 * kAccBytes <= L0C_BYTES;
-  static constexpr bool kBlockIt =
-      (PTO_HAD_BLOCK_ALWAYS != 0) || !kDenseShallowFits;
+  static constexpr bool kBlockIt = !kDenseShallowFits;
 
-  // Move both GM transfers onto the contiguous NZ descriptor. At C == 16 the
-  // two layouts are the same bytes and each leg is independent
-  // (PTO_HAD_NZLOAD / PTO_HAD_NZSTORE); above it they differ by a bit
-  // permutation that only cancels if BOTH legs use the NZ view, and only
-  // stays inside one sample if the tile holds one. See PTO_HAD_NZGM.
-  //
-  // Not on the blocked path: its stores are row SUB-BLOCKS of the output, and
-  // TStoreAccNz2nz derives the destination block-column stride from the shape
-  // (gShape2 * gShape3 * C0) rather than from gStride1, so it can only write a
-  // whole NZ tile.
-  static constexpr bool kNzGm = (PTO_HAD_NZGM != 0) && (C > 16) &&
-                                (S == 1 || PTO_HAD_NZUNSAFE != 0) && !kBlockIt;
+  // Both GM legs use the NZ view, or neither -- ONE predicate, because at
+  // C > 16 the two only cancel as a pair (see the note at PTO_HAD_BLOCK). Every
+  // load and store site reads this, so they cannot drift apart; a store that
+  // forgot it would emit a permuted result, rel_rms sqrt(2). Not on the blocked
+  // path: its stores are row SUB-BLOCKS of the output, and TStoreAccNz2nz takes
+  // the destination block-column stride from the shape rather than gStride1, so
+  // it can only write a whole NZ tile.
+  static constexpr bool kNzGm = (C == 16) || (S == 1 && !kBlockIt);
 
-  // Which GM view each leg uses. EVERY load and store site reads these two,
-  // so the pair cannot drift apart: kNzGm makes both true at once, which is
-  // what the permutation needs, while at C == 16 the bytes coincide and the two
-  // switches are free to differ. A store site that forgets them emits a
-  // permuted result -- rel_rms sqrt(2), which validate_variant.py reports at
-  // every shape of that size.
-  static constexpr bool kNzLoad = (C == 16 && PTO_HAD_NZLOAD != 0) || kNzGm;
-  static constexpr bool kNzStore = (C == 16 && PTO_HAD_NZSTORE != 0) || kNzGm;
   static constexpr uint32_t kMa =
       (!kBlockIt || PTO_HAD_BLOCK == 0 || PTO_HAD_BLOCK >= R)
           ? R
@@ -355,7 +242,7 @@ struct Layout {
   // Only where blocking is active. Aliasing buys nothing without it (the
   // slots, not the accumulators, are what overflow), and leaving it off keeps
   // every unblocked size's L0C offsets -- and so its codegen -- untouched.
-  static constexpr bool kAlias = (PTO_HAD_ACCALIAS != 0) && (kC1 > 1 || kR1 > 1);
+  static constexpr bool kAlias = (kC1 > 1 || kR1 > 1);
 
   // Operands, resident for the whole kernel: +-H_M when blocked, else H itself.
   static constexpr unsigned kOpABytes = kBlkB ? 2 * kMa * kMa * sizeof(half)
@@ -387,7 +274,7 @@ struct Layout {
   // So the deep path stays dense, and with kMa == R and kMb == C its operands
   // and slices are exactly the dense ones: H whole, and full-tile slices.
   static constexpr bool kDbuf =
-      PTO_HAD_DBUF && !kBlockIt && (C == 16 || PTO_HAD_DBUF_GEN) &&
+      !kBlockIt &&
       R * R * sizeof(half) + 2 * kTileBytes <= L0AB_BYTES &&
       C * C * sizeof(half) + 2 * kTileBytes <= L0AB_BYTES &&
       4 * kAccBytes <= L0C_BYTES &&
@@ -586,7 +473,7 @@ AICORE void issueTileLoad(__gm__ half *x, uint32_t sample) {
   TASSIGN(x_l1, L::xSlot(Slot));
   __gm__ half *x_tile = x + sample * L::kN;
 
-  if constexpr (L::kNzLoad) {
+  if constexpr (L::kNzGm) {
     // Declaring the source Layout::NZ turns the default ND2NZ gather -- which
     // writes L1 in C0-sized 32-BYTE pieces however wide the tile is -- into one
     // contiguous burst over the whole tile. At C == 16 that is a pure
@@ -642,9 +529,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
     TileAcc<float, R, kCat> acc_cat;
     TASSIGN(hl_l0, L::kL0aHl);
     TASSIGN(acc_cat, L::kL0cStack);
-#if !PTO_HAD_NOMM
     TMATMUL(acc_cat, hl_l0, x_l0b);
-#endif
     Sync<PIPE_M, PIPE_FIX>();
 
     // Same reinterpret on the accumulator: an Acc fractal is 16x16 fp32, so
@@ -666,13 +551,11 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
     TASSIGN(hc_l0, L::kL0bHc);
     TASSIGN(acc_out, L::kL0cCat);
     wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous tile's TSTORE has drained
-#if !PTO_HAD_NOMM
     TMATMUL(acc_out, t_l0a, hc_l0);
-#endif
     Sync<PIPE_M, PIPE_FIX>();
 
     __gm__ half *y_tile = y + sample * L::kN;
-    if constexpr (L::kNzStore) {
+    if constexpr (L::kNzGm) {
       GmNz<kStackRows, C> y_gm(y_tile);
       TASSIGN(y_gm, y_tile);
       TSTORE(y_gm, acc_out);
@@ -746,7 +629,6 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
           wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous tile's stores drained
         }
       }
-#if !PTO_HAD_NOMM
       for (uint32_t a = 0; a < L::kR1; ++a) {
         TileAcc<float, L::kMa, S * C> acc_a;
         TASSIGN(acc_a, L::l0cCatBlock(false, a));
@@ -758,7 +640,6 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
           TMATMUL_ACC(acc_a, h_a, t_l0);
         }
       }
-#endif
       if (ap + 1 < L::kR1) {
         set_flag(PIPE_M, PIPE_MTE1, EV_SWB);
       }
@@ -793,9 +674,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
     TMOV(x_l0, x_l1);
     set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // slot free for the load after next
     Sync<PIPE_MTE1, PIPE_M>();
-#if !PTO_HAD_NOMM
     TMATMUL(acc_stack, x_l0, hc_l0);
-#endif
     Sync<PIPE_M, PIPE_FIX>();
 
     // --- vertical stack -> horizontal concatenation, in L1 ---
@@ -823,9 +702,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
     TASSIGN(acc_cat, L::kL0cCat);
 
     wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous tile's TSTORE has drained
-#if !PTO_HAD_NOMM
     TMATMUL(acc_cat, hl_l0, t_l0);
-#endif
     Sync<PIPE_M, PIPE_FIX>();
 
     // Each sample is a contiguous (R x C) block-column range of acc_cat.
@@ -837,7 +714,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
       TASSIGN(acc_block, L::kL0cCat + s * R * C * sizeof(float));
 
       __gm__ half *y_row = y + (sample + s) * L::kN;
-      if constexpr (L::kNzStore) {
+      if constexpr (L::kNzGm) {
         // The second half of the pair: writing the accumulator out through the
         // NZ view undoes the permutation the NZ load introduced, so the result
         // lands in natural order. Unlike the ND path (TStoreAccNz2nd, which
@@ -876,7 +753,6 @@ AICORE void shallowBlockA(uint32_t i) {
   set_flag(PIPE_MTE1, PIPE_M, EvRdy);
 
   wait_flag(PIPE_MTE1, PIPE_M, EvRdy);
-#if !PTO_HAD_NOMM
   for (uint32_t j = 0; j < L::kC1; ++j) {
     TileAcc<float, kStackRows, L::kMb> acc_j;
     TASSIGN(acc_j, L::l0cStackBlock(false, j));
@@ -888,7 +764,6 @@ AICORE void shallowBlockA(uint32_t i) {
       TMATMUL_ACC(acc_j, x_l0, h_j);
     }
   }
-#endif
   if (i + L::kSlotsA < L::kC1) {
     set_flag(PIPE_M, PIPE_MTE1, EvWar);
   }
@@ -939,9 +814,7 @@ AICORE void tilePhaseA() {
     set_flag(PIPE_MTE1, PIPE_M, EvPA);
 
     wait_flag(PIPE_MTE1, PIPE_M, EvPA);
-#if !PTO_HAD_NOMM
     TMATMUL(acc_stack, x_l0a, hc_l0);
-#endif
     set_flag(PIPE_M, PIPE_FIX, EvPA);
 
     // Vertical stack -> horizontal concatenation, in L1. Block-columns are
@@ -973,9 +846,7 @@ AICORE void tilePhaseA() {
   TASSIGN(hl_l0, L::kL0aHl);
   TASSIGN(acc_cat, L::l0cStack(Par));
   wait_flag(PIPE_MTE1, PIPE_M, EvPA);
-#if !PTO_HAD_NOMM
   TMATMUL(acc_cat, hl_l0, x_l0b);
-#endif
   set_flag(PIPE_M, PIPE_FIX, EvPA);
 
   // Same free reinterpret on the accumulator: an Acc fractal is 16x16 fp32, so
@@ -1013,9 +884,7 @@ AICORE void tilePhaseB(__gm__ half *y, uint32_t sample) {
     set_flag(PIPE_MTE1, PIPE_M, EvPB);
 
     wait_flag(PIPE_MTE1, PIPE_M, EvPB);
-#if !PTO_HAD_NOMM
     TMATMUL(acc_cat, hl_l0, t_l0b);
-#endif
     set_flag(PIPE_M, PIPE_FIX, EvPB);
 
     // No EV_ACC edge, as in the C == 16 phase body: with two cat accumulators
@@ -1027,7 +896,7 @@ AICORE void tilePhaseB(__gm__ half *y, uint32_t sample) {
       TileAcc<float, R, C> acc_block;
       TASSIGN(acc_block, L::l0cCat(Par) + s * R * C * sizeof(float));
       __gm__ half *y_row = y + (sample + s) * L::kN;
-      if constexpr (L::kNzStore) {  // must match the load -- see PTO_HAD_NZGM
+      if constexpr (L::kNzGm) {
         GmNz<R, C> y_gm(y_row);
         TASSIGN(y_gm, y_row);
         TSTORE(y_gm, acc_block);
@@ -1055,14 +924,12 @@ AICORE void tilePhaseB(__gm__ half *y, uint32_t sample) {
   TASSIGN(hc_l0, L::kL0bHc);
   TASSIGN(acc_out, L::l0cCat(Par));
   wait_flag(PIPE_MTE1, PIPE_M, EvPB);
-#if !PTO_HAD_NOMM
   TMATMUL(acc_out, t_l0a, hc_l0);
-#endif
   set_flag(PIPE_M, PIPE_FIX, EvPB);
 
   __gm__ half *y_tile = y + sample * L::kN;
   wait_flag(PIPE_M, PIPE_FIX, EvPB);
-  if constexpr (L::kNzStore) {
+  if constexpr (L::kNzGm) {
     GmNz<kStackRows, C> y_gm(y_tile);
     TASSIGN(y_gm, y_tile);
     TSTORE(y_gm, acc_out);
@@ -1227,9 +1094,6 @@ AICORE void runCubeHadamard(__gm__ half *x, __gm__ half *y,
   }
 
   loadHadamardFactors<R, C, S>(h_left, h_right);
-#if PTO_HAD_STOP >= 2
-  return;
-#endif
 
   set_flag(PIPE_FIX, PIPE_M, EV_ACC);  // output accumulator starts free
 
@@ -1264,9 +1128,6 @@ __global__ AICORE void fast_hadamard_cube_fp16(__gm__ void *x, __gm__ void *y,
                                                uint32_t batch, uint32_t n) {
 #if defined(__CHECK_FEATURE_AT_PRECOMPILE) || \
     (__CCE_AICORE__ == 220 && defined(__DAV_C220_CUBE__))
-#if PTO_HAD_STOP >= 1
-  return;
-#endif
   dispatchCubeHadamard((__gm__ half *)x, (__gm__ half *)y,
                        (__gm__ half *)h_left, (__gm__ half *)h_right, batch, n);
 #endif

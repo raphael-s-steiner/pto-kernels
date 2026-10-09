@@ -3,7 +3,7 @@
 # top of the kernel. Run from the fast_hadamard/ directory.
 #
 #   bash onesided/build_variant.sh base
-#   bash onesided/build_variant.sh big -DPTO_OS_BIGTILE=1
+#   bash onesided/build_variant.sh m32 -DPTO_OS_BLOCK=32
 #   python3 onesided/validate_variant.py onesided/outputs/so_var/base.so  # ALWAYS
 #
 # Validate before timing: a variant that computes the wrong answer is a broken

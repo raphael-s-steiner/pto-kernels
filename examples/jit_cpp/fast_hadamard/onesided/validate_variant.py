@@ -62,7 +62,7 @@ def main():
               + ", ".join(f"n={k}:{v:.2e}" for k, v in sorted(worst.items())))
 
 
-# Guarded so that _bigcheck.py can import fwht without re-running the whole
-# sweep as an import side effect.
+# Guarded so another module can import fwht without re-running the whole sweep
+# as an import side effect.
 if __name__ == "__main__":
     main()

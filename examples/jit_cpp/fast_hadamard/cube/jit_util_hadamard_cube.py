@@ -41,7 +41,7 @@ _SAMPLES_PER_TILE = {256: 32, 512: 16, 1024: 8, 2048: 4, 4096: 2, 8192: 1,
 # assuming 8 for it cost 1.51x.
 #
 # REFITTED for the two-phase deep path now that it runs at every size (see
-# PTO_HAD_DBUF_GEN in the kernel). The deep body changes per-tile cost, so the
+# the two-phase tile body in the kernel). The deep body changes per-tile cost, so the
 # shallow-fitted constants went stale: they cost the deep path up to 1.05x at
 # N=512 and 1.045x at N=2048. Only those two moved; 1024, 4096 and 8192 were
 # already within 0.005x of their own optimum.
@@ -160,7 +160,7 @@ def hadamard_factors(n: int, device, block: int | None = None):
 # descriptor each) needs the kernel's view of the tile to be the NZ regrouping
 # of the GM byte index. For a tile of S > 1 samples that regrouping lifts the
 # high column bits above the SAMPLE index, which an ordinary H_R / H_C pair
-# cannot undo -- see PTO_HAD_NZGM in the kernel.
+# cannot undo -- see the note above PTO_HAD_BLOCK in the kernel.
 #
 # But H is a compile-time constant, so it does not have to be a Hadamard.
 # Because H_N is a tensor power of H_2, the transform applies H_2 to each index
@@ -185,14 +185,10 @@ def hadamard_factors(n: int, device, block: int | None = None):
 # The price is MACs: the operands span the whole index, so the cost is
 # A + B = 2*sqrt(T) per value instead of 2*sqrt(N), i.e. sqrt(S) more. That is
 # only worth paying where the per-tile descriptor count dominates, which is
-# N=512 and nowhere else -- measured 1.76-2.50x there against 0.94-1.11x
-# (a wash) at N=1024 through 4096. See the README.
+# N=512 and nowhere else: measured 2.19-2.42x there, against a best of
+# 0.98-1.12x at N=1024 through 4096 swept over every tile size. See the README.
 _BITPLAN_TILE = {512: 8192}
 _BITPLAN_CACHE: dict = {}
-
-# Env override so the A/B needs no code edit, as with PTO_HAD_BLOCK. Off falls
-# back to the classic H_R / H_C path at every size.
-_USE_BITPLAN = os.environ.get("PTO_HAD_BITPLAN", "1") != "0"
 
 
 def bitplan_view(n: int, tile: int):
@@ -260,10 +256,8 @@ def validate_cube_hadamard_args(x, y):
     return int(x.shape[0]), n
 
 
-def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE,
-             use_bitplan: bool | None = None):
+def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE):
     lib = load_cdll(lib_path)
-    use_bitplan = _USE_BITPLAN if use_bitplan is None else bool(use_bitplan)
     resolved_block_dim = max(
         1, int(block_dim) if block_dim is not None else get_cube_block_dim(device)
     )
@@ -311,7 +305,7 @@ def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE,
         # ops issued after the pointer was read, so a hoisted pointer races the
         # operand tensors into existence -- which shows up only on the FIRST
         # call at each N, as a moving set of wrong answers.
-        plan = bitplan_operands(resolved_n, x.device) if use_bitplan else None
+        plan = bitplan_operands(resolved_n, x.device)
         h_left, h_right = hadamard_factors(resolved_n, x.device)
         bulk = 0
         if plan is not None:
@@ -353,7 +347,6 @@ def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE,
         )
 
     hadamard_func.block_dim = resolved_block_dim
-    hadamard_func.use_bitplan = use_bitplan
     hadamard_func.bitplan_sizes = sorted(_BITPLAN_TILE)
     return hadamard_func
 

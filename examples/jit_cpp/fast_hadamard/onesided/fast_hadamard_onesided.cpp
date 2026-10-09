@@ -52,17 +52,17 @@ using namespace pto;
 //
 // WHAT CAPS IT NOW is arithmetic, not capacity. The one-sided product is N*N
 // MACs per sample however H is factored, and at N=512 that is already most of
-// the time -- dropping the matmuls (PTO_OS_NOMM) is 3.96x faster at batch
-// 65536, against 2.34x at N=256. Past 512 the MACs grow 4x per doubling while
+// the time -- dropping the matmuls was measured 3.96x faster at batch 65536,
+// against 2.34x at N=256. Past 512 the MACs grow 4x per doubling while
 // the bytes only double, so the two-sided kernel in cube/ -- 2*N*sqrt(N) MACs
-// -- takes over. PTO_OS_BIG compiles 1024 and 2048, which the blocked form is
-// correct at and the dense form could never reach (H would be 2 MB and 8 MB);
-// measured there the two-sided kernel is 1.7x faster at 1024 and 4.8x at 2048,
-// so they stay off. 512 is now a compute crossover, not a capacity limit.
+// -- takes over. The blocked form is CORRECT at 1024 and 2048, which the dense
+// form could never reach (H would be 2 MB and 8 MB), but the two-sided kernel
+// is 1.7x faster at 1024 and 4.8x at 2048, so this kernel's table stops at
+// 512. 512 is a compute crossover, not a capacity limit.
 //
-// THAT IS ONLY TRUE AT THE TOP OF THE RANGE. Measured per size with
-// PTO_OS_NOMM (device time, batch 1024 / 4096, each at its own best block_dim),
-// the matmuls are:
+// THAT IS ONLY TRUE AT THE TOP OF THE RANGE. Measured per size by dropping the
+// matmuls (device time, batch 1024 / 4096, each at its own best block_dim),
+// they are:
 //
 //     N=64   9.0% / 9.3%      N=256  22.7% / 23.2%
 //     N=128 12.2% / 17.1%     N=512  29.1% / 48.8%
@@ -123,19 +123,6 @@ using namespace pto;
 #define PTO_OS_S512 16
 #endif
 
-// Split the per-core work by whole tiles rather than by samples, so at most one
-// core is left with a count that is not a multiple of S and has to walk the
-// halving chain (and then the backed-up 16-sample tail) for a fraction of a
-// tile's work at a full tile's handshake cost.
-#ifndef PTO_OS_TILE_SPLIT
-#define PTO_OS_TILE_SPLIT 1
-#endif
-// Diagnostic only: drop the matmuls, keeping every transfer and handshake, to
-// measure the data-movement floor of this tile geometry. Output is wrong.
-#ifndef PTO_OS_NOMM
-#define PTO_OS_NOMM 0
-#endif
-
 // BLOCKED ACCUMULATION -- the vector butterfly's staging, done on the cube.
 //
 // Everywhere H does not already fit L0B, replace the single dense (N x N) right
@@ -156,9 +143,6 @@ using namespace pto;
 // Same MAC count as the dense form, B*B matmuls instead of one, same single
 // fp32 rounding, and still one pass over each pipe per block with no L1
 // turnaround. H_B is never materialized: H_B[i,j] = (-1)^popcount(i & j).
-#ifndef PTO_OS_BLOCKED
-#define PTO_OS_BLOCKED 1
-#endif
 // M above, and it MUST match _BLOCK in the host wrapper, which builds +-H_M --
 // a mismatch just hands the kernel a wrong-sized operand and it computes
 // garbage. 128 is the largest that fits L0B's 64 KB, and the argument for it is
@@ -184,29 +168,11 @@ using namespace pto;
 // arithmetic one takes its place (the one-sided product is N*N MACs per sample
 // whatever the form), so past 512 the two-sided kernel in cube/ wins. On for
 // the probe that measured where that crossover is; see the README.
-#ifndef PTO_OS_BIG
-#define PTO_OS_BIG 0
-#endif
-#ifndef PTO_OS_S1024
-#define PTO_OS_S1024 16
-#endif
-#ifndef PTO_OS_S2048
-#define PTO_OS_S2048 16
-#endif
-#if PTO_OS_BIG
-#define FAST_HADAMARD_ONESIDED_BIG_CASES(X) \
-  X(1024, PTO_OS_S1024)                     \
-  X(2048, PTO_OS_S2048)
-#else
-#define FAST_HADAMARD_ONESIDED_BIG_CASES(X)
-#endif
-
 #define FAST_HADAMARD_ONESIDED_CASES(X) \
   X(64, PTO_OS_S64)                     \
   X(128, PTO_OS_S128)                   \
   X(256, PTO_OS_S256)                   \
-  X(512, PTO_OS_S512)                   \
-  FAST_HADAMARD_ONESIDED_BIG_CASES(X)
+  X(512, PTO_OS_S512)
 
 #if defined(__CHECK_FEATURE_AT_PRECOMPILE) || \
     (__CCE_AICORE__ == 220 && defined(__DAV_C220_CUBE__))
@@ -246,8 +212,6 @@ constexpr uint32_t L0C_BYTES = 128 * 1024;
 // Sync<PIPE_MTE2, PIPE_MTE1>() helper, whose id 0 collides with EV_X0 on that
 // very pair. Only the streamed-H case runs that Sync inside the tile loop, so
 // it corrupted the X ring's credit counts at N=512 and nowhere else.
-#define EV_H0 EVENT_ID4  // (MTE2<->MTE1) H L1 ring slot 0
-#define EV_H1 EVENT_ID5  // (MTE2<->MTE1) H L1 ring slot 1
 
 template <pipe_t SrcPipe, pipe_t DstPipe>
 AICORE inline void Sync(uint32_t id = 0) {
@@ -276,52 +240,44 @@ struct Layout {
   // double-bufferable: one dense matmul per tile and no H traffic at all.
   static constexpr bool kResident = (kHBytes * 2 <= L0AB_BYTES);  // N <= 128
 
-  // Otherwise: blocked accumulation against a resident +-H_M (see PTO_OS_BLOCK),
-  // or, with that switched off, the dense product split into contraction chunks
-  // of the largest Kc whose (Kc x N) slice fits half of L0B.
+  // Otherwise: blocked accumulation against a resident +-H_M (see PTO_OS_BLOCK).
+  // Those are the only two forms -- N <= 128 is resident, N = 256 and 512 are
+  // blocked -- so every size's H is loaded once per core and no tile ever
+  // touches MTE2 for H.
   static constexpr uint32_t kM = (N < PTO_OS_BLOCK) ? N : (uint32_t)PTO_OS_BLOCK;
   static constexpr uint32_t kBlk = N / kM;  // B, the number of M-column blocks
-  static constexpr bool kBlocked =
-      (PTO_OS_BLOCKED != 0) && !kResident && (kBlk > 1);
+  static constexpr bool kBlocked = !kResident && (kBlk > 1);
+  static_assert(kResident || kBlocked, "every size must reach one of the two bodies");
   static_assert(!kBlocked || kBlk * kM == N, "M must divide N");
 
-  // Contraction chunk, which both non-resident forms walk: the blocked form's
-  // is one M-column block of X, the chunked form's is a Kc-row slice of H. Kc
-  // stays a multiple of 16 -- it indexes whole fractal columns.
-  static constexpr uint32_t kKc =
-      kResident ? N
-                : (kBlocked ? kM : (L0AB_BYTES / 2) / (N * sizeof(half)));
+  // Contraction chunk: the whole (S x N) tile when resident, one M-column
+  // block of X when blocked. A multiple of 16 either way -- it indexes whole
+  // fractal columns.
+  static constexpr uint32_t kKc = kResident ? N : kM;
   static constexpr uint32_t kChunks = N / kKc;
   static_assert(kKc * kChunks == N && kKc % 16 == 0, "Kc must tile N by 16s");
 
-  // H placement. Resident in L0B when there is only one chunk: loaded once per
-  // core and never touched again, which is the whole point at small N.
-  static constexpr bool kHInL0B = (kChunks == 1);
+  // H placement: all of it in L0B when resident, else the +-H_M pair.
+  static constexpr bool kHInL0B = kResident;
   // The blocked form is resident too -- +-H_M, two M x M tiles, loaded once per
-  // core. Otherwise H is resident in L1 if it fits beside the X ring, else
-  // streamed from GM into a two-slot L1 ring on every tile.
+  // core.
   static constexpr unsigned kXSlots = 4;
-  static constexpr bool kHInL1 =
-      !kHInL0B && !kBlocked && (kHBytes + kXSlots * kTileBytes <= L1_BYTES);
 
-  // L1: H (all of it, +-H_M, or a 2-slot chunk ring), then the X ring.
+  // L1: H, either all of it or the +-H_M pair, then the X ring.
   static constexpr unsigned kL1H = 0;
   static constexpr unsigned kL1HChunk =
       kBlocked ? kM * kM * sizeof(half) : kKc * N * sizeof(half);
-  static constexpr unsigned kL1HBytes =
-      kHInL0B ? kHBytes : (kHInL1 ? kHBytes : 2 * kL1HChunk);
+  static constexpr unsigned kL1HBytes = kHInL0B ? kHBytes : 2 * kL1HChunk;
   static constexpr unsigned kL1X = kL1H + kL1HBytes;
   static_assert(kL1X + kXSlots * kTileBytes <= L1_BYTES, "L1 overflow");
 
   static constexpr unsigned xSlot(uint32_t slot) {
     return kL1X + slot * kTileBytes;
   }
-  // Row chunk kc of H inside L1. Resident: H is (N x N) row-major in NZ, and a
-  // row chunk is Kc/16 fractal ROWS -- not contiguous unless kKc == N. So the
-  // resident L1 copy is staged as kChunks separate (Kc x N) tiles instead, which
-  // the host hands over in exactly that order.
+  // Slot kc of H inside L1. For the blocked pair the index is the SIGN, not a
+  // chunk: 0 is +H_M and 1 is -H_M.
   static constexpr unsigned l1HChunk(uint32_t kc) {
-    return kL1H + (kHInL1 ? kc : (kc & 1u)) * kL1HChunk;
+    return kL1H + (kc & 1u) * kL1HChunk;
   }
 
   // L0A: one contraction chunk of X, two slots. With a single chunk that is the
@@ -347,9 +303,7 @@ struct Layout {
     return xSlot(slot) + kc * kKc * S * sizeof(half);
   }
 
-  // L0B: H, resident in full, as the resident +-H_M pair, or a two-slot chunk
-  // ring. The blocked pair and the chunk ring index the same way -- slot 0/1 --
-  // so l0bH serves both; for the pair the index is the SIGN, not a chunk.
+  // L0B: H resident in full, or the resident +-H_M pair indexed by SIGN.
   static constexpr unsigned kL0bH = 0;
   static constexpr unsigned kL0bChunk =
       kBlocked ? kM * kM * sizeof(half) : kKc * N * sizeof(half);
@@ -426,18 +380,7 @@ AICORE void loadHadamard(__gm__ half *h) {
     TASSIGN(h_l0b, L::kL0bH);
     TMOV(h_l0b, h_l1);
     Sync<PIPE_MTE1, PIPE_M>();
-  } else if constexpr (L::kHInL1) {
-    for (uint32_t kc = 0; kc < L::kChunks; ++kc) {
-      MatTile<L::kKc, N> h_l1;
-      TASSIGN(h_l1, L::l1HChunk(kc));
-      __gm__ half *src = h + kc * L::kKc * N;
-      GmTile<L::kKc, N> h_gm(src);
-      TASSIGN(h_gm, src);
-      TLOAD(h_l1, h_gm);
-    }
-    Sync<PIPE_MTE2, PIPE_MTE1>();
   }
-  // kHInL1 == false and kHInL0B == false: nothing resident, every tile streams.
 }
 
 // GM -> L1 X slot, signalling MTE2->MTE1. The caller already holds the slot.
@@ -493,70 +436,6 @@ AICORE void issueTileLoad(__gm__ half *x, uint32_t sample) {
 // One contraction chunk: X column-slice and H row-chunk to L0A/L0B, then a
 // matmul into the running accumulator. Slot parity is a template argument
 // because the flag ids must be literal.
-template <uint32_t N, uint32_t S, uint32_t XSlot, bool CPar, event_t EvA,
-          event_t EvH, typename AccT>
-AICORE void chunkStep(__gm__ half *h, AccT &acc, uint32_t kc,
-                      uint32_t chunks) {
-  using L = Layout<N, S>;
-
-  // X: slice the L1 tile by columns, then move just that chunk to L0A. An L1
-  // Mat tile is block-column-major, so whole 16-column groups are contiguous --
-  // this is the slice an L0A Left tile canNOT do, being fractal-ROW-major.
-  MatTile<S, L::kKc> x_l1;
-  TileLeft<half, S, L::kKc> x_l0a;
-  TASSIGN(x_l1, L::xChunk(XSlot, kc));
-  TASSIGN(x_l0a, L::l0aX(CPar ? 1u : 0u));
-
-  // H: row chunk kc, contiguous in GM and in L1.
-  MatTile<L::kKc, N> h_l1;
-  TileRight<half, L::kKc, N> h_l0b;
-  TASSIGN(h_l1, L::l1HChunk(kc));
-  TASSIGN(h_l0b, L::l0bH(CPar ? 1u : 0u));
-
-  if constexpr (!L::kHInL1) {
-    // Nothing resident: stage this chunk GM -> L1 first. H is the same every
-    // tile, so these reads are served by L2, not HBM.
-    __gm__ half *src = h + kc * L::kKc * N;
-    GmTile<L::kKc, N> h_gm(src);
-    TASSIGN(h_gm, src);
-    wait_flag(PIPE_MTE1, PIPE_MTE2, EvH);  // chunk kc-2 has read this slot
-    TLOAD(h_l1, h_gm);
-    set_flag(PIPE_MTE2, PIPE_MTE1, EvH);
-  }
-  wait_flag(PIPE_M, PIPE_MTE1, EvA);  // chunk kc-2 has finished with the slot
-  if constexpr (!L::kHInL1) {
-    wait_flag(PIPE_MTE2, PIPE_MTE1, EvH);  // this chunk's H has landed
-  }
-  TMOV(x_l0a, x_l1);
-  TMOV(h_l0b, h_l1);
-  if constexpr (!L::kHInL1) {
-    set_flag(PIPE_MTE1, PIPE_MTE2, EvH);  // H L1 slot free for chunk kc+2
-  }
-  // A full barrier, so chunk kc+1's TMOVs do not start under chunk kc's matmul:
-  // the slot alternation above is allocated but NOT exploited. That is
-  // deliberate, and measured rather than assumed -- a PTO_OS_NOMM probe puts the
-  // matmuls at 0% of N=512's time and 7-8% of N=256's, so these sizes are purely
-  // movement-bound and overlapping M under MTE1 has nothing to win. Splitting
-  // this into a distance-1 pair would only pay if that ever changes.
-  Sync<PIPE_MTE1, PIPE_M>();
-#if !PTO_OS_NOMM
-  if (kc == 0) {
-    TMATMUL(acc, x_l0a, h_l0b);
-  } else {
-    TMATMUL_ACC(acc, x_l0a, h_l0b);
-  }
-#endif
-  set_flag(PIPE_M, PIPE_MTE1, EvA);  // slot free for chunk kc+2
-}
-
-// One input block of the blocked form: move X's M-column block i to L0A, then
-// fan it out over all B output blocks, each against +H_M or -H_M.
-//
-// This is the cube's version of one butterfly stage. The vector core walks
-// log2(N) stages, reading and rewriting the whole sample each time; here the B
-// partial products that make output block j land in the SAME L0C accumulator
-// and TMATMUL_ACC sums them in place, so the combination costs no traffic at
-// all -- block i is read from L1 once and never written back.
 template <uint32_t N, uint32_t S, uint32_t XSlot, bool APar, event_t EvA>
 AICORE void blockStep(unsigned accBase, uint32_t i) {
   using L = Layout<N, S>;
@@ -573,7 +452,6 @@ AICORE void blockStep(unsigned accBase, uint32_t i) {
   TMOV(x_l0a, x_l1);
   Sync<PIPE_MTE1, PIPE_M>();
 
-#if !PTO_OS_NOMM
   for (uint32_t j = 0; j < L::kBlk; ++j) {
     TileAcc<float, S, L::kM> acc_j;
     TASSIGN(acc_j, L::l0cBlock(accBase, j));
@@ -588,7 +466,6 @@ AICORE void blockStep(unsigned accBase, uint32_t i) {
       TMATMUL_ACC(acc_j, x_l0a, h_j);
     }
   }
-#endif
   set_flag(PIPE_M, PIPE_MTE1, EvA);  // slot free for block i+2
 }
 
@@ -617,9 +494,7 @@ AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample) {
     TASSIGN(h_l0b, L::kL0bH);
     wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // the slot's previous store drained
     Sync<PIPE_MTE1, PIPE_M>();
-#if !PTO_OS_NOMM
     TMATMUL(acc, x_l0a, h_l0b);
-#endif
     set_flag(PIPE_M, PIPE_MTE1, EvA);  // slot free for tile i+2
   } else if constexpr (L::kBlocked) {
     // +-H_M is already in L0B and stays there, so a block costs one TMOV and B
@@ -634,16 +509,6 @@ AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample) {
       }
     }
     set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // last block has read the X slot
-  } else {
-    wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // the slot's previous store drained
-    for (uint32_t kc = 0; kc < L::kChunks; ++kc) {
-      if (kc & 1u) {
-        chunkStep<N, S, Slot, true, EV_A1, EV_H1>(h, acc, kc, L::kChunks);
-      } else {
-        chunkStep<N, S, Slot, false, EV_A0, EV_H0>(h, acc, kc, L::kChunks);
-      }
-    }
-    set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // last chunk has read the X slot
   }
   Sync<PIPE_M, PIPE_FIX>();
 
@@ -697,11 +562,6 @@ AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
     }
     set_flag(PIPE_M, PIPE_MTE1, EV_A0);  // both L0A/L0B slots start free
     set_flag(PIPE_M, PIPE_MTE1, EV_A1);
-    if constexpr (!Layout<N, S>::kHInL0B && !Layout<N, S>::kHInL1 &&
-                  !Layout<N, S>::kBlocked) {
-      set_flag(PIPE_MTE1, PIPE_MTE2, EV_H0);  // both H L1 slots start free
-      set_flag(PIPE_MTE1, PIPE_MTE2, EV_H1);
-    }
 
     issueTileLoad<N, S, 0, EV_X0>(x, tileStart(base, S, n_full, end, 0));
     if (n > 1) issueTileLoad<N, S, 1, EV_X1>(x, tileStart(base, S, n_full, end, 1));
@@ -741,11 +601,6 @@ AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
     }
     wait_flag(PIPE_M, PIPE_MTE1, EV_A0);
     wait_flag(PIPE_M, PIPE_MTE1, EV_A1);
-    if constexpr (!Layout<N, S>::kHInL0B && !Layout<N, S>::kHInL1 &&
-                  !Layout<N, S>::kBlocked) {
-      wait_flag(PIPE_MTE1, PIPE_MTE2, EV_H0);
-      wait_flag(PIPE_MTE1, PIPE_MTE2, EV_H1);
-    }
   }
   if constexpr (S > 16) {
     runTiles<N, S / 2>(x, h, y, sample, end);
@@ -765,20 +620,12 @@ AICORE void runOnesided(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   // with a count that is not a multiple of S, and each then walks the
   // power-of-two fallback down to single-sample tiles, which cost the same
   // handshakes as a full tile for a fraction of the work.
-#if PTO_OS_TILE_SPLIT
   const uint32_t tiles_per_core = DIV_ROUNDUP(DIV_ROUNDUP(batch, S), num_cores);
   const uint32_t begin = tiles_per_core * S * core_id;
-#else
-  const uint32_t begin = DIV_ROUNDUP(batch, num_cores) * core_id;
-#endif
   if (begin >= batch) {
     return;
   }
-#if PTO_OS_TILE_SPLIT
   uint32_t end = begin + tiles_per_core * S;
-#else
-  uint32_t end = begin + DIV_ROUNDUP(batch, num_cores);
-#endif
   if (end > batch) {
     end = batch;
   }

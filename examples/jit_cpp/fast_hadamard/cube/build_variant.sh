@@ -2,8 +2,8 @@
 # for A/B-ing the PTO_HAD_* switches documented at the top of the kernel. Run
 # from the fast_hadamard/ directory.
 #
-#   bash cube/build_variant.sh base -DPTO_HAD_DBUF=0
-#   bash cube/build_variant.sh deep -DPTO_HAD_DBUF=1
+#   bash cube/build_variant.sh base
+#   bash cube/build_variant.sh m32 -DPTO_HAD_BLOCK=32
 #   python3 cube/validate_variant.py cube/outputs/so_var/base.so ...   # ALWAYS
 #   python3 cube/devtime_bench.py <cfg.json>                           # then time
 #
