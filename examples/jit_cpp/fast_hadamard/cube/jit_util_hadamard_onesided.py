@@ -39,31 +39,12 @@ _PAD_CACHE: dict = {}
 _TILE_ELEMS = 16384
 _SAMPLES_PER_TILE = {64: 256, 128: 128, 256: 32, 512: 16}
 
-# Same shape of schedule as the two-sided kernel: cores are only worth adding
-# while each still gets a tile run long enough to keep its pipes full, and
-# bd = sqrt(k * tiles) trades those off.
-#
-# REFITTED for the blocked form. The old constants (8, 16, 16, 16) were fitted
-# when the kernel was movement-bound at N>=256 and ran a 2-4x taller tile; the
-# blocked form is matmul-bound there and tiles are smaller, so both the tile
-# count and the per-tile cost moved. Resweep this whenever the tile geometry or
-# PTO_OS_BLOCK changes -- it is calibration, not a rule.
-#
-# Fitted per N over EVERY integer block_dim in [1, 24] x batch in
-# {64, 256, 1024, 8192, 65536}, msprof device time on 910B2, 15 reps each.
-# Regret is against the best measured block_dim at that shape:
-#
-#    N      k    worst regret   mean    constant-24 worst
-#   64    7.51      1.041x     1.012x        1.192x
-#  128    7.23      1.021x     1.006x        1.176x
-#  256    7.51      1.000x     1.000x        1.214x
-#  512   22.57      1.028x     1.014x        1.181x
-#
-# Sweep every integer, not a subset. A first fit over
-# {1,2,3,4,6,8,12,16,20,24} chose constants that emit bd = 15 and 23 -- values
-# it had never measured -- and scored them against their nearest neighbour. The
-# regret it reported was 1.013-1.031x; the real cost at N=64 batch 8192 was
-# 1.12x, because 32 tiles divide evenly over 16 cores and badly over 15.
+# Same shape of schedule as the two-sided kernel: bd = sqrt(k * tiles) trades
+# core count against keeping each core's pipes full. Fitted per N over every
+# integer block_dim in [1, 24] x batch in {64, 256, 1024, 8192, 65536} against
+# msprof device time, minimising worst-case regret (<= 1.041x, where a constant
+# 24 costs up to 1.21x). It is calibration, not a rule -- resweep it whenever
+# the tile geometry or PTO_OS_BLOCK changes.
 _TILE_RUN_K = {64: 7.51, 128: 7.23, 256: 7.51, 512: 22.57}
 # Only reached if the case table grows a size this table has not been fitted
 # for. Then it is an extrapolation -- sweep block_dim and add the entry.
@@ -92,9 +73,7 @@ def hadamard_matrix(size: int, device, dtype=torch.float16):
 
 # Block size M of the kernel's blocked-accumulation form, mirroring
 # PTO_OS_BLOCK. The buffer below carries +-H_M for it, so the two MUST agree:
-# a mismatch hands the kernel the wrong-sized operand and it computes garbage
-# (which is how the first M=64 A/B failed -- a host/device disagreement, not a
-# bad block size). The env override exists so that A/B can set both at once.
+# a mismatch hands the kernel a wrong-sized operand and it computes garbage.
 _BLOCK = int(os.environ.get("PTO_OS_BLOCK", 64))
 
 
@@ -226,14 +205,11 @@ def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE):
             else resolve_launch_block_dim(block_dim, resolved_block_dim)
         )
 
-        # Build H BEFORE resolving the stream pointer, and keep it on its own
-        # line. On a cache miss hadamard_full enqueues torch ops (host->device
-        # copies and a cat), while resolve_stream_ptr is what drains torch_npu's
-        # async task queue so this raw ctypes launch is ordered after them.
-        # Python evaluates call arguments left to right, so writing this inline
-        # after the stream pointer enqueues those ops AFTER the drain and the
-        # kernel can read H before it is written -- Y = X * 0 = 0, on the first
-        # call for each n only, which is exactly as intermittent as it sounds.
+        # Build H BEFORE resolving the stream pointer, on its own line. On a
+        # cache miss this enqueues torch ops, and resolve_stream_ptr is what
+        # drains torch_npu's task queue so the raw ctypes launch is ordered
+        # behind them; inlining it after the stream pointer would enqueue them
+        # after the drain and the kernel could read H before it is written.
         h = hadamard_full(resolved_n, x.device)
         kernel(
             launch_block_dim,

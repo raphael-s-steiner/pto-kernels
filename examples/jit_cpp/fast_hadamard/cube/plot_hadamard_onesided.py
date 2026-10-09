@@ -17,7 +17,7 @@ from plot_common import (
 CSV_PREFIX = "fht_onesided_compare_bd"
 
 # Column that is blank on rows the two-sided kernel cannot run (N < 256).
-TWO_SIDED_KEY = "cube_duration_us"
+TWO_SIDED_KEY = "twosided_duration_us"
 
 ONESIDED_COLOR = "#16a34a"
 VECTOR_COLOR = "#2563eb"
@@ -58,11 +58,11 @@ HEATMAPS = (
 # These need the two-sided arm, so they only cover the rows that have one.
 TWO_SIDED_LINE_PLOTS = (
     {
-        "filename": "hadamard_onesided_vs_cube_duration_bd{block_dim}.png",
+        "filename": "hadamard_onesided_vs_twosided_duration_bd{block_dim}.png",
         "series": (
             ("onesided_duration_us", "One-sided PTO (dense matmul)",
              ONESIDED_COLOR, "D-"),
-            ("cube_duration_us", "Two-sided PTO (Kronecker split)",
+            ("twosided_duration_us", "Two-sided PTO (Kronecker split)",
              CUBE_COLOR, "s-"),
             ("vector_duration_us", "Vector PTO (butterfly)", VECTOR_COLOR, "o-"),
         ),
@@ -73,8 +73,8 @@ TWO_SIDED_LINE_PLOTS = (
 
 TWO_SIDED_HEATMAPS = (
     {
-        "filename": "hadamard_onesided_speedup_vs_cube_bd{block_dim}.png",
-        "key": "onesided_speedup_vs_cube",
+        "filename": "hadamard_onesided_speedup_vs_twosided_bd{block_dim}.png",
+        "key": "onesided_speedup_vs_twosided",
         "title": "One-sided PTO Speedup over Two-sided PTO",
     },
 )

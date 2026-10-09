@@ -27,7 +27,7 @@ ALL_HIDDEN_DIMS = sorted(set(REQUIRED_HIDDEN_DIMS + EXTRA_HIDDEN_DIMS))
 TEST_BATCHES = [1, 7, 22, 65]
 DTYPE = torch.float16
 
-# Same basis as cube/test_hadamard_cube.py: both back ends accumulate in fp32
+# Same basis as cube/test_hadamard_twosided.py: both back ends accumulate in fp32
 # and round to fp16 only a couple of times, so neither reproduces a staged-fp16
 # reference bit for bit and both are compared against an exact fp64 transform.
 REL_RMS_TOL = 1e-3
@@ -68,13 +68,13 @@ def _assert_matches_reference(y, ref):
 
 @pytest.mark.parametrize("n", ALL_HIDDEN_DIMS)
 def test_routing_is_the_measured_crossover(n):
-    expected = "onesided" if n <= ONESIDED_MAX_N else "cube"
+    expected = "onesided" if n <= ONESIDED_MAX_N else "twosided"
     assert pick_implementation(n) == expected
 
 
 @pytest.mark.parametrize("batch,expected", [
     (1, "onesided"), (16, "onesided"), (128, "onesided"),
-    (BITPLAN_BATCH_MIN, "cube"), (1024, "cube"), (16384, "cube"),
+    (BITPLAN_BATCH_MIN, "twosided"), (1024, "twosided"), (16384, "twosided"),
 ])
 def test_n512_routing_follows_batch(batch, expected):
     """N=512 is the one size where batch moves the choice.
@@ -97,7 +97,7 @@ def test_required_grid_is_inside_the_supported_range():
     assert min(REQUIRED_HIDDEN_DIMS) >= MIN_AUTO_N
     assert max(REQUIRED_HIDDEN_DIMS) <= MAX_AUTO_N
     for n in REQUIRED_HIDDEN_DIMS:
-        assert pick_implementation(n) in ("onesided", "cube")
+        assert pick_implementation(n) in ("onesided", "twosided")
 
 
 def test_supported_sizes_are_the_union_of_the_two_back_ends():
@@ -133,7 +133,7 @@ def test_matches_exact_transform(auto_hadamard_kernel, npu_device, batch, n):
 
 @pytest.mark.parametrize("n", ALL_HIDDEN_DIMS)
 def test_dispatch_is_bit_identical_to_calling_the_back_end_directly(
-    auto_hadamard_kernel, cube_hadamard_kernel, onesided_hadamard_kernel,
+    auto_hadamard_kernel, twosided_hadamard_kernel, onesided_hadamard_kernel,
     npu_device, n,
 ):
     """The dispatcher must add nothing but the choice.
@@ -148,7 +148,7 @@ def test_dispatch_is_bit_identical_to_calling_the_back_end_directly(
 
     auto_hadamard_kernel(x, y_auto)
     backend = (onesided_hadamard_kernel if pick_implementation(n) == "onesided"
-               else cube_hadamard_kernel)
+               else twosided_hadamard_kernel)
     backend(x, y_direct)
     torch.npu.synchronize()
     assert torch.equal(y_auto, y_direct)
@@ -172,7 +172,7 @@ def test_1d_input_rejected(auto_hadamard_kernel, npu_device):
 
 def test_only_the_needed_back_end_is_compiled(auto_hadamard_kernel, npu_device):
     """Compilation is on demand, so the set of built kernels tracks use."""
-    assert set(auto_hadamard_kernel.compiled) <= {"onesided", "cube"}
+    assert set(auto_hadamard_kernel.compiled) <= {"onesided", "twosided"}
     auto_hadamard_kernel.kernel_for("onesided")
-    auto_hadamard_kernel.kernel_for("cube")
-    assert set(auto_hadamard_kernel.compiled) == {"onesided", "cube"}
+    auto_hadamard_kernel.kernel_for("twosided")
+    assert set(auto_hadamard_kernel.compiled) == {"onesided", "twosided"}

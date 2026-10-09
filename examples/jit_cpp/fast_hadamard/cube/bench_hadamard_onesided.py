@@ -20,15 +20,15 @@ from bench_common import (
     validate_benchmark_args,
     write_csv_records,
 )
-from cube.jit_util_hadamard_cube import MIN_CUBE_HADAMARD_N
-from cube.jit_util_hadamard_cube import jit_compile as jit_compile_cube
-from onesided.jit_util_hadamard_onesided import (
+from cube.jit_util_hadamard_twosided import MIN_TWOSIDED_N
+from cube.jit_util_hadamard_twosided import jit_compile as jit_compile_twosided
+from cube.jit_util_hadamard_onesided import (
     MAX_ONESIDED_N,
     MIN_ONESIDED_BATCH,
     MIN_ONESIDED_N,
     onesided_block_dim_schedule,
 )
-from onesided.jit_util_hadamard_onesided import jit_compile as jit_compile_onesided
+from cube.jit_util_hadamard_onesided import jit_compile as jit_compile_onesided
 from standard.jit_util_hadamard import jit_compile as jit_compile_vector
 
 DEFAULT_WARMUP = 10
@@ -45,21 +45,21 @@ ONESIDED_POOL_KINDS = {
     "onesided_y": POOL_EMPTY_FP16,
     "vector_x": POOL_RANDN_FP16,
 }
-CUBE_POOL_KINDS = {
-    "cube_x": POOL_RANDN_FP16,
-    "cube_y": POOL_EMPTY_FP16,
+TWOSIDED_POOL_KINDS = {
+    "twosided_x": POOL_RANDN_FP16,
+    "twosided_y": POOL_EMPTY_FP16,
 }
 
 CSV_HEADER = (
     "batch,N,onesided_block_dim,onesided_duration_us,vector_duration_us,"
-    "cube_duration_us,onesided_bandwidth_gbs,vector_bandwidth_gbs,"
-    "cube_bandwidth_gbs,onesided_speedup_vs_vector,onesided_speedup_vs_cube,"
+    "twosided_duration_us,onesided_bandwidth_gbs,vector_bandwidth_gbs,"
+    "twosided_bandwidth_gbs,onesided_speedup_vs_vector,onesided_speedup_vs_twosided,"
     "trials,onesided_duration_mean_us,onesided_duration_std_us,"
     "onesided_duration_min_us,onesided_duration_max_us,"
     "onesided_duration_cv_pct,vector_duration_mean_us,vector_duration_std_us,"
     "vector_duration_min_us,vector_duration_max_us,vector_duration_cv_pct,"
-    "cube_duration_mean_us,cube_duration_std_us,cube_duration_min_us,"
-    "cube_duration_max_us,cube_duration_cv_pct\n"
+    "twosided_duration_mean_us,twosided_duration_std_us,twosided_duration_min_us,"
+    "twosided_duration_max_us,twosided_duration_cv_pct\n"
 )
 
 ARM_STAT_KEYS = ("mean_us", "std_us", "min_us", "max_us", "cv_pct")
@@ -69,7 +69,7 @@ def _parse_args():
     parser = argparse.ArgumentParser(
         description=(
             "Benchmark the one-sided (single dense matmul) Hadamard PTO kernel "
-            "against the vector butterfly kernel and the two-sided cube "
+            "against the vector butterfly kernel and the two-sided "
             "kernel, and save CSV outputs."
         )
     )
@@ -89,7 +89,7 @@ def supports_onesided(n: int) -> bool:
 
 
 def supports_two_sided(n: int) -> bool:
-    return n >= MIN_CUBE_HADAMARD_N
+    return n >= MIN_TWOSIDED_N
 
 
 def benchmark_out_of_place_us(func, x_list, y_list, *, block_dim, warmup, repeats):
@@ -138,13 +138,13 @@ def _add_arm_stats(result, prefix, stats):
 def measure_onesided_hadamard_shape(
     onesided_func,
     vector_func,
-    cube_func,
+    twosided_func,
     *,
     batch,
     n,
     onesided_block_dim,
     vector_block_dim,
-    cube_block_dim,
+    twosided_block_dim,
     warmup,
     repeats,
     trials,
@@ -152,7 +152,7 @@ def measure_onesided_hadamard_shape(
 ):
     pool_kinds = dict(ONESIDED_POOL_KINDS)
     if supports_two_sided(n):
-        pool_kinds.update(CUBE_POOL_KINDS)
+        pool_kinds.update(TWOSIDED_POOL_KINDS)
     pools = make_shape_pools(
         batch,
         n,
@@ -186,14 +186,14 @@ def measure_onesided_hadamard_shape(
             repeats=repeats,
         ),
     )
-    cube_stats = (
+    twosided_stats = (
         benchmark_trials_us(
             trials,
             lambda: benchmark_out_of_place_us(
-                cube_func,
-                pools["cube_x"],
-                pools["cube_y"],
-                block_dim=cube_block_dim,
+                twosided_func,
+                pools["twosided_x"],
+                pools["twosided_y"],
+                block_dim=twosided_block_dim,
                 warmup=warmup,
                 repeats=repeats,
             ),
@@ -204,7 +204,7 @@ def measure_onesided_hadamard_shape(
 
     onesided_us = onesided_stats["median_us"]
     vector_us = vector_stats["median_us"]
-    cube_us = cube_stats["median_us"] if cube_stats is not None else None
+    twosided_us = twosided_stats["median_us"] if twosided_stats is not None else None
     data_bytes = 2 * batch * n * 2
 
     result = {
@@ -225,16 +225,16 @@ def measure_onesided_hadamard_shape(
         ),
         "onesided_us": onesided_us,
         "vector_us": vector_us,
-        "cube_us": cube_us,
+        "twosided_us": twosided_us,
         "onesided_bw": bandwidth_gbs(data_bytes, onesided_us),
         "vector_bw": bandwidth_gbs(data_bytes, vector_us),
-        "cube_bw": bandwidth_gbs(data_bytes, cube_us) if cube_us is not None else None,
+        "twosided_bw": bandwidth_gbs(data_bytes, twosided_us) if twosided_us is not None else None,
         "onesided_speedup_vs_vector": (
             vector_us / onesided_us if onesided_us > 0 else 0.0
         ),
-        "onesided_speedup_vs_cube": (
-            (cube_us / onesided_us if onesided_us > 0 else 0.0)
-            if cube_us is not None
+        "onesided_speedup_vs_twosided": (
+            (twosided_us / onesided_us if onesided_us > 0 else 0.0)
+            if twosided_us is not None
             else None
         ),
         "trials": trials,
@@ -242,7 +242,7 @@ def measure_onesided_hadamard_shape(
     for prefix, stats in (
         ("onesided", onesided_stats),
         ("vector", vector_stats),
-        ("cube", cube_stats),
+        ("twosided", twosided_stats),
     ):
         _add_arm_stats(result, prefix, stats)
     return result
@@ -262,10 +262,10 @@ def print_onesided_hadamard_shape_summary(result) -> None:
         f"  {_fmt(result['onesided_us'], 12)}"
         f"  {_fmt(result['onesided_cv_pct'], 8)}"
         f"  {_fmt(result['vector_us'], 10)}  {_fmt(result['vector_cv_pct'], 8)}"
-        f"  {_fmt(result['cube_us'], 10)}  {_fmt(result['cube_cv_pct'], 8)}"
+        f"  {_fmt(result['twosided_us'], 10)}  {_fmt(result['twosided_cv_pct'], 8)}"
         f"  {_fmt(result['onesided_bw'], 14)}"
         f"  {_fmt(result['onesided_speedup_vs_vector'], 11, 3)}"
-        f"  {_fmt(result['onesided_speedup_vs_cube'], 11, 3)}"
+        f"  {_fmt(result['onesided_speedup_vs_twosided'], 11, 3)}"
     )
 
 
@@ -282,15 +282,15 @@ def format_onesided_hadamard_csv_record(result) -> str:
         str(result["onesided_block_dim"]),
         _csv_float(result["onesided_us"]),
         _csv_float(result["vector_us"]),
-        _csv_float(result["cube_us"]),
+        _csv_float(result["twosided_us"]),
         _csv_float(result["onesided_bw"]),
         _csv_float(result["vector_bw"]),
-        _csv_float(result["cube_bw"]),
+        _csv_float(result["twosided_bw"]),
         _csv_float(result["onesided_speedup_vs_vector"]),
-        _csv_float(result["onesided_speedup_vs_cube"]),
+        _csv_float(result["onesided_speedup_vs_twosided"]),
         str(result["trials"]),
     ]
-    for prefix in ("onesided", "vector", "cube"):
+    for prefix in ("onesided", "vector", "twosided"):
         fields.extend(_csv_float(result[f"{prefix}_{key}"]) for key in ARM_STAT_KEYS)
     return ",".join(fields)
 
@@ -298,7 +298,7 @@ def format_onesided_hadamard_csv_record(result) -> str:
 def benchmark(
     onesided_func,
     vector_func,
-    cube_func,
+    twosided_func,
     *,
     warmup: int,
     repeats: int,
@@ -309,12 +309,12 @@ def benchmark(
     hidden_dims,
 ):
     ensure_output_dir(output_dir)
-    # None lets each cube-unit wrapper apply its own per-shape block_dim
+    # None lets each wrapper apply its own per-shape block_dim
     # schedule, which is what ships; pinning a constant here would benchmark a
     # configuration nobody runs. The vector kernel has no schedule, so it keeps
     # its resolved default.
     onesided_block_dim = None
-    cube_block_dim = None
+    twosided_block_dim = None
     vector_block_dim = vector_func.block_dim
 
     # Every arm leaves stream_ptr at None so that each call resolves it through
@@ -340,7 +340,7 @@ def benchmark(
     blank_two_sided = [n for n in hidden_dims if not supports_two_sided(n)]
     if blank_two_sided:
         print(
-            f"Note: the two-sided kernel needs N >= {MIN_CUBE_HADAMARD_N}, so "
+            f"Note: the two-sided kernel needs N >= {MIN_TWOSIDED_N}, so "
             f"N in {blank_two_sided} has no two-sided arm; those cells are blank."
         )
 
@@ -355,9 +355,9 @@ def benchmark(
         f"{'batch':>6s}  {'N':>6s}  {'os_bd':>6s}"
         f"  {'onesided_us':>12s}  {'os_cv%':>8s}"
         f"  {'vector_us':>10s}  {'vec_cv%':>8s}"
-        f"  {'cube_us':>10s}  {'cube_cv%':>8s}"
+        f"  {'twosided_us':>10s}  {'ts_cv%':>8s}"
         f"  {'os_bw_gbs':>14s}"
-        f"  {'os_vs_vec':>11s}  {'os_vs_cube':>11s}"
+        f"  {'os_vs_vec':>11s}  {'os_vs_twosided':>11s}"
     )
     print(header)
     print("-" * len(header))
@@ -369,12 +369,12 @@ def benchmark(
             result = measure_onesided_hadamard_shape(
                 onesided_func,
                 vector_func,
-                cube_func,
+                twosided_func,
                 batch=batch,
                 n=n,
                 onesided_block_dim=onesided_block_dim,
                 vector_block_dim=vector_block_dim,
-                cube_block_dim=cube_block_dim,
+                twosided_block_dim=twosided_block_dim,
                 warmup=warmup,
                 repeats=repeats,
                 trials=trials,
@@ -400,7 +400,7 @@ def main():
     repo_base = base.parent
 
     onesided_kernel_path = base / "fast_hadamard_onesided.cpp"
-    cube_kernel_path = repo_base / "cube" / "fast_hadamard_cube.cpp"
+    twosided_kernel_path = repo_base / "cube" / "fast_hadamard_twosided.cpp"
     vector_kernel_path = repo_base / "standard" / "fast_hadamard.cpp"
     csv_dir = resolve_dir_arg(base, args.csv_dir)
 
@@ -409,8 +409,8 @@ def main():
     onesided_func = jit_compile_onesided(
         str(onesided_kernel_path), verbose=True, device=args.npu
     )
-    print("Compiling fast_hadamard_cube.cpp ...")
-    cube_func = jit_compile_cube(str(cube_kernel_path), verbose=True, device=args.npu)
+    print("Compiling fast_hadamard_twosided.cpp ...")
+    twosided_func = jit_compile_twosided(str(twosided_kernel_path), verbose=True, device=args.npu)
     print("Compiling fast_hadamard.cpp ...")
     vector_func = jit_compile_vector(
         str(vector_kernel_path), verbose=True, device=args.npu
@@ -419,7 +419,7 @@ def main():
     benchmark(
         onesided_func,
         vector_func,
-        cube_func,
+        twosided_func,
         warmup=args.warmup,
         repeats=args.repeats,
         trials=args.trials,

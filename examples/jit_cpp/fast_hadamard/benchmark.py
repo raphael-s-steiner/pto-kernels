@@ -5,8 +5,8 @@ import sys
 
 CORE_TARGET_MODULES = {
     "standard": "standard.bench_hadamard",
-    "cube": "cube.bench_hadamard_cube",
-    "onesided": "onesided.bench_hadamard_onesided",
+    "twosided": "cube.bench_hadamard_twosided",
+    "onesided": "cube.bench_hadamard_onesided",
     "quantize_int8": "fuse_int8_quant.bench_quantize",
     "hadamard_quant_int8": "fuse_int8_quant.bench_hadamard_quant",
     "quantize_int4": "fuse_int4_quant.bench_quantize",

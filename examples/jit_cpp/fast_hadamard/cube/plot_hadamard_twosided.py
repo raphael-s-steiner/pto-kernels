@@ -8,22 +8,22 @@ from plot_common import (
     resolve_dir_arg,
 )
 
-CSV_PREFIX = "fht_cube_compare_bd"
+CSV_PREFIX = "fht_twosided_compare_bd"
 
 LINE_PLOTS = (
     {
-        "filename": "hadamard_cube_duration_bd{block_dim}.png",
+        "filename": "hadamard_twosided_duration_bd{block_dim}.png",
         "series": (
-            ("cube_duration_us", "Cube PTO (matmul)", "#dc2626", "s-"),
+            ("twosided_duration_us", "Two-sided PTO (Kronecker split)", "#dc2626", "s-"),
             ("vector_duration_us", "Vector PTO (butterfly)", "#2563eb", "o-"),
         ),
         "y_label": "Duration (us)",
         "title": "Cube vs Vector Hadamard Duration",
     },
     {
-        "filename": "hadamard_cube_bandwidth_bd{block_dim}.png",
+        "filename": "hadamard_twosided_bandwidth_bd{block_dim}.png",
         "series": (
-            ("cube_bandwidth_gbs", "Cube PTO (matmul)", "#dc2626", "s-"),
+            ("twosided_bandwidth_gbs", "Two-sided PTO (Kronecker split)", "#dc2626", "s-"),
             ("vector_bandwidth_gbs", "Vector PTO (butterfly)", "#2563eb", "o-"),
         ),
         "y_label": "Bandwidth (GB/s)",
@@ -33,8 +33,8 @@ LINE_PLOTS = (
 
 HEATMAPS = (
     {
-        "filename": "hadamard_cube_speedup_vs_vector_bd{block_dim}.png",
-        "key": "cube_speedup_vs_vector",
+        "filename": "hadamard_twosided_speedup_vs_vector_bd{block_dim}.png",
+        "key": "twosided_speedup_vs_vector",
         "title": "Cube PTO Speedup over Vector PTO",
     },
 )
@@ -42,12 +42,12 @@ HEATMAPS = (
 
 def _parse_args():
     parser = argparse.ArgumentParser(
-        description="Plot cube-vs-vector Hadamard benchmark results from CSV files."
+        description="Plot two-sided-vs-vector Hadamard benchmark results from CSV files."
     )
     return add_common_plot_args(parser).parse_args()
 
 
-def plot_hadamard_cube(csv_path, plot_dir):
+def plot_hadamard_twosided(csv_path, plot_dir):
     plot_comparison_csv(
         csv_path,
         plot_dir,
@@ -69,8 +69,8 @@ def main():
         plot_dir,
         pattern=f"{CSV_PREFIX}*.csv",
         prefix=CSV_PREFIX,
-        warning="no cube Hadamard benchmark CSV files found",
-        plot_csv_fn=plot_hadamard_cube,
+        warning="no two-sided Hadamard benchmark CSV files found",
+        plot_csv_fn=plot_hadamard_twosided,
     )
 
 

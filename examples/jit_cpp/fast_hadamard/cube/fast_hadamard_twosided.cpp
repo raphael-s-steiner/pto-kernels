@@ -4,7 +4,7 @@ using namespace pto;
 
 #define DIV_ROUNDUP(x, y) (((x) + (y) - 1) / (y))
 
-// Radix-sqrt(N) Hadamard transform on the cube unit.
+// Radix-sqrt(N) Hadamard transform on the cube unit, as two matrix products.
 //
 // H_N is separable: with N = R * C and the Sylvester (natural) ordering,
 // H_N = H_R (x) H_C, so for a sample viewed as an R x C row-major matrix X,
@@ -12,106 +12,47 @@ using namespace pto;
 //     Y = H_R * X * H_C
 //
 // and reading Y back row-major gives the length-N transform in natural order.
-// R and C are the balanced split of log2(N), R = 2^floor(m/2) and
-// C = 2^ceil(m/2), so both factors are about sqrt(N) on a side and the whole
-// transform is two matrix-matrix products -- one applied from the right, one
-// from the left -- instead of log2(N) butterfly stages on the vector unit.
-// Accumulation is fp32 and the result is rounded twice rather than log2(N)
-// times, so this is also the more accurate of the two kernels.
+// R and C are the balanced split of log2(N), so both are about sqrt(N) on a
+// side. Accumulation is fp32 with two roundings, against log2(N) for the vector
+// butterfly in standard/.
 //
-// A tile is S consecutive samples, which in GM is one contiguous (S*R x C)
-// matrix. Both multiplies are then whole-tile: a right multiply does not mix
-// rows, so X_stack * H_C transforms all S samples at once; a left multiply
-// does not mix columns, so H_R * T_cat does the same with the samples laid
-// side by side. Two TMATMULs per tile, whatever S is.
+// A tile is S consecutive samples, in GM one contiguous (S*R x C) matrix. Both
+// multiplies are whole-tile -- a right multiply does not mix rows, a left
+// multiply does not mix columns -- so two TMATMULs transform the tile whatever
+// S is. Between them the per-sample blocks move from a vertical stack to a
+// horizontal one: free at C == 16 (one NZ block-column, the same bytes), else
+// S TEXTRACTs into one (R x S*C) L1 tile plus S per-sample stores, which
+// TStoreAccNz2nd cannot fold into one strided descriptor.
 //
-// The two paths differ only in how the per-sample blocks get from a vertical
-// stack to a horizontal one between the multiplies:
-//
-//   C == 16  A 16-column tile is a single NZ block-column, so (S*R x 16) and
-//            (16 x S*R) are the SAME BYTES -- fractal s is sample s either
-//            way. The flip costs nothing, both GM transfers stay one
-//            contiguous descriptor, and the tile is 7 descriptors for any S.
-//
-//   C > 16   Block-columns are still contiguous, so the flip is S TEXTRACTs
-//            into one (R x S*C) L1 tile, and the result comes back out as S
-//            per-sample Acc sub-tiles. The fixpipe L0C->GM path is 2D-to-2D
-//            only (TStoreAccNz2nd asserts the three outer GlobalTensor dims
-//            are 1), so those stores cannot be folded into one strided
-//            descriptor -- a 5D scatter faults the aicore.
-//
-// Measured on 910B2 (msprof device time, batch 8192, with the wrapper's
-// block_dim schedule), against the vector butterfly kernel in standard/:
-// N=1024 1.64x, N=4096 2.09x, N=256 0.84x -- and N=256 is 1.26x at batch 64 and
-// 1.95x at batch 65536. Geometric mean 1.42x over the benchmark grid.
-//
-// N=256 is the weak case because a tile is the same 16 KB at every size
-// (S * N = 8192 throughout the table), so N=256 yields the fewest tiles for a
-// given batch, and a core needs a RUN of tiles to fill its pipes: measured, a
-// tile costs 340 ns when it is one of two on a core and 91 ns on a long run.
-// That is what the two-phase tile body and the host-side block_dim schedule in
-// jit_util_hadamard_cube.py are for; the README derives both.
-//
-// (N, R, C, samples per tile)
+// See the README for the measurements behind every constant here.
 
 // Samples per tile at N=256. S*N <= 16384 keeps both L0C accumulators inside
 // 128 KB; the rest of the table is fixed by the same bound.
-#ifndef PTO_HAD_S256
-#define PTO_HAD_S256 32
+#ifndef PTO_TS_S256
+#define PTO_TS_S256 32
 #endif
-// Both GM legs of a tile go through a Layout::NZ view wherever that is
-// correct, which makes each one a single contiguous burst instead of the
-// default ND2NZ path -- that path writes L1 in C0-sized 32-BYTE pieces however
-// wide the tile is, and removing it is the single largest win in this kernel
-// (4.5-8.7x at N=256). Two separate things make it correct, and Layout::kNzGm
-// below is true when either does:
-//
-//   C == 16   One block-column, so the NZ image IS the row-major bytes. A pure
-//             reinterpret, and each leg would be valid on its own.
-//
-//   S == 1    ND and NZ differ, but only by a PERMUTATION OF THE BIT FIELDS of
-//             the byte index,
-//
-//               ND:  [ row>>4 | row&15 | col>>4 | col&15 ]
-//               NZ:  [ col>>4 | row>>4 | row&15 | col&15 ]
-//
-//             and a Sylvester Hadamard is invariant under any bit permutation
-//             of its index, because H[i][j] = (-1)^popcount(i & j) and popcount
-//             is blind to which positions the set bits occupy. So the cube
-//             transforms a permuted input, which IS the permuted transform, and
-//             reading the accumulator back through the same NZ view undoes it.
-//             Both legs must therefore flip TOGETHER -- hence one predicate for
-//             the pair, not two -- and the permutation lifts col>>4 above the
-//             row index, so it would cross samples unless the tile holds one.
-//
-// A tile of S > 1 samples at C > 16 reaches the same contiguous descriptor by
-// choosing the OPERANDS instead: see bitplan_operands in
-// jit_util_hadamard_cube.py, which is what N=512 ships.
-//
-// Apply each stage's factor as H_f = H_acc (x) H_mat with H_mat of size M, so
-// the matmul is M-sized and the sum over blocks runs in the L0C accumulator --
-// the same trick the one-sided kernel in onesided/ uses, applied to each of the
-// two one-sided stages this kernel is made of.
-//
-// The MAC count is unchanged: B*B matmuls of (rows x M) by (M x M) is the same
-// rows*f*f as one dense product, whatever M is. What changes is footprint, and
-// the term that matters is the SLOT, not the operand:
-//
-//     phase A's X slice in L0A    2*S*R*C  ->  2*S*R*M_b
-//     phase B's T slice in L0B    2*S*R*C  ->  2*M_a*S*C
-//     phase B's operand in L0A    2*R*R    ->  4*M_a*M_a
-//     phase A's operand in L0B    2*C*C    ->  4*M_b*M_b
-//
-// Blocking a stage COSTS 1.5-1.9x (the blocked body walks MTE1 -> M -> MTE1 ->
-// M, so consecutive tiles stop overlapping), so it is applied only where there
-// is no dense form at all -- N=32768, whose H_C alone would fill L0B. M must
-// divide its factor and be at least 16, the cube's fractal size.
-#ifndef PTO_HAD_BLOCK
-#define PTO_HAD_BLOCK 64
+// Both GM legs of a tile go through a Layout::NZ view wherever that is correct
+// (Layout::kNzGm), making each one a contiguous burst instead of the default
+// ND2NZ path, which writes L1 in 32-byte pieces however wide the tile is. It is
+// correct when C == 16 (one block-column: the NZ image IS the row-major bytes),
+// or when S == 1, where ND and NZ differ by a permutation of the BIT FIELDS of
+// the byte index and H[i][j] = (-1)^popcount(i & j) is invariant under any such
+// permutation, so an NZ load and an NZ store cancel. S > 1 at C > 16 reaches
+// the same descriptor by choosing the OPERANDS instead -- see bitplan_operands
+// in jit_util_hadamard_twosided.py, which is what N=512 ships.
+
+// Apply a stage's factor as H_f = H_acc (x) H_mat with H_mat of size M, so the
+// matmul is M-sized and the sum over blocks runs in the L0C accumulator -- the
+// same identity the one-sided kernel beside it uses. Same MAC count; what
+// shrinks is the per-matmul SLOT. Blocking costs 1.5-1.9x, so it is used only
+// where there is no dense form at all: N=32768, whose H_C alone fills L0B. M
+// must divide its factor and be a multiple of 16, the cube's fractal size.
+#ifndef PTO_TS_BLOCK
+#define PTO_TS_BLOCK 64
 #endif
 
-#define FAST_HADAMARD_CUBE_CASES(X) \
-  X(256, 16, 16, PTO_HAD_S256)      \
+#define FAST_HADAMARD_TWOSIDED_CASES(X) \
+  X(256, 16, 16, PTO_TS_S256)      \
   X(512, 16, 32, 16)                \
   X(1024, 32, 32, 8)                \
   X(2048, 32, 64, 4)                \
@@ -130,23 +71,18 @@ constexpr uint32_t L0AB_BYTES = 64 * 1024;
 constexpr uint32_t L0C_BYTES = 128 * 1024;
 
 // Distinct ids for the cross-tile edges; the intra-tile Sync pairs use id 0.
-// Macros, not constexpr: bisheng rejects anything but the literal EVENT_ID*
-// token as the third argument of set_flag / wait_flag. They reach the flag
-// instructions as template non-type arguments, which is the one other form it
-// accepts.
+// Macros, not constexpr: bisheng accepts only a literal EVENT_ID* token or a
+// template non-type argument as the third set_flag / wait_flag argument.
 //
-// The two drivers never coexist in one instantiation, so they get separate
-// names over a shared id pool. Keep the shallow ids exactly as they are: moving
-// them renumbers flags in a path that did not otherwise change, and that alone
-// measured a reproducible 0.92x at N=1024 batch 65536.
+// Two rules: one id must never carry two set_flag channels out of the same
+// source pipe (the wrong waiter takes a mid-loop credit), and the shallow ids
+// must not be renumbered -- doing so measured a reproducible 0.92x.
 #define EV_X0 EVENT_ID1   // shallow: L1 X slot 0
 #define EV_X1 EVENT_ID2   // shallow: L1 X slot 1
 #define EV_ACC EVENT_ID3  // shallow: output accumulator
-// Shallow blocked bodies. Every id below is distinct WITHIN its source pipe,
-// which is the invariant that matters: two channels out of the same pipe under
-// one id let the wrong waiter take a credit -- see the README section on it.
-// EV_SWB shares id 3 with EV_ACC, but EV_ACC's source is FIX and this one's is
-// M, so they are different channels either way the hardware keys them.
+// Shallow blocked bodies; distinct WITHIN each source pipe, which is the
+// invariant that matters. EV_SWB shares id 3 with EV_ACC, but EV_ACC's source
+// is FIX and this one's is M, so they are different channels regardless.
 #define EV_SWB  EVENT_ID3  // (M  -> MTE1) left multiply, slice free
 #define EV_SWA0 EVENT_ID4  // (M  -> MTE1) right multiply, slot 0 free
 #define EV_SWA1 EVENT_ID5  // (M  -> MTE1) right multiply, slot 1 free
@@ -173,11 +109,8 @@ template <uint32_t Rows, uint32_t Cols>
 using MatTile = Tile<TileType::Mat, half, Rows, Cols, BLayout::ColMajor, Rows,
                      Cols, SLayout::RowMajor, 512>;
 
-// NZ view of a tile: Shape<1, Cols/16, Rows/16, 16, C0> with the canonical
-// strides, i.e. block-column major over 16x16 row-major fractals. At Cols == 16
-// that is one block-column and the bytes coincide with ND; above it the two
-// differ by the bit-field permutation noted at PTO_HAD_BLOCK. Either way the
-// descriptor is contiguous over the whole tile.
+// NZ view of a tile: block-column major over 16x16 row-major fractals. One
+// contiguous descriptor over the whole tile either way.
 template <uint32_t Rows, uint32_t Cols>
 using GmNz = GlobalTensor<half, TileShape2D<half, Rows, Cols, Layout::NZ>,
                           BaseShape2D<half, Rows, Cols, Layout::NZ>,
@@ -198,40 +131,33 @@ struct Layout {
   static constexpr unsigned kTileBytes = kTileElems * sizeof(half);
   static constexpr unsigned kAccBytes = kTileElems * sizeof(float);
 
-  // Mat-factor of each stage, and the matching accumulation factor. A factor
-  // at or below the block size is left dense (kMa == R, kR1 == 1).
-  // Does the DENSE SHALLOW path fit? That is the fallback every size has, so it
-  // -- not the deep path -- is what decides whether blocking is needed at all.
+  // Does the DENSE SHALLOW path fit? That is the fallback every size has, so
+  // it -- not the deep path -- decides whether blocking is needed at all.
   // L0A carries H_R plus one X slice, L0B carries H_C plus one T slice, L0C the
-  // two accumulators. Blocking to reach the DEEP path instead is a measured
-  // 1.28x regression at N=16384 (56.86 us blocked-deep against 44.30 us
-  // dense-shallow, batch 1024, and the same 1.28-1.33x at all 24 block_dims),
-  // because blocking's serialization cost exceeds what the interleave buys.
-  // The deep path's own fit is the same four conditions with double buffering,
-  // so kDbuf below repeats these with the slot counts doubled.
+  // two accumulators. Blocking to reach the deep path instead is a measured
+  // 1.28x regression at N=16384.
   static constexpr bool kDenseShallowFits =
       R * R * sizeof(half) + kTileBytes <= L0AB_BYTES &&
       C * C * sizeof(half) + kTileBytes <= L0AB_BYTES &&
       2 * kAccBytes <= L0C_BYTES;
   static constexpr bool kBlockIt = !kDenseShallowFits;
 
-  // Both GM legs use the NZ view, or neither -- ONE predicate, because at
-  // C > 16 the two only cancel as a pair (see the note at PTO_HAD_BLOCK). Every
-  // load and store site reads this, so they cannot drift apart; a store that
-  // forgot it would emit a permuted result, rel_rms sqrt(2). Not on the blocked
-  // path: its stores are row SUB-BLOCKS of the output, and TStoreAccNz2nz takes
-  // the destination block-column stride from the shape rather than gStride1, so
-  // it can only write a whole NZ tile.
+  // Both GM legs use the NZ view, or neither -- ONE predicate read by every
+  // load and store site, because at C > 16 the two only cancel as a pair; a
+  // store that forgot it would emit a permuted result, rel_rms sqrt(2). Never
+  // on the blocked path: its stores are row SUB-BLOCKS, and TStoreAccNz2nz
+  // takes the block-column stride from the shape, not gStride1, so it can only
+  // write a whole NZ tile.
   static constexpr bool kNzGm = (C == 16) || (S == 1 && !kBlockIt);
 
   static constexpr uint32_t kMa =
-      (!kBlockIt || PTO_HAD_BLOCK == 0 || PTO_HAD_BLOCK >= R)
+      (!kBlockIt || PTO_TS_BLOCK == 0 || PTO_TS_BLOCK >= R)
           ? R
-          : (uint32_t)PTO_HAD_BLOCK;
+          : (uint32_t)PTO_TS_BLOCK;
   static constexpr uint32_t kMb =
-      (!kBlockIt || PTO_HAD_BLOCK == 0 || PTO_HAD_BLOCK >= C)
+      (!kBlockIt || PTO_TS_BLOCK == 0 || PTO_TS_BLOCK >= C)
           ? C
-          : (uint32_t)PTO_HAD_BLOCK;
+          : (uint32_t)PTO_TS_BLOCK;
   static constexpr uint32_t kR1 = R / kMa;   // blocks of H_R
   static constexpr uint32_t kC1 = C / kMb;   // blocks of H_C
   static_assert(kR1 * kMa == R && kC1 * kMb == C, "M must divide its factor");
@@ -239,9 +165,8 @@ struct Layout {
   static constexpr bool kBlkA = (kC1 > 1);   // phase A (right multiply) blocked
   static constexpr bool kBlkB = (kR1 > 1);   // phase B (left multiply) blocked
 
-  // Only where blocking is active. Aliasing buys nothing without it (the
-  // slots, not the accumulators, are what overflow), and leaving it off keeps
-  // every unblocked size's L0C offsets -- and so its codegen -- untouched.
+  // Only where blocking is active: without it the slots, not the accumulators,
+  // are what overflow, and leaving it off keeps every unblocked size's offsets.
   static constexpr bool kAlias = (kC1 > 1 || kR1 > 1);
 
   // Operands, resident for the whole kernel: +-H_M when blocked, else H itself.
@@ -253,26 +178,16 @@ struct Layout {
   static constexpr unsigned kSliceA = S * R * kMb * sizeof(half);  // L0A, phase A
   static constexpr unsigned kSliceB = kMa * S * C * sizeof(half);  // L0B, phase B
 
-  // Block-level double buffering for the blocked SHALLOW right multiply: with
-  // two L0A slices MTE1 can stage block i+1 while M is still working on block
-  // i, which is exactly the overlap blocking otherwise gives up (blocking
-  // measured 1.49-1.53x on this path at N=8192/16384, bd 20 and 24, against a
-  // 0.995-1.000x null control). Phase A only -- phase B's slice is kMa*S*C,
-  // twice as wide here, and two of those plus the operand overflow L0B.
+  // Block-level double buffering for the blocked SHALLOW right multiply: two
+  // L0A slices let MTE1 stage block i+1 under M's block i, recovering the
+  // overlap blocking gives up. Phase A only -- phase B's slice is twice as
+  // wide, and two of those plus the operand overflow L0B.
   static constexpr uint32_t kSlotsA =
       (kBlkA && kOpABytes + 2 * kSliceA <= L0AB_BYTES) ? 2u : 1u;
 
-  // Two of every intermediate plus a 4-deep X ring. Every case in the table
-  // holds S * N <= 16384, so all of them fit except the widest, whose two
-  // accumulators already fill L0C; that one keeps the shallow path.
-  //
-  // `!kBlockIt` is the load-bearing term: a blocked size takes the SHALLOW
-  // path, always. Blocking a single stage costs 1.49-1.86x (it makes the body
-  // walk MTE1 -> M -> MTE1 -> M, so consecutive tiles stop overlapping), and no
-  // size that NEEDS blocking can reach the deep path regardless -- what
-  // overflows at N=32768 is the accumulator, which double buffering doubles.
-  // So the deep path stays dense, and with kMa == R and kMb == C its operands
-  // and slices are exactly the dense ones: H whole, and full-tile slices.
+  // Two of every intermediate plus a 4-deep X ring. `!kBlockIt` is
+  // load-bearing: a blocked size always takes the shallow path, so the deep
+  // path is dense and its operands and slices are the dense ones.
   static constexpr bool kDbuf =
       !kBlockIt &&
       R * R * sizeof(half) + 2 * kTileBytes <= L0AB_BYTES &&
@@ -283,14 +198,9 @@ struct Layout {
   static constexpr unsigned kXSlots = kDbuf ? 4 : 2;
   static constexpr unsigned kBuf = kDbuf ? 2 : 1;
 
-  // Both the deep and the shallow general bodies have blocked forms, so a
-  // blocked size no longer has to reach the deep path -- which matters, because
-  // the sizes that MUST block are exactly the ones too wide for it. The C == 16
-  // bodies are the only dense ones left, and M is clamped to the factor there,
-  // so kC1 and kR1 are 1 and this cannot fire; it is here to catch a future
-  // case-table entry that breaks that. The L0C assert below is what enforces
-  // the other half: a blocked shallow size needs kAlias to fit its two
-  // accumulators, and without it this is a compile error, not a wrong answer.
+  // The C == 16 bodies are the only dense-only ones; M is clamped to the factor
+  // there, so this cannot fire today and is here to catch a future case-table
+  // entry that breaks it. The L0C assert below enforces the other half.
   static_assert(!(kC1 > 1 || kR1 > 1) || C != 16,
                 "the C == 16 bodies are dense and would read +-H_M as H");
 
@@ -348,11 +258,9 @@ struct Layout {
   static constexpr unsigned l0cCat(bool par) {
     return (par ? kAccPair : 0) + (kAlias ? 0u : kAccBytes);
   }
-  // Output block a of the blocked phase B: rows [a*Ma, (a+1)*Ma) of the (R x
-  // S*C) result, laid out as kR1 separate contiguous (Ma x S*C) accumulators --
-  // an L0C tile is block-COLUMN-major, so a row slice of one tall tile would be
-  // strided, while kR1 short tiles are each contiguous and together occupy the
-  // same bytes.
+  // Output block a of the blocked phase B, as kR1 separate contiguous
+  // (Ma x S*C) accumulators: an L0C tile is block-COLUMN-major, so a row slice
+  // of one tall tile would be strided while kR1 short ones are not.
   static constexpr unsigned l0cCatBlock(bool par, uint32_t a) {
     return l0cCat(par) + a * kMa * S * C * sizeof(float);
   }
@@ -363,19 +271,16 @@ struct Layout {
   }
 };
 
-// GM -> L1 -> L0A/L0B for the two Hadamard factors. Done once per core; both
-// stay resident for the whole kernel.
-// S is a template parameter although no address here depends on it: the block
-// decision does (kDenseShallowFits weighs the tile size), and loading the
-// factors under a different decision from the one the tile bodies make would
-// stage dense H where they expect +-H_M.
+// GM -> L1 -> L0A/L0B for the two Hadamard factors, once per core; both stay
+// resident. S is a template parameter although no address here depends on it:
+// the blocking decision does, and loading the factors under a different
+// decision from the tile bodies' would stage dense H where they expect +-H_M.
 template <uint32_t R, uint32_t C, uint32_t S>
 AICORE void loadHadamardFactors(__gm__ half *h_left, __gm__ half *h_right) {
   using L = Layout<R, C, S>;
 
   // Each buffer is H_f followed by +H_M and -H_M (see _factor_buffer on the
-  // host). A blocked stage reads the pair at offset f*f and never touches the
-  // dense prefix; a dense stage reads the prefix and never touches the pair.
+  // host); a stage reads one or the other, never both.
   if constexpr (L::kBlkB) {
     for (uint32_t neg = 0; neg < 2; ++neg) {
       MatTile<L::kMa, L::kMa> hl_l1;
@@ -443,9 +348,6 @@ AICORE void loadHadamardFactors(__gm__ half *h_left, __gm__ half *h_right) {
   Sync<PIPE_MTE1, PIPE_M>();
 }
 
-// H_f[i,j] = (-1)^popcount(i & j) for the Sylvester matrix, so the sign of
-// block (i,j) is a parity and H_acc itself is never built or read. Returns 1
-// for -H_M and 0 for +H_M, which are also their operand slot indices.
 // One column block of the blocked shallow right multiply. Slot and flag ids
 // are template arguments because bisheng requires a literal EVENT_ID*, so the
 // caller branches on i & 1 rather than indexing.
@@ -453,6 +355,9 @@ template <uint32_t R, uint32_t C, uint32_t S, uint32_t Slot, uint32_t P,
           event_t EvRdy, event_t EvWar>
 AICORE void shallowBlockA(uint32_t i);
 
+// H_f[i,j] = (-1)^popcount(i & j) for the Sylvester matrix, so the sign of
+// block (i,j) is a parity and H_acc itself is never built or read. Returns 1
+// for -H_M and 0 for +H_M, which are also their operand slot indices.
 AICORE inline uint32_t blockSign(uint32_t i, uint32_t j) {
   uint32_t v = i & j;
   v ^= v >> 4;
@@ -474,11 +379,9 @@ AICORE void issueTileLoad(__gm__ half *x, uint32_t sample) {
   __gm__ half *x_tile = x + sample * L::kN;
 
   if constexpr (L::kNzGm) {
-    // Declaring the source Layout::NZ turns the default ND2NZ gather -- which
-    // writes L1 in C0-sized 32-BYTE pieces however wide the tile is -- into one
-    // contiguous burst over the whole tile. At C == 16 that is a pure
-    // reinterpret; above it the permutation it introduces is undone by the
-    // matching NZ store, which L::kNzGm guarantees is in use.
+    // One contiguous burst instead of the default ND2NZ gather. At C == 16 a
+    // pure reinterpret; above it the permutation is undone by the matching NZ
+    // store, which L::kNzGm guarantees is in use.
     GmNz<L::kStackRows, C> x_gm(x_tile);
     TASSIGN(x_gm, x_tile);
     TLOAD(x_l1, x_gm);
@@ -502,18 +405,9 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
   wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);  // this tile's load has landed
 
   if constexpr (C == 16) {
-    // With R == C == 16 a (S*R x 16) NZ tile and a (16 x S*R) NZ tile are the
-    // SAME BYTES: 16 columns is one block-column, so the tile is just S
-    // 16x16 fractals in sample order, and fractal s is sample s whichever way
-    // the tile is declared. The vertical stack therefore reads back as the
-    // horizontal concatenation [X_0 | X_1 | ... ] for free, and the
-    // per-sample layout flip the general path pays for disappears.
-    //
-    // So apply H_R first, on the horizontal view (one left multiply covers
-    // every sample), then H_C on the vertical view (one right multiply), and
-    // both GM transfers stay a single contiguous descriptor. The whole tile
-    // costs 7 descriptors regardless of S, which is what makes N=256 -- the
-    // size where the general path is descriptor-bound -- run at memory speed.
+    // (S*R x 16) and (16 x S*R) are the SAME BYTES, so the stack reads back
+    // as the horizontal concatenation for free. Apply H_R first on that view,
+    // then H_C on the vertical one: 7 descriptors per tile whatever S is.
     static_assert(R == 16, "the free reinterpret needs square 16x16 fractals");
     constexpr uint32_t kCat = S * R;
 
@@ -566,11 +460,9 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
     }
     set_flag(PIPE_FIX, PIPE_M, EV_ACC);
   } else if constexpr (L::kBlkA || L::kBlkB) {
-    // Blocked shallow body: the same two multiplies as below, each applied as
-    // blocks against a resident +-H_M so that neither factor is ever in L0A or
-    // L0B whole. Blocking costs 1.8x per two-way split on the deep path, so it
-    // is only ever worth paying where there is no dense form at all -- a size
-    // whose H_C alone would fill L0B. Then it is not a speedup, it is the
+    // Blocked shallow body: the same two multiplies as below, applied as blocks
+    // against a resident +-H_M so neither factor is ever in L0A or L0B whole.
+    // Only for a size with no dense form at all -- not a speedup, the
     // difference between running and not compiling.
     constexpr uint32_t kSlot = Pong ? 1u : 0u;
 
@@ -771,22 +663,16 @@ AICORE void shallowBlockA(uint32_t i) {
 
 // --- deep pipeline --------------------------------------------------------
 //
-// Both phase bodies branch on C internally. The C == 16 pair uses that case's
-// free NZ reinterpret so its turnaround is two TMOVs; the general pair pays the
-// same S TEXTRACTs plus S TSTOREs the shallow body pays. The SPLIT itself is
-// independent of either -- it is about pipe order, not about the reshape.
+// The straight-line tile above, split at the L1 turnaround. Phase A takes the
+// loaded X slot to L0B, left-multiplies by H_R and parks the result in L1;
+// phase B takes it to L0A, right-multiplies by H_C and stores. The driver
+// issues A(i+1) before B(i), so each pipe always has the next tile's work
+// queued behind the current one's.
 //
-// The straight-line tile above is split here at the L1 turnaround. Phase A
-// takes the loaded X slot to L0B, left-multiplies by H_R and parks the result
-// back in L1; phase B takes it to L0A, right-multiplies by H_C and stores. The
-// driver issues A(i+1) before B(i), so each pipe always has the next tile's
-// work queued behind the current tile's.
-//
-// Every WAR edge between tiles is covered transitively by the in-order pipes
-// plus the RAW flags below, given two slots per intermediate: with issue order
-// A0 A1 B0 A2 B1 A3 B2 ..., the reuse of a slot by A(i+2) sits behind B(i)'s
-// MTE1, which waits on A(i)'s FIX. So no extra WAR flags are needed, and the
-// shallow path's EV_ACC edge disappears entirely.
+// With two slots per intermediate and issue order A0 A1 B0 A2 B1 ..., every
+// cross-tile WAR edge is already covered transitively: A(i+2)'s reuse of a slot
+// sits behind B(i)'s MTE1, which waits on A(i)'s FIX. So no WAR flags are
+// needed here and the shallow path's EV_ACC edge disappears.
 
 // X slot -> L0B, H_R * X -> L0C, L0C -> L1 T slot. Releases the X slot and
 // leaves t_l1(Par) ready, signalled FIX->MTE1 on EvPA.
@@ -1013,13 +899,10 @@ AICORE void runTilesDeep(__gm__ half *x, __gm__ half *y, uint32_t &sample,
 
 
 // Consume [sample, end) with the largest power-of-two tile that still fits,
-// halving on the way down. A core with 43 samples left runs 32 + 8 + 2 + 1
-// rather than 43 single-sample tiles.
-//
-// Each size runs its own two-slot pipeline: the next tile's TLOAD is issued
-// before the current tile's compute, so MTE2 overlaps MTE1/M/FIX instead of
-// sitting in front of them. The slot flags are primed on entry and drained on
-// exit, so every tile size leaves the flag state balanced for the next one.
+// halving on the way down: 43 samples run 32 + 8 + 2 + 1. Each size runs its
+// own two-slot pipeline, issuing the next tile's TLOAD before the current
+// tile's compute, and primes and drains its slot flags so the next size starts
+// balanced.
 template <uint32_t R, uint32_t C, uint32_t S>
 AICORE void runTiles(__gm__ half *x, __gm__ half *y, uint32_t &sample,
                      uint32_t end) {
@@ -1067,7 +950,7 @@ AICORE void runTiles(__gm__ half *x, __gm__ half *y, uint32_t &sample,
 }
 
 template <uint32_t N, uint32_t R, uint32_t C, uint32_t S>
-AICORE void runCubeHadamard(__gm__ half *x, __gm__ half *y,
+AICORE void runTwosided(__gm__ half *x, __gm__ half *y,
                             __gm__ half *h_left, __gm__ half *h_right,
                             uint32_t batch) {
   static_assert(R * C == N, "R * C must equal N");
@@ -1076,13 +959,10 @@ AICORE void runCubeHadamard(__gm__ half *x, __gm__ half *y,
   const uint32_t num_cores = block_num;
   const uint32_t core_id = get_block_idx();
 
-  // Split by TILES, not by samples. An even split of samples leaves most cores
-  // with a count that is not a multiple of S, and each one then walks the
-  // power-of-two fallback down to single-sample tiles -- which cost the same
-  // handshakes as a full tile for a fraction of the work. Rounding the split
-  // up to whole tiles instead leaves at most one ragged core and is worth 2x
-  // at shapes where batch/cores lands just above a tile boundary, even though
-  // it can idle the last few cores.
+  // Split by TILES, not samples: an even sample split leaves most cores walking
+  // the power-of-two fallback down to single-sample tiles, which cost a full
+  // tile's handshakes for a fraction of the work. Worth 2x where batch/cores
+  // lands just above a tile boundary, at the price of idling the last cores.
   const uint32_t tiles_per_core = DIV_ROUNDUP(DIV_ROUNDUP(batch, S), num_cores);
   const uint32_t begin = tiles_per_core * S * core_id;
   if (begin >= batch) {
@@ -1103,16 +983,16 @@ AICORE void runCubeHadamard(__gm__ half *x, __gm__ half *y,
   wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
 }
 
-AICORE void dispatchCubeHadamard(__gm__ half *x, __gm__ half *y,
+AICORE void dispatchTwosided(__gm__ half *x, __gm__ half *y,
                                  __gm__ half *h_left, __gm__ half *h_right,
                                  uint32_t batch, uint32_t n) {
   switch (n) {
-#define FAST_HADAMARD_CUBE_DISPATCH(N, R, C, S)                      \
+#define FAST_HADAMARD_TWOSIDED_DISPATCH(N, R, C, S)                      \
   case N:                                                            \
-    runCubeHadamard<N, R, C, S>(x, y, h_left, h_right, batch);       \
+    runTwosided<N, R, C, S>(x, y, h_left, h_right, batch);       \
     return;
-    FAST_HADAMARD_CUBE_CASES(FAST_HADAMARD_CUBE_DISPATCH)
-#undef FAST_HADAMARD_CUBE_DISPATCH
+    FAST_HADAMARD_TWOSIDED_CASES(FAST_HADAMARD_TWOSIDED_DISPATCH)
+#undef FAST_HADAMARD_TWOSIDED_DISPATCH
     default:
       return;
   }
@@ -1122,13 +1002,13 @@ AICORE void dispatchCubeHadamard(__gm__ half *x, __gm__ half *y,
 
 #endif  // cube core
 
-__global__ AICORE void fast_hadamard_cube_fp16(__gm__ void *x, __gm__ void *y,
+__global__ AICORE void fast_hadamard_twosided_fp16(__gm__ void *x, __gm__ void *y,
                                                __gm__ void *h_left,
                                                __gm__ void *h_right,
                                                uint32_t batch, uint32_t n) {
 #if defined(__CHECK_FEATURE_AT_PRECOMPILE) || \
     (__CCE_AICORE__ == 220 && defined(__DAV_C220_CUBE__))
-  dispatchCubeHadamard((__gm__ half *)x, (__gm__ half *)y,
+  dispatchTwosided((__gm__ half *)x, (__gm__ half *)y,
                        (__gm__ half *)h_left, (__gm__ half *)h_right, batch, n);
 #endif
 }
@@ -1136,6 +1016,6 @@ __global__ AICORE void fast_hadamard_cube_fp16(__gm__ void *x, __gm__ void *y,
 extern "C" void call_kernel(uint32_t blockDim, void *stream, uint8_t *x,
                             uint8_t *y, uint8_t *h_left, uint8_t *h_right,
                             uint32_t batch, uint32_t n) {
-  fast_hadamard_cube_fp16<<<blockDim, nullptr, stream>>>(x, y, h_left, h_right,
+  fast_hadamard_twosided_fp16<<<blockDim, nullptr, stream>>>(x, y, h_left, h_right,
                                                          batch, n);
 }

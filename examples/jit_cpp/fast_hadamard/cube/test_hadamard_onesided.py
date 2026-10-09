@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from onesided.jit_util_hadamard_onesided import (
+from cube.jit_util_hadamard_onesided import (
     MAX_ONESIDED_N,
     MIN_ONESIDED_BATCH,
     MIN_ONESIDED_N,
@@ -16,7 +16,7 @@ from onesided.jit_util_hadamard_onesided import (
 # formula gives, because the blocked form prefers depth to height), and a test
 # that recomputed it would silently start probing the wrong boundaries the next
 # time that override moves.
-from onesided.jit_util_hadamard_onesided import _SAMPLES_PER_TILE
+from cube.jit_util_hadamard_onesided import _SAMPLES_PER_TILE
 
 # The one-sided product costs n*n MACs per sample however H is factored, so its
 # case table stops at 512 on compute grounds; larger belongs to cube/.
@@ -246,7 +246,7 @@ def test_more_accurate_than_two_sided(request, onesided_hadamard_kernel, npu_dev
     only has a comparison arm at N >= 256.
     """
     try:
-        cube_hadamard_kernel = request.getfixturevalue("cube_hadamard_kernel")
+        twosided_hadamard_kernel = request.getfixturevalue("twosided_hadamard_kernel")
     except Exception as exc:  # pragma: no cover - depends on the environment
         pytest.skip(f"two-sided kernel unavailable: {exc}")
 
@@ -259,14 +259,14 @@ def test_more_accurate_than_two_sided(request, onesided_hadamard_kernel, npu_dev
         run_onesided_hadamard(onesided_hadamard_kernel, x).cpu().double(), exact
     )
 
-    cube_y = torch.empty_like(x)
-    cube_hadamard_kernel(x, cube_y)
+    twosided_y = torch.empty_like(x)
+    twosided_hadamard_kernel(x, twosided_y)
     torch.npu.synchronize()
-    cube_rel_rms, _ = relative_errors(cube_y.cpu().double(), exact)
+    twosided_rel_rms, _ = relative_errors(twosided_y.cpu().double(), exact)
 
-    assert onesided_rel_rms <= cube_rel_rms * ACCURACY_SLACK, (
+    assert onesided_rel_rms <= twosided_rel_rms * ACCURACY_SLACK, (
         f"one-sided relative RMS {onesided_rel_rms:.3e} is worse than the "
-        f"two-sided kernel's {cube_rel_rms:.3e} for N={n}"
+        f"two-sided kernel's {twosided_rel_rms:.3e} for N={n}"
     )
 
 
@@ -462,7 +462,7 @@ def test_first_call_for_a_size_is_ordered_after_h_is_built(
     Clearing the cache is what makes this a regression test rather than a
     repeat of the correctness sweep: without it every n is already warm.
     """
-    from onesided import jit_util_hadamard_onesided as ju
+    from cube import jit_util_hadamard_onesided as ju
 
     for n in TEST_HIDDEN_DIMS:
         ju._H_CACHE.clear()

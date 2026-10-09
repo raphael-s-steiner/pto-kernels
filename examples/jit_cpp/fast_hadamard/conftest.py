@@ -4,9 +4,9 @@ import pytest
 import torch
 
 from auto.jit_util_hadamard_auto import jit_compile as jit_compile_auto
-from cube.jit_util_hadamard_cube import jit_compile as jit_compile_cube
+from cube.jit_util_hadamard_twosided import jit_compile as jit_compile_twosided
 from jit_util_common import normalize_npu_device
-from onesided.jit_util_hadamard_onesided import jit_compile as jit_compile_onesided
+from cube.jit_util_hadamard_onesided import jit_compile as jit_compile_onesided
 from standard.jit_util_hadamard import jit_compile
 
 
@@ -38,16 +38,16 @@ def hadamard_kernel(npu_device):
 
 
 @pytest.fixture(scope="session")
-def cube_hadamard_kernel(npu_device):
+def twosided_hadamard_kernel(npu_device):
     base = Path(__file__).resolve().parent
-    src = base / "cube" / "fast_hadamard_cube.cpp"
-    return jit_compile_cube(str(src), verbose=True, device=npu_device)
+    src = base / "cube" / "fast_hadamard_twosided.cpp"
+    return jit_compile_twosided(str(src), verbose=True, device=npu_device)
 
 
 @pytest.fixture(scope="session")
 def onesided_hadamard_kernel(npu_device):
     base = Path(__file__).resolve().parent
-    src = base / "onesided" / "fast_hadamard_onesided.cpp"
+    src = base / "cube" / "fast_hadamard_onesided.cpp"
     return jit_compile_onesided(str(src), verbose=True, device=npu_device)
 
 

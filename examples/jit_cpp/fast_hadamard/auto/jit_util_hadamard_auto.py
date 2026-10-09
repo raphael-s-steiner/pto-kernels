@@ -3,13 +3,15 @@
 Three implementations exist in this example, and which one wins is decided
 almost entirely by N:
 
-  - `onesided/`  Y = X * H_N as a single right multiplication, H_N = H_B (x) H_M
-                 applied as fixed-size matmuls accumulated in L0C. Costs N*N
-                 MACs per sample but touches each pipe once per tile.
-  - `cube/`      Y = H_R * X * H_C, the balanced Kronecker split. Costs only
-                 N*(R+C) MACs per sample but needs a turnaround between the two
-                 multiplies.
-  - `standard/`  the vector-unit butterfly, log2(N) stages in UB.
+  - `cube/fast_hadamard_onesided.cpp`  Y = X * H_N as a single right
+        multiplication, H_N = H_B (x) H_M applied as fixed-size matmuls
+        accumulated in L0C. Costs N*N MACs per sample but touches each pipe
+        once per tile.
+  - `cube/fast_hadamard_twosided.cpp`  Y = H_R * X * H_C, the balanced
+        Kronecker split. Costs only N*(R+C) MACs per sample but needs a
+        turnaround between the two multiplies.
+  - `standard/fast_hadamard.cpp`  the vector-unit butterfly, log2(N) stages
+        in UB.
 
 The one-sided product's MAC count grows 4x per doubling of N against 2x for its
 bytes, so it wins while N is small and loses once arithmetic dominates; the
@@ -30,40 +32,25 @@ one-sided kernel and N=32768 only by the two-sided one.
 """
 from pathlib import Path
 
-from cube.jit_util_hadamard_cube import (
-    MAX_CUBE_HADAMARD_N,
-    MIN_CUBE_HADAMARD_N,
-    jit_compile as jit_compile_cube,
+from cube.jit_util_hadamard_twosided import (
+    MAX_TWOSIDED_N,
+    MIN_TWOSIDED_N,
+    jit_compile as jit_compile_twosided,
 )
 from jit_util_common import DEFAULT_DEVICE, normalize_npu_device
-from onesided.jit_util_hadamard_onesided import (
+from cube.jit_util_hadamard_onesided import (
     MAX_ONESIDED_N,
     MIN_ONESIDED_N,
     jit_compile as jit_compile_onesided,
 )
 
 MIN_AUTO_N = MIN_ONESIDED_N          # 64
-MAX_AUTO_N = MAX_CUBE_HADAMARD_N     # 32768
+MAX_AUTO_N = MAX_TWOSIDED_N     # 32768
 
-# The crossover, measured rather than reasoned. Device time in us (msprof,
-# 910B2, pool of one buffer so all kernels see the same footprint, each kernel
-# at its own best block_dim; the one-sided host pads batch < 16 up to 16, so its
-# batch-1 cost IS its batch-16 cost):
-#
-#     N  batch   vector  onesided  twosided
-#   256      16    3.160     1.700     2.121
-#   256    1024    4.100     2.880     6.160
-#   512      16    3.100     2.180     2.420
-#   512    1024    5.460     4.321     8.760
-#  1024      16    3.280        --     1.980
-#  1024    1024    8.480        --     4.680
-#
-# Those two-sided numbers at N=512 are the CLASSIC path and are now stale: the
-# bit-plan tile made that size 1.73-2.47x faster, which is what turned N=512
-# from a clear one-sided win into the batch-dependent crossover handled by
-# BITPLAN_BATCH_MIN below. At N=1024 and above the split still wins everywhere,
-# and below N=512 the one-sided kernel still does, by enough that neither needs
-# a batch term.
+# The crossover, measured rather than reasoned (msprof device time, each kernel
+# at its own best block_dim). At N=1024 and above the split wins everywhere, and
+# below N=512 the one-sided kernel does, by enough that neither needs a batch
+# term; N=512 is the one size where batch moves the choice. See the README.
 ONESIDED_MAX_N = MAX_ONESIDED_N      # 512
 
 # N=512 is the one size where batch moves the choice, because the two-sided
@@ -98,7 +85,7 @@ def supported_auto_sizes() -> list[int]:
 
 
 def pick_implementation(n: int, batch: int | None = None) -> str:
-    """'onesided' or 'cube' -- the faster kernel at this N (and batch).
+    """'onesided' or 'twosided' -- the faster kernel at this N (and batch).
 
     N decides everywhere except N=512, where the two-sided kernel's bit-plan
     tile moved the crossover into the middle of the batch range; see
@@ -116,9 +103,9 @@ def pick_implementation(n: int, batch: int | None = None) -> str:
     if n & (n - 1):
         raise ValueError(f"n must be a power of two; got {n}.")
     if n > ONESIDED_MAX_N:
-        return "cube"
+        return "twosided"
     if n == ONESIDED_MAX_N and batch is not None and int(batch) >= BITPLAN_BATCH_MIN:
-        return "cube"
+        return "twosided"
     return "onesided"
 
 
@@ -140,9 +127,9 @@ def jit_compile(
     builders = {
         "onesided": (
             jit_compile_onesided,
-            base / "onesided" / "fast_hadamard_onesided.cpp",
+            base / "cube" / "fast_hadamard_onesided.cpp",
         ),
-        "cube": (jit_compile_cube, base / "cube" / "fast_hadamard_cube.cpp"),
+        "twosided": (jit_compile_twosided, base / "cube" / "fast_hadamard_twosided.cpp"),
     }
     compiled: dict = {}
 
@@ -191,7 +178,7 @@ __all__ = [
     "MAX_AUTO_N",
     "ONESIDED_MAX_N",
     "BITPLAN_BATCH_MIN",
-    "MIN_CUBE_HADAMARD_N",
+    "MIN_TWOSIDED_N",
     "jit_compile",
     "pick_implementation",
     "supported_auto_sizes",

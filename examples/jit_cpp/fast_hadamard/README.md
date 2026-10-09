@@ -2,11 +2,17 @@
 
 ### Layout
 
-- `standard/`: plain Hadamard kernel, benchmark, plot, and test files
-- `cube/`: cube-unit (matmul) Hadamard kernel, benchmark, plot, and test files
-- `onesided/`: cube-unit Hadamard as a single right-multiplication `Y = X * H_N`,
-  with `H_N = H_B (x) H_M` applied as fixed-size matmuls accumulated in L0C, for
-  `N` in 64..512 -- benchmark, plot, and test files
+- `standard/`: the vector-unit butterfly -- kernel, host wrapper, benchmark,
+  plot, and test files
+- `cube/`: both cube-unit (matmul) kernels, each with the same five files:
+  - `fast_hadamard_twosided.cpp`: `Y = H_R * X * H_C`, the balanced Kronecker
+    split, for `N` in 256..32768
+  - `fast_hadamard_onesided.cpp`: `Y = X * H_N` as a single right
+    multiplication, with `H_N = H_B (x) H_M` applied as fixed-size matmuls
+    accumulated in L0C, for `N` in 64..512
+  - plus `devtime_bench.py` / `devtime_run.py`, the msprof device-time harness
+    both kernels are measured with (the event-timed benchmarks cannot see them;
+    see "Measured device time")
 - `auto/`: **the entry point to use.** One `fn(x, y)` that branches on `N` to
   whichever of the above is fastest, covering `N` in 64..32768
 - `fuse_int8_quant/`: int8 quantize and fused Hadamard+int8 quant files
@@ -30,10 +36,10 @@ python test.py --list
 
 # benchmark and write CSV files
 python benchmark.py --target standard --npu 0
-# cube-unit Hadamard, also timed against the standard vector kernel
-python benchmark.py --target cube --npu 0
+# two-sided (Kronecker split) Hadamard, also timed against the vector kernel
+python benchmark.py --target twosided --npu 0
 # one-sided (blocked right-multiply) Hadamard over N in {64, 128, 256, 512}, timed
-# against the vector kernel and, where N >= 256, the two-sided cube kernel
+# against the vector kernel and, where N >= 256, the two-sided kernel
 python benchmark.py --target onesided --npu 0
 python benchmark.py --target quantize_int8 --npu 0
 python benchmark.py --target quantize_int4 --npu 0
@@ -49,8 +55,8 @@ python benchmark.py --target all --npu 0
 
 # generate plots from CSV files
 python plot.py --target standard
-# cube-vs-vector duration, bandwidth, and speedup plots
-python plot.py --target cube
+# two-sided-vs-vector duration, bandwidth, and speedup plots
+python plot.py --target twosided
 # one-sided-vs-vector plots, plus one-sided-vs-two-sided for the N it shares
 python plot.py --target onesided
 python plot.py --target quantize_int8
@@ -66,7 +72,7 @@ python plot.py --target all
 
 # correctness tests
 python test.py --target standard -v --npu "npu:0"
-python test.py --target cube -v --npu "npu:0"
+python test.py --target twosided -v --npu "npu:0"
 python test.py --target onesided -v --npu "npu:0"
 python test.py --target auto -v --npu "npu:0"
 python test.py --target quantize_int8 -v --npu "npu:0"
@@ -83,8 +89,8 @@ Benchmark scripts save CSV files into the subdirectories that own the real
 implementations:
 
 - `standard/outputs/csv/fht_pto_bd*.csv` from `benchmark.py --target standard`
-- `cube/outputs/csv/fht_cube_compare_bd*.csv` from `benchmark.py --target cube`
-- `onesided/outputs/csv/fht_onesided_compare_bd*.csv` from `benchmark.py --target onesided`
+- `cube/outputs/csv/fht_twosided_compare_bd*.csv` from `benchmark.py --target twosided`
+- `cube/outputs/csv/fht_onesided_compare_bd*.csv` from `benchmark.py --target onesided`
 - `fuse_int8_quant/outputs/csv/quantize_compare_bd*.csv` from `benchmark.py --target quantize_int8`
 - `fuse_int8_quant/outputs/csv/fht_quant_compare_bd*.csv` from `benchmark.py --target hadamard_quant_int8`
 - `fuse_int4_quant/outputs/csv/quantize_compare_bd*.csv` from `benchmark.py --target quantize_int4`
@@ -113,23 +119,23 @@ In the int4 targets, outputs use packed-byte storage with shape `[batch, N // 2]
 The unfused int4 reference path is `hadamard_torch_stagewise(...)` followed by a
 torch packed-int4 reference, also reported as `torch_unfused_*` in the fused CSV.
 
-In `benchmark.py --target cube`, the cube kernel applies the balanced
+In `benchmark.py --target twosided`, the kernel applies the balanced
 Kronecker split `H_n = H_R (x) H_C` as `Y = H_R * X * H_C`, i.e. two matmuls
 on the cube unit per tile of samples instead of `log2(N)` vector butterfly
 stages. It is out-of-place (`fn(x, y)`) and supports `N` in `[256, 32768]`,
 so its hidden-dimension grid starts at 256 instead of 128. The same shapes
 are also timed with the `standard/` vector kernel, reported as `vector_*` in
-the CSV and plots alongside the `cube_speedup_vs_vector` column.
+the CSV and plots alongside the `twosided_speedup_vs_vector` column.
 
-The cube arm launches with the wrapper's per-shape `block_dim` schedule, so the
-`bd` in the CSV filename is the cap (`cube_core_num`) and the `cube_block_dim`
-column records what each shape actually ran at.
+The two-sided arm launches with the wrapper's per-shape `block_dim` schedule, so
+the `bd` in the CSV filename is the cap (`cube_core_num`) and the
+`twosided_block_dim` column records what each shape actually ran at.
 
 Both arms resolve the stream per call: `torch.npu.current_stream()` drains the
 torch_npu async task queue, which is what orders a raw ctypes launch after the
 torch ops that fill its inputs. That drain costs ~27 us per call, more than the
 device time of every shape in the grid, so these CSV durations are launch-bound
-for both kernels and the `cube_speedup_vs_vector` column mostly compares
+for both kernels and the `twosided_speedup_vs_vector` column mostly compares
 wrapper overhead. Hoisting the stream pointer out of the loop does not fix
 this -- it drops the drain, and the kernel can then run ahead of the torch ops
 setting up its inputs and of the events meant to bracket it.
@@ -139,8 +145,10 @@ under `msprof` and reads the per-launch duration off the device task record:
 
 ```bash
 cat > /tmp/cfg.json <<'EOF'
-[{"tag":"cube","kind":"cube","batch":8192,"n":4096,"bd":24,"reps":10,"warmup":3},
- {"tag":"std", "kind":"std", "batch":8192,"n":4096,"bd":24,"reps":10,"warmup":3}]
+[{"tag":"ts", "kind":"twosided","batch":8192,"n":4096,"bd":24,"reps":10,"warmup":3},
+ {"tag":"os", "kind":"onesided","batch":8192,"n":512, "bd":24,"reps":10,"warmup":3},
+ {"tag":"bp", "kind":"bitplan", "batch":8192,"n":512, "bd":24,"reps":10,"warmup":3},
+ {"tag":"std","kind":"std",     "batch":8192,"n":4096,"bd":24,"reps":10,"warmup":3}]
 EOF
 python cube/devtime_bench.py /tmp/cfg.json
 ```
@@ -152,8 +160,8 @@ the kernel from `N`:
 
 | `N` | kernel | why |
 |---|---|---|
-| 64 .. 512 | `onesided/` | `N*N` MACs per sample, but one pipe pass per tile |
-| 1024 .. 32768 | `cube/` | `N*(R+C)` MACs, at the cost of a turnaround |
+| 64 .. 512 | one-sided | `N*N` MACs per sample, but one pipe pass per tile |
+| 1024 .. 32768 | two-sided | `N*(R+C)` MACs, at the cost of a turnaround |
 
 The one-sided product's MACs grow 4x per doubling of `N` against 2x for its
 bytes, so it wins while `N` is small and loses once arithmetic dominates; the
@@ -207,7 +215,7 @@ it falls through to the generic body and quietly computes the wrong transform --
 `log2_n` is passed in, never derived, and the specialised dispatch treats a
 mismatch as a reason to fall through rather than to fail.
 
-`cube/` and `onesided/` validated in their wrappers already. The vector
+both cube kernels validated in their wrappers already. The vector
 kernel's checks used to sit in `standard/test_hadamard.py`, where nothing in the
 shipped path called them; they now live in `standard/jit_util_hadamard.py`
 beside `MAX_HADAMARD_N`, are applied by the wrapper on every call, and
@@ -279,7 +287,7 @@ balanced split makes both Hadamard factors 16x16, so a tile is only 32 samples
 and a given batch yields the fewest tiles of any size -- which turned out to be
 exactly the problem. See **Why N=256 is the weak case** below. The alternative
 for small `N` is the one-sided `Y = X * H_N` product, which trades 8x the FLOPs
-for a tile body that touches each pipe once; that lives in `onesided/` rather
+for a tile body that touches each pipe once; that lives in the one-sided kernel rather
 than here, because it is no longer the two-sided split this kernel is about, and
 it is 1.25x - 2.44x faster than this kernel at every `N <= 512`.
 
@@ -511,7 +519,7 @@ hardware. **This needs no new kernel code**: view `(64 x 128)` with `S == 1` is
 byte for byte the configuration the kernel already runs at N=8192, so the
 bit-plan is the existing, already-validated body driven with `T`-element rows
 and these operands substituted for `H_64` / `H_128`. It lives in
-`bitplan_operands` in `cube/jit_util_hadamard_cube.py`; a batch that does not
+`bitplan_operands` in `cube/jit_util_hadamard_twosided.py`; a batch that does not
 fill whole tiles sends its remainder to the classic path in a second launch.
 
 **What it buys, and why only at N=512.** The tile drops from `2S+5` descriptors
@@ -688,7 +696,7 @@ untouched -- cost a reproducible 0.92x at N=1024 batch 65536. The two drivers
 now keep separate id names over a shared pool so the shallow path's flags are
 exactly what they were. Measure renumbering as its own change.
 
-#### Blocking each stage internally (`PTO_HAD_BLOCK`): costs 1.5x, buys N=32768
+#### Blocking each stage internally (`PTO_TS_BLOCK`): costs 1.5x, buys N=32768
 
 The two-sided kernel is two one-sided products, and each of those can be split
 again: `H_C = H_{C,acc} (x) H_{C,mat}`, applied as `kC1` column blocks of the
@@ -742,8 +750,8 @@ form of it -- blocking is not a speedup there, it is the difference between
 running and not compiling. With `M=64` the operands are 16 KB, and with the two
 accumulators aliased (they are live in disjoint phases) L0C lands at exactly
 128 KB. 288 validation cases pass at `rel_rms` 2.94e-04, the same fp16 floor as
-every other size, and `cube/race_probe.py` reports 0 bad in 40 repeats at three
-shapes. At batch 1024 `block_dim` 24 it runs **133.1 us, 1009 GB/s**.
+every other size, and a repeat-until-failure probe reported 0 bad in 40 repeats
+at three shapes. At batch 1024 `block_dim` 24 it runs **133.1 us, 1009 GB/s**.
 
 Two things were worth tuning on it. **Block-level double buffering of the right
 multiply** gives MTE1 a second L0A slice so it can stage block `i+1` while the
@@ -777,8 +785,8 @@ Three things made it findable, and all three generalise:
 - **The error magnitude named the stage.** Dropping one of `k` accumulation
   terms in an orthogonal transform leaves relative RMS `sqrt(1/k)`. Every
   failure read 0.7071, i.e. exactly one of two terms missing -- which says a
-  store ran ahead of a matmul, not that data was corrupt. `cube/race_probe.py`
-  exists for this and prints the value.
+  store ran ahead of a matmul, not that data was corrupt. Report `rel_rms`
+  rather than a pass/fail, and the stage names itself.
 - **The reproducer had no shared buffers.** It failed on a core with two tiles,
   whose parities use disjoint slots, so nothing cross-tile could be at fault and
   the search collapsed to one tile's own flags.
@@ -797,21 +805,21 @@ per id, which is why they always validated.
 Every measurement in this file was taken with a compile-time switch holding the
 two arms apart. Once an arm had shipped, keeping the other one cost clarity and
 bought nothing, so the switches are gone and only the two genuine tuning
-constants remain -- `PTO_HAD_BLOCK` / `PTO_OS_BLOCK` (the M of the blocked
+constants remain -- `PTO_TS_BLOCK` / `PTO_OS_BLOCK` (the M of the blocked
 accumulation) and the per-N samples-per-tile overrides. Removed:
 
 | removed | was | why it is gone |
 |---|---|---|
-| `PTO_HAD_NZLOAD`, `PTO_HAD_NZSTORE`, `PTO_HAD_NZGM` | three switches over the NZ GM legs | folded into one `Layout::kNzGm`; the legs must agree, so one predicate is also safer than three |
-| `PTO_HAD_DBUF`, `PTO_HAD_DBUF_GEN` | the two-phase tile body, and its extension past `C == 16` | both always on; `kDbuf` is now decided by capacity alone |
-| `PTO_HAD_BLOCK_ALWAYS` | force blocking where it is not needed | blocking costs 1.5-1.9x; only ever on for the A/B |
-| `PTO_HAD_ACCALIAS` | accumulator aliasing | the off arm does not compile at N=32768, so it was never a choice |
-| `PTO_HAD_NOMM`, `PTO_HAD_STOP`, `PTO_HAD_NZUNSAFE`, `PTO_OS_NOMM` | movement-floor and truncation probes | **all compute wrong answers**; not something to ship a switch for |
-| `PTO_HAD_FORCE_S1` | one sample per tile | a probe for the tile-size sweep, now recorded above |
+| `PTO_TS_NZLOAD`, `PTO_TS_NZSTORE`, `PTO_TS_NZGM` | three switches over the NZ GM legs | folded into one `Layout::kNzGm`; the legs must agree, so one predicate is also safer than three |
+| `PTO_TS_DBUF`, `PTO_TS_DBUF_GEN` | the two-phase tile body, and its extension past `C == 16` | both always on; `kDbuf` is now decided by capacity alone |
+| `PTO_TS_BLOCK_ALWAYS` | force blocking where it is not needed | blocking costs 1.5-1.9x; only ever on for the A/B |
+| `PTO_TS_ACCALIAS` | accumulator aliasing | the off arm does not compile at N=32768, so it was never a choice |
+| `PTO_TS_NOMM`, `PTO_TS_STOP`, `PTO_TS_NZUNSAFE`, `PTO_OS_NOMM` | movement-floor and truncation probes | **all compute wrong answers**; not something to ship a switch for |
+| `PTO_TS_FORCE_S1` | one sample per tile | a probe for the tile-size sweep, now recorded above |
 | `PTO_OS_BLOCKED` | blocked accumulation on/off | always on; the dense form it falls back to was 0.6-0.8x of the vector kernel |
 | `PTO_OS_BIG`, `PTO_OS_S1024`, `PTO_OS_S2048` | one-sided N=1024/2048 | correct but 1.7-4.8x slower than the two-sided kernel |
 | `PTO_OS_TILE_SPLIT` | split per-core work by samples instead of tiles | the sample split walks the halving chain on most cores |
-| `PTO_HAD_BITPLAN` (host) | bit-plan on/off | always on; it is 2.19-2.42x at the one size it applies to |
+| `PTO_TS_BITPLAN` (host) | bit-plan on/off | always on; it is 2.19-2.42x at the one size it applies to |
 
 Two whole code paths went with them, both **provably** dead rather than merely
 slow, and the proof is that deleting each one left a **byte-identical `.so`**:
@@ -822,16 +830,25 @@ slow, and the proof is that deleting each one left a **byte-identical `.so`**:
   N in the table is either resident (N <= 128) or blocked (N = 256, 512) -- the
   chunked form needs `!kResident && !kBlocked`, i.e. `N > 128` and `N <= 64`.
 
+With only two bodies left, the one-sided `Layout`'s chunk abstraction
+(`kKc`, `kChunks`, `kHInL0B`, the `kL1HChunk` / `kL0bChunk` pair) collapsed into
+a resident/blocked branch and a single `kHPair` -- also byte-identical.
+
 Byte-identical codegen is a stronger no-regression result than any timing, and
 it is the only evidence worth having for a change that is meant to be neutral.
 The A/B arms themselves are in git history.
 
-### The one-sided kernel (`onesided/`, N = 64..512)
+The same pass moved the kernels' measurement narrative out of their comments and
+into this file: both `.cpp` files now state the constraint each constant encodes
+and nothing else, and the numbers behind them live here. That too was checked by
+compiling before and after from one identical path and diffing the `.so`.
 
-`cube/` applies the balanced Kronecker split and pays two matmuls of about
-sqrt(N) on a side. `onesided/` instead applies `H_N` from the right only, which
-costs `N*N` MACs per sample -- sqrt(N)/2 times as many, 8x at N=256 -- and buys a
-tile body that touches each pipe exactly ONCE:
+### The one-sided kernel (`cube/fast_hadamard_onesided.cpp`, N = 64..512)
+
+`fast_hadamard_twosided.cpp` applies the balanced Kronecker split and pays two
+matmuls of about sqrt(N) on a side. The one-sided kernel instead applies `H_N`
+from the right only, which costs `N*N` MACs per sample -- sqrt(N)/2 times as
+many, 8x at N=256 -- and buys a tile body that touches each pipe exactly ONCE:
 
 ```
 GM --MTE2--> L1 --MTE1--> L0A --M--> L0C --FIX--> GM
@@ -949,8 +966,8 @@ So the guidance is now simple, which it was not before:
 
 | N | use |
 |---:|---|
-| 64 .. 512 | `onesided/` |
-| >= 1024 | `cube/` (two-sided) |
+| 64 .. 512 | one-sided |
+| >= 1024 | two-sided |
 
 #### Two tuning decisions that inverted, and are worth the warning
 
@@ -1020,7 +1037,7 @@ a cache-clearing regression test -- the correctness sweep cannot catch it,
 because by then every `n` is warm.
 
 The two tuning constants are documented at the top of the kernel;
-`onesided/build_variant.sh` builds one combination and
-`onesided/validate_variant.py` checks a prebuilt variant against the exact fp64
+`cube/devtime_bench.py` builds one combination and
+`cube/test_hadamard_onesided.py` checks a prebuilt variant against the exact fp64
 reference over 168 cases. Validate before timing: a variant that computes the
 wrong answer is a broken lever, not a slow technique.

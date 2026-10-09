@@ -14,14 +14,14 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 import torch_npu  # noqa: F401
 
-from cube.jit_util_hadamard_cube import (bitplan_operands,
+from cube.jit_util_hadamard_twosided import (bitplan_operands,
                                             hadamard_factors)
-from onesided.jit_util_hadamard_onesided import hadamard_full
+from cube.jit_util_hadamard_onesided import hadamard_full
 from jit_util_common import get_current_stream_ptr, load_cdll, load_required_symbol
 
 BASE = pathlib.Path(__file__).resolve().parents[1]
 
-CUBE_ARGS = [
+TWOSIDED_ARGS = [
     ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
 ]
@@ -33,6 +33,14 @@ ONESIDED_ARGS = [
     ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
     ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
 ]
+
+# One .so per kind, so a config only needs `so` to point at a variant build.
+DEFAULT_SO = {
+    "twosided": "cube/outputs/so/fast_hadamard_twosided_jit.so",
+    "bitplan": "cube/outputs/so/fast_hadamard_twosided_jit.so",
+    "onesided": "cube/outputs/so/fast_hadamard_onesided_jit.so",
+    "std": "standard/outputs/so/fast_hadamard_jit.so",
+}
 
 _LIBS: dict = {}
 
@@ -52,8 +60,8 @@ def main():
         batch, n = int(cfg["batch"]), int(cfg["n"])
         reps, warmup = int(cfg.get("reps", 30)), int(cfg.get("warmup", 5))
         block_dim = int(cfg.get("bd", 24))
-        kind = cfg.get("kind", "cube")
-        so = str(BASE / cfg.get("so", "cube/outputs/so/fast_hadamard_cube_jit.so"))
+        kind = cfg.get("kind", "twosided")
+        so = str(BASE / cfg.get("so", DEFAULT_SO.get(kind, DEFAULT_SO["std"])))
 
         # The vector kernel is IN PLACE, so relaunching it on one buffer makes
         # the values diverge (H*H = n*I, so magnitude grows by n every two
@@ -78,8 +86,8 @@ def main():
             args = (block_dim, stream_ptr,
                     ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(y.data_ptr()),
                     ctypes.c_void_p(h.data_ptr()), batch, n)
-        elif kind == "cube":
-            fn = kernel_for(so, CUBE_ARGS)
+        elif kind == "twosided":
+            fn = kernel_for(so, TWOSIDED_ARGS)
             h_left, h_right = hadamard_factors(n, x.device, cfg.get("block"))
             args = (block_dim, stream_ptr,
                     ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(y.data_ptr()),
@@ -90,7 +98,7 @@ def main():
             # are driven as batch/samples_per_tile rows of T = A*B elements,
             # against the tensor-product operands. Same .so and same entry
             # point as `cube` -- only the operands and the declared shape move.
-            fn = kernel_for(so, CUBE_ARGS)
+            fn = kernel_for(so, TWOSIDED_ARGS)
             op_a, op_b, spt = bitplan_operands(n, x.device)
             tiles, tile_n = batch // spt, spt * n
             assert tiles, f"batch {batch} is below one bit-plan tile ({spt})"
@@ -99,7 +107,6 @@ def main():
                     ctypes.c_void_p(op_a.data_ptr()),
                     ctypes.c_void_p(op_b.data_ptr()), tiles, tile_n)
         else:
-            so = str(BASE / "standard" / "outputs" / "so" / "fast_hadamard_jit.so")
             fn = kernel_for(so, STD_ARGS)
             args = (block_dim, stream_ptr, ctypes.c_void_p(x.data_ptr()),
                     batch, n, int(math.log2(n)))

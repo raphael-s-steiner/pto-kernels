@@ -1,6 +1,6 @@
 """Device-time benchmark: run configs under msprof, report per-launch device us.
 
-The event-timed harness in bench_hadamard_cube.py cannot see this kernel: a
+The event-timed harness in bench_hadamard_twosided.py cannot see this kernel: a
 launch costs ~46-59 us on the host (most of it torch_npu's task-queue drain)
 while the kernel itself is 3-95 us on device, so the reported duration is flat
 across a 64x range of work. msprof reads the duration off the device task
@@ -10,8 +10,11 @@ Usage (cwd = this example's root, needs msprof on PATH):
     python3 cube/devtime_bench.py <configs.json> [out.json]
 
 where configs.json is a list of
-    {"tag": "...", "kind": "cube"|"std", "so": "<path>", "batch": N,
-     "n": N, "bd": 24, "reps": 30, "warmup": 5}
+    {"tag": "...", "kind": "twosided"|"onesided"|"bitplan"|"std",
+     "batch": N, "n": N, "bd": 24, "reps": 30, "warmup": 5}
+
+`kind` picks the .so each config launches; add "so": "<path>" to point one at a
+variant build instead.
 
 Each config runs `warmup` + `reps` launches back to back. The AI_CORE tasks in
 msprof's op_summary come out in launch order, so the blocks are chunked in the
@@ -29,7 +32,7 @@ import sys
 BASE = pathlib.Path(__file__).resolve().parent
 PROF_DIR = BASE / "outputs" / "prof"
 
-KERNEL_MARKERS = ("fast_hadamard_cube", "fast_hadamard_onesided",
+KERNEL_MARKERS = ("fast_hadamard_twosided", "fast_hadamard_onesided",
                   "fast_hadamard_fp16")
 
 
@@ -99,7 +102,7 @@ def main():
     print(f"{'tag':<{width}} {'kind':<6} {'batch':>7} {'n':>6} {'bd':>3} "
           f"{'median_us':>10} {'min_us':>9} {'max_us':>9} {'GB/s':>8}")
     for r in results:
-        print(f"{str(r.get('tag', '')):<{width}} {r.get('kind', 'cube'):<6} "
+        print(f"{str(r.get('tag', '')):<{width}} {r.get('kind', 'twosided'):<6} "
               f"{r['batch']:>7} {r['n']:>6} {r.get('bd', 24):>3} "
               f"{r['median_us']:>10.3f} {r['min_us']:>9.3f} {r['max_us']:>9.3f} {r['gbs']:>8.1f}")
 
