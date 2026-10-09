@@ -198,14 +198,26 @@ using namespace pto;
 #define PTO_HAD_STOP 0
 #endif
 
-#define FAST_HADAMARD_CUBE_CASES(X) \
-  X(256, 16, 16, PTO_HAD_S256)      \
-  X(512, 16, 32, 16)                \
-  X(1024, 32, 32, 8)                \
-  X(2048, 32, 64, 4)                \
-  X(4096, 64, 64, 2)                \
-  X(8192, 64, 128, 1)               \
-  X(16384, 128, 128, 1)             \
+// DIAGNOSTIC. Forces one sample per tile at every size. With S == 1 there are
+// no sample bits in the byte index, so kNzGm turns both GM legs conversion-free
+// and the operands are just the balanced Hadamard split -- i.e. this IS the
+// bit-plan configuration for a tile of T == N, at NO MAC cost. The only thing
+// it trades is tile size, so it exists to price that trade (the T column of the
+// bit-plan grid in the README). Answers stay CORRECT here, unlike
+// PTO_HAD_NZUNSAFE; only the tile geometry moves.
+#ifndef PTO_HAD_FORCE_S1
+#define PTO_HAD_FORCE_S1 0
+#endif
+#define PTO_HAD_S(s) ((PTO_HAD_FORCE_S1 != 0) ? 1 : (s))
+
+#define FAST_HADAMARD_CUBE_CASES(X)      \
+  X(256, 16, 16, PTO_HAD_S(PTO_HAD_S256)) \
+  X(512, 16, 32, PTO_HAD_S(16))           \
+  X(1024, 32, 32, PTO_HAD_S(8))           \
+  X(2048, 32, 64, PTO_HAD_S(4))           \
+  X(4096, 64, 64, PTO_HAD_S(2))           \
+  X(8192, 64, 128, 1)                     \
+  X(16384, 128, 128, 1)                   \
   X(32768, 128, 256, 1)
 
 #if defined(__CHECK_FEATURE_AT_PRECOMPILE) || \

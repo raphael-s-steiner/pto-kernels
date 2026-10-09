@@ -60,6 +60,17 @@ using namespace pto;
 // measured there the two-sided kernel is 1.7x faster at 1024 and 4.8x at 2048,
 // so they stay off. 512 is now a compute crossover, not a capacity limit.
 //
+// THAT IS ONLY TRUE AT THE TOP OF THE RANGE. Measured per size with
+// PTO_OS_NOMM (device time, batch 1024 / 4096, each at its own best block_dim),
+// the matmuls are:
+//
+//     N=64   9.0% / 9.3%      N=256  22.7% / 23.2%
+//     N=128 12.2% / 17.1%     N=512  29.1% / 48.8%
+//
+// so this kernel is 51-91% MOVEMENT, and only at N=512 with a large batch is
+// arithmetic even half of it. That matters because its GM legs cannot be made
+// conversion-free (see issueTileLoad), so the movement it is spending most of
+// its time on is movement it cannot reduce the way cube/ can.
 // H is symmetric, so there is no transpose to worry about: Y = X * H with H as
 // the right operand gives the natural (Sylvester) ordered transform, and the
 // host builds H once.
@@ -441,22 +452,33 @@ AICORE void issueTileLoad(__gm__ half *x, uint32_t sample) {
   __gm__ half *x_tile = x + sample * N;
 
   // The descriptor row here is N * sizeof(half) bytes, 128 at the smallest N in
-  // the table. That is narrow, and there are two ways an NZ view could fix it:
-  // as a pure byte reinterpret, which needs the tile to be exactly one
-  // block-column wide, or through the bit-permutation identity the two-sided
-  // kernel uses at S == 1 (see PTO_HAD_NZGM there) -- NZ position is a
-  // permutation of the bit fields of ND position, and a Sylvester H is blind to
-  // bit permutations of its index, so an NZ load and an NZ store cancel.
+  // the table, so this is a CONVERTING ND->NZ load and it would be worth
+  // avoiding -- this kernel is 51-91% movement (see the header). It cannot be
+  // avoided, and the proof is a counting argument rather than anything about
+  // Hadamard matrices.
   //
-  // NEITHER applies here, and the second one is the interesting no. This tile
-  // is (S x N) with the SAMPLE on the row axis, and the operator is
-  // I_S (x) H_N -- a right multiplication that treats each row independently.
-  // The NZ permutation lifts col>>4 above the row index, i.e. it moves
-  // transform bits into the sample position, and I_S (x) H_N is only invariant
-  // under permutations that leave the sample bits fixed. So the permutation
-  // would genuinely mix samples rather than being undone on the way out. The
-  // two-sided kernel escapes this only where its tile holds ONE sample, and
-  // this kernel needs S > 1 to amortize H's L1->L0B traffic.
+  // Write the GM byte index of a tile as p = [ sample | i ]. Whatever operands
+  // we precompute, each matmul applies them to one FIELD of p, and which fields
+  // exist is fixed by the layout:
+  //
+  //   conversion-free NZ:  right operand owns p[0,4) u p[a+4,t)
+  //                        left  operand owns p[4, a+4)
+  //   conversion-free ND:  the mirror image -- TMOV from an ND L1 tile reads
+  //                        the bytes as fractals AND TRANSPOSES (measured), so
+  //                        the left operand owns p[0,4) u the top bits and the
+  //                        right operand owns the middle.
+  //
+  // This kernel is ONE-SIDED: every operand, dense or blocked, is a RIGHT
+  // operand. So exactly one of those two fields is ever covered, and the other
+  // one keeps whichever transform bits it holds -- p[4, a+4) under NZ, p[0,4)
+  // under ND. Both are non-empty for every N here (A >= 16 forces a >= 4, and
+  // log2(N) >= 6 > 4), so some transform bit is never multiplied at all.
+  //
+  // Covering both fields means a left multiply AND a right multiply, which is
+  // the two-sided kernel in cube/ -- and that kernel, once it had
+  // conversion-free legs, duly overtook this one at N=512 from batch 256 up.
+  // So "one-sided" and "conversion-free GM transfers" are mutually exclusive by
+  // construction, not by accident of the layouts.
   GmTile<S, N> x_gm(x_tile);
   TASSIGN(x_gm, x_tile);
   TLOAD(x_l1, x_gm);

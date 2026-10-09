@@ -540,6 +540,87 @@ to the existing N=8192 configuration: comparing the two at matched values and
 matched tile counts predicted 1.76/2.23/2.50/1.91x against the 1.73/2.23/2.47/
 1.88x finally measured. A free forecast from a measurement already in hand.
 
+##### The whole (N, T) grid, and why T == N is a trap
+
+The tile size `T` is a free parameter, and the MAC cost `2*sqrt(T)` falls as `T`
+does -- at `T == N` it is `2*sqrt(N)`, i.e. **conversion-free transfers at zero
+MAC penalty**. That looks like the obvious choice and it is the worst one.
+`PTO_HAD_FORCE_S1` builds exactly that configuration (correct answers, one
+sample per tile), and the full grid, device time at each point's own best
+`block_dim`, measured against the shipped converting-load kernel:
+
+| N | batch | T=N | 2N | 4N | 8N | 16N | 32N |
+|---|---|---|---|---|---|---|---|
+| 512 | 1024 | 0.44x | 1.38x | 1.89x | **2.26x** | 2.19x | 1.76x |
+| 512 | 4096 | 0.39x | 0.91x | 1.47x | 2.05x | **2.42x** | 1.74x |
+| 1024 | 1024 | 0.49x | 0.74x | 0.95x | **0.98x** | 0.79x | -- |
+| 1024 | 4096 | 0.34x | 0.58x | 0.88x | **1.12x** | 0.79x | -- |
+| 2048 | 1024 | 0.58x | 0.82x | **0.96x** | 0.68x | -- | -- |
+| 2048 | 4096 | 0.45x | 0.72x | **1.01x** | 0.66x | -- | -- |
+| 4096 | 1024 | 0.77x | **0.98x** | 0.69x | -- | -- | -- |
+| 4096 | 4096 | 0.69x | **1.00x** | 0.66x | -- | -- | -- |
+
+**`T == N` loses 1.3x to 3x** despite being MAC-free and conversion-free: a
+one-sample tile is 7 descriptors per *sample* where the shipped tile is `2S+5`
+per *S* samples, and per-tile overhead swamps everything else. The curve is
+unimodal in `T` with its peak well inside the range, so this is a parameter to
+sweep, not to reason about -- "no MAC penalty" was the wrong thing to optimise.
+
+It also settles the shipped choice: T=8192 at N=512 is 2.19x/2.42x against a
+best-possible 2.26x/2.42x, so one constant is within 1.03x of the per-batch
+optimum and no batch-dependent `T` is worth carrying. And it confirms the middle
+sizes are a wash at **every** `T`, not just at the one point measured first --
+N=1024 peaks at 1.12x only at batch 4096, N=2048 at 1.01x, N=4096 at 1.00x.
+
+##### Where conversion-free transfers stand, per kernel and per size
+
+Complete, after sweeping the grid above:
+
+| kernel / size | GM legs today | conversion-free possible? | measured |
+|---|---|---|---|
+| two-sided N=256 | **NZ both** (byte identity, `C == 16`) | already is | shipped |
+| two-sided N=512 | ND->NZ converting | **yes**, bit-plan T=8192 | **2.19-2.42x, shipped** |
+| two-sided N=1024 | ND->NZ converting | yes, best T=8192 | 0.98-1.12x, declined |
+| two-sided N=2048 | ND->NZ converting | yes, best T=8192 | 0.96-1.01x, declined |
+| two-sided N=4096 | ND->NZ converting | yes, best T=8192 | 0.98-1.00x, declined |
+| two-sided N=8192 | **NZ both** (`S == 1`) | already is | 1.017x, shipped |
+| two-sided N=16384 | **NZ both** (`S == 1`) | already is | 1.017x, shipped |
+| two-sided N=32768 | ND->NZ + ND store | **no** | -- |
+| one-sided, all N | ND->NZ converting | **no** | -- |
+
+N=32768 has no conversion-free view at all: `t = 15` needs `8 <= a <= 11` for
+the field widths to work, while an fp16 operand must satisfy `A = 2^a <= 128`,
+i.e. `a <= 7`. No overlap, so there is no two-matmul plan -- independently of
+the blocked-store limitation noted above.
+
+The one-sided kernel's `no` is a counting argument, not a layout accident: every
+one of its operands is a RIGHT operand, so it can cover only one of the two
+fields the layout offers, and the other keeps live transform bits
+(`p[4, a+4)` under NZ, `p[0,4)` under ND). Covering both means a left *and* a
+right multiply, which is the two-sided kernel. This is not free: a `PTO_OS_NOMM`
+split shows the one-sided kernel is **51-91% movement** (matmuls are 9.0% at
+N=64 rising to 48.8% at N=512 batch 4096), so it spends most of its time on
+movement it cannot reduce this way. It keeps N=64-256 regardless, because the
+two-sided kernel already has ideal transfers at N=256 and still loses there.
+
+##### `TMOV` will not fractalise an ND tile (so the conversion cannot move to MTE1)
+
+The tempting third option is to leave the conversion out of the GM leg
+altogether: load ND->ND (contiguous) and let the `L1 -> L0` `TMOV` fractalise on
+the MTE1 leg instead of MTE2. `TLOAD` does support ND->ND into a `Mat` tile, and
+a `TMOV` from an ND (`SLayout::NoneBox`) source compiles.
+
+It does not convert. Measured with an identity multiply so the output is exactly
+what the cube saw, against a converting-load control that returns the identity:
+**`TMOV` from an ND L1 tile reads the bytes as fractals and TRANSPOSES them.**
+That matches the dispatch in `tmov_common.hpp`, which branches on
+`DstTileData::SFractal == SrcTileData::SFractal` and takes the transposing path
+when they differ. So the ND route is not a way to avoid the permutation -- it is
+a *different* permutation, `p = [ r_hi | c_hi | c_lo | r_lo ]`, which is still a
+bit-field permutation and so still fits the bit accounting, with the left and
+right operand roles swapped. Same framework, no new capability, and the
+one-sided impossibility holds under both routes.
+
 **It moved a routing decision.** N=512 was the one size where the one-sided
 kernel beat the two-sided one, which is why `auto` branched there. With the
 bit-plan the two-sided kernel wins from batch 256 up -- 1.01x at 256 to 1.69x at
