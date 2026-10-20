@@ -158,9 +158,14 @@ def test_sample_tile_boundaries(onesided_hadamard_kernel, npu_device, n):
 
 @pytest.mark.parametrize("n", TEST_HIDDEN_DIMS)
 def test_backed_up_tail(onesided_hadamard_kernel, npu_device, n):
-    """batch % 16 != 0: the last 1..15 samples are covered by backing one more
-    16-sample tile up to the end, so some samples are recomputed and stored
-    twice. Both stores must write the same bytes."""
+    """A core whose span is not a whole number of tiles covers the remainder by
+    backing its LAST tile up to end, so up to S-1 samples are recomputed and
+    stored twice. Both stores must write the same bytes.
+
+    The duplicated rows are what this is really testing, so the batches below
+    have to straddle a tile boundary rather than merely a 16-row one: a span
+    shorter than one tile takes the masked path instead and duplicates
+    nothing."""
     s = samples_per_tile(n)
     batches = sorted(
         {

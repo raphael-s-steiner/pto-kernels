@@ -386,23 +386,23 @@ AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample) {
   set_flag(PIPE_FIX, PIPE_M, EV_ACC);
 }
 
-// The 1..15 rows a core is left with once its full tiles are done. The tile
-// size is a compile-time 16, but the TRANSFERS are not: an ND->NZ load moves
-// the GM source's row count (A2/A3) and TSTORE moves `src.GetValidRow()`, so
-// MTE2 reads exactly `rows` rows and FIX writes exactly `rows` rows. The cube
-// still runs a full 16-row tile over whatever else L1 holds -- the transform is
-// per-sample, so those rows only reach output rows that are never stored.
+// The rows a core is left with when its span is shorter than one tile, 1..S-1.
+// The tile geometry is the compile-time S, but the TRANSFERS are not: an
+// ND->NZ load moves the GM source's row count (A2/A3) and TSTORE moves
+// `src.GetValidRow()`, so MTE2 reads exactly `rows` rows and FIX writes exactly
+// `rows` rows. The cube still runs a full S-row tile over whatever else L1
+// holds -- the transform is per-sample, so those rows only reach output rows
+// that are never stored.
 //
-// This is the only way a partial tile is ever handled, at any batch: nothing is
-// padded, no row is computed twice, and nothing outside [sample, sample + rows)
-// is touched on either side. H is already resident (runOnesided loaded it, and
-// its offsets do not depend on S), and the caller has drained the ring, so this
-// owns slot 0 outright and syncs straight through rather than buying
-// pipelining a single tile cannot use. Flag id 7 is unused by the ring.
-template <uint32_t N>
+// The blocked body is the ring's own `blockStep`, so the B blocks of one tile
+// double-buffer L0A against each other exactly as they do in the ring. It is
+// NOT enough to sync M->MTE1 once per block instead: a single tile is the whole
+// of a short-span core's work, so serializing its B blocks is the critical
+// path, and doing that cost 1.35x at N=512 and 1.14x at N=256. That is a cost
+// of this body alone and has nothing to do with how the span was divided.
+template <uint32_t N, uint32_t S>
 AICORE void partialTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
                         uint32_t sample, uint32_t rows) {
-  constexpr uint32_t S = 16;
   using L = Layout<N, S>;
 
   {
@@ -430,26 +430,17 @@ AICORE void partialTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
     Sync<PIPE_MTE1, PIPE_M>(7);
     TMATMUL(acc, x_l0a, h_l0b);
   } else {
+    set_flag(PIPE_M, PIPE_MTE1, EV_A0);
+    set_flag(PIPE_M, PIPE_MTE1, EV_A1);
     for (uint32_t i = 0; i < L::kBlk; ++i) {
-      MatTile<S, L::kM> x_l1;
-      TileLeft<half, S, L::kM> x_l0a;
-      TASSIGN(x_l1, L::xBlock(0, i));
-      TASSIGN(x_l0a, L::l0aX(0));
-      TMOV(x_l0a, x_l1);
-      Sync<PIPE_MTE1, PIPE_M>(7);
-      for (uint32_t j = 0; j < L::kBlk; ++j) {
-        TileAcc<float, S, L::kM> acc_j;
-        TASSIGN(acc_j, L::l0cBlock(0, j));
-        TileRight<half, L::kM, L::kM> h_j;
-        TASSIGN(h_j, L::l0bH(blockSign(i, j)));
-        if (i == 0) {
-          TMATMUL(acc_j, x_l0a, h_j);
-        } else {
-          TMATMUL_ACC(acc_j, x_l0a, h_j);
-        }
+      if (i & 1u) {
+        blockStep<N, S, 0, true, EV_A1>(0, i);
+      } else {
+        blockStep<N, S, 0, false, EV_A0>(0, i);
       }
-      Sync<PIPE_M, PIPE_MTE1>(7);  // one L0A slot, so reuse waits for the MACs
     }
+    wait_flag(PIPE_M, PIPE_MTE1, EV_A0);
+    wait_flag(PIPE_M, PIPE_MTE1, EV_A1);
   }
   Sync<PIPE_M, PIPE_FIX>();
 
@@ -461,29 +452,30 @@ AICORE void partialTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   TASSIGN(y_gm, y_tile);
   y_gm.template SetShape<GlobalTensorDim::DIM_3>(rows);
   TSTORE(y_gm, acc_out);
-  Sync<PIPE_FIX, PIPE_M>(7);  // the store has drained; L0C is free again
+  Sync<PIPE_FIX, PIPE_M>(7);
 }
 
-// Consume [sample, end) with the largest power-of-two tile that still fits,
-// halving on the way down. 16 is the smallest: a tile's Rows IS S here, and PTO
-// wants Rows a multiple of 16 while TMOV's TExtract rejects even Rows == 1.
-// Every level therefore runs WHOLE tiles only, and the 1..15 rows left at the
-// bottom go to partialTile, which masks the transfers instead of rounding the
-// tile up. That holds at any batch -- there is no separate short-batch case and
-// no batch >= 16 precondition, so the host never pads.
+// A core's whole span as ONE ring: m = ceil(span / S) tiles, the LAST of them
+// BACKED UP to finish exactly at `end` rather than running off it.
 //
-// The X ring is four deep so MTE2 stays two tiles ahead of MTE1; the tile body
-// touches each pipe once, so nothing further is needed to keep them overlapped.
+// The back-up overlaps its predecessor by (-span) mod S rows, and those rows
+// are recomputed and stored twice. That is safe for two reasons and both are
+// load-bearing: the transform is per-SAMPLE, so a duplicated row gets the same
+// bytes both times, and FIX retires a core's stores in issue order, so the
+// second write of a row cannot be overtaken by the first. It also stays inside
+// the core's own range -- `end - S >= base` is exactly the `span >= S` guard in
+// runTiles -- so no core ever writes into another's rows, and `block_dim`
+// cannot change a single output byte (test_block_dim_does_not_change_result).
+// When span is a whole multiple of S the back-up is the natural position and
+// nothing is duplicated at all.
+//
+// The point of it is that the remainder rides the ring as an ordinary tile: it
+// is pipelined against its predecessor instead of being a separate unit behind
+// its own prime and drain. See `runTiles` for what this replaced.
 template <uint32_t N, uint32_t S>
-AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
-                     uint32_t &sample, uint32_t end) {
-  constexpr bool kTail = (S == 16);  // the level that mops up a short remainder
-  const uint32_t base = sample;
-  const uint32_t span = end - base;
-  const uint32_t n = span / S;                      // whole tiles at this level
-  const uint32_t rest = kTail ? (span - n * S) : 0u;  // 1..15, bottom level only
-
-  if (n > 0) {
+AICORE void runRing(__gm__ half *x, __gm__ half *h, __gm__ half *y,
+                    uint32_t base, uint32_t end, uint32_t m) {
+  {
     set_flag(PIPE_MTE1, PIPE_MTE2, EV_X0);  // all four slots start free
     set_flag(PIPE_MTE1, PIPE_MTE2, EV_X1);
     set_flag(PIPE_MTE1, PIPE_MTE2, EV_X2);
@@ -495,33 +487,30 @@ AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
     set_flag(PIPE_M, PIPE_MTE1, EV_A0);  // both L0A/L0B slots start free
     set_flag(PIPE_M, PIPE_MTE1, EV_A1);
 
-    issueTileLoad<N, S, 0, EV_X0>(x, base);
-    if (n > 1) issueTileLoad<N, S, 1, EV_X1>(x, base + S);
-    if (n > 2) issueTileLoad<N, S, 2, EV_X2>(x, base + 2 * S);
+    issueTileLoad<N, S, 0, EV_X0>(x, (0 + 1 < m ? base + 0 * S : end - S));
+    if (m > 1) issueTileLoad<N, S, 1, EV_X1>(x, (1 + 1 < m ? base + 1 * S : end - S));
+    if (m > 2) issueTileLoad<N, S, 2, EV_X2>(x, (2 + 1 < m ? base + 2 * S : end - S));
 
-    for (uint32_t i = 0; i < n; ++i) {
-      // Slot and accumulator parity follow i, and the flag ids must be literal,
-      // so the loop is a four-way switch over i mod 4.
+    for (uint32_t i = 0; i < m; ++i) {
       switch (i & 3u) {
         case 0:
-          if (i + 3 < n) issueTileLoad<N, S, 3, EV_X3>(x, base + (i + 3) * S);
-          onesidedTile<N, S, 0, false, EV_X0, EV_A0>(h, y, base + i * S);
+          if (i + 3 < m) issueTileLoad<N, S, 3, EV_X3>(x, ((i + 3) + 1 < m ? base + (i + 3) * S : end - S));
+          onesidedTile<N, S, 0, false, EV_X0, EV_A0>(h, y, (i + 1 < m ? base + i * S : end - S));
           break;
         case 1:
-          if (i + 3 < n) issueTileLoad<N, S, 0, EV_X0>(x, base + (i + 3) * S);
-          onesidedTile<N, S, 1, true, EV_X1, EV_A1>(h, y, base + i * S);
+          if (i + 3 < m) issueTileLoad<N, S, 0, EV_X0>(x, ((i + 3) + 1 < m ? base + (i + 3) * S : end - S));
+          onesidedTile<N, S, 1, true, EV_X1, EV_A1>(h, y, (i + 1 < m ? base + i * S : end - S));
           break;
         case 2:
-          if (i + 3 < n) issueTileLoad<N, S, 1, EV_X1>(x, base + (i + 3) * S);
-          onesidedTile<N, S, 2, false, EV_X2, EV_A0>(h, y, base + i * S);
+          if (i + 3 < m) issueTileLoad<N, S, 1, EV_X1>(x, ((i + 3) + 1 < m ? base + (i + 3) * S : end - S));
+          onesidedTile<N, S, 2, false, EV_X2, EV_A0>(h, y, (i + 1 < m ? base + i * S : end - S));
           break;
         default:
-          if (i + 3 < n) issueTileLoad<N, S, 2, EV_X2>(x, base + (i + 3) * S);
-          onesidedTile<N, S, 3, true, EV_X3, EV_A1>(h, y, base + i * S);
+          if (i + 3 < m) issueTileLoad<N, S, 2, EV_X2>(x, ((i + 3) + 1 < m ? base + (i + 3) * S : end - S));
+          onesidedTile<N, S, 3, true, EV_X3, EV_A1>(h, y, (i + 1 < m ? base + i * S : end - S));
           break;
       }
     }
-    sample = base + n * S;
 
     wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X0);  // drain the four primes
     wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X1);
@@ -534,15 +523,74 @@ AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
     wait_flag(PIPE_M, PIPE_MTE1, EV_A0);
     wait_flag(PIPE_M, PIPE_MTE1, EV_A1);
   }
-  if constexpr (kTail) {
-    // The ring is drained above, so the partial tile owns slot 0 outright.
-    if (rest > 0) {
-      partialTile<N>(x, h, y, base + n * S, rest);
+}
+
+// One masked tile at the SMALLEST instantiated tile size that covers `rows`.
+//
+// Masking is free on the TRANSFERS but not on the tile: the cube still runs all
+// S rows whatever the row count says, so a 1..15 row span in an S = 256 tile
+// wastes 240 rows of TMOV and MACs -- 0.19 us at N=64 and 0.32 us at N=128,
+// which is 15-20% of a short-span core, enough to lose to the chain this
+// replaced. Choosing the level by `rows` bounds the waste at under half a tile
+// and costs a scalar compare chain plus one partialTile instantiation per
+// level.
+//
+// The recursion is a compile-time CHOICE, not a chain: every level below the
+// chosen one returns before doing any work, so exactly one tile ever runs.
+template <uint32_t N, uint32_t S>
+AICORE void maskedTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
+                       uint32_t sample, uint32_t rows) {
+  if constexpr (S > 16) {
+    if (rows <= S / 2) {
+      maskedTile<N, S / 2>(x, h, y, sample, rows);
+      return;
     }
   }
-  if constexpr (S > 16) {
-    runTiles<N, S / 2>(x, h, y, sample, end);
+  partialTile<N, S>(x, h, y, sample, rows);
+}
+
+// Consume [sample, end) as exactly ONE unit of work: a ring of whole tiles with
+// its last one backed up, or -- when the span is shorter than a single tile --
+// one masked tile. Either way nothing is left over, so there is no second unit
+// and no chain of them.
+//
+// This replaced a recursive power-of-two HALVING chain: run span/S whole tiles,
+// then tail-recurse on S/2, down to 16, and mask the last 1..15 rows. That was
+// correct and it cost nothing in bulk -- work is split by TILES, so every core
+// but the last-with-work has a span that is a whole multiple of S and never
+// descends at all, and the one core that does descend is the truncated, UNDER-
+// loaded one, whose serialization hides in its slack (N=64 batch 65535 against
+// 65536: 5.46 vs 5.48 us, no difference).
+//
+// What it cost was the regime where that slack is gone -- tiles_per_core of 1
+// or 2, where the descending core IS the critical path. There each level is a
+// full prime/ring/drain for one tile, with no predecessor to overlap, and a
+// 255-sample span at N=64 walked five of them back to back. Collapsing that to
+// one unit is 1.28-1.56x over the four sizes at short and unaligned spans, and
+// parity everywhere else, including every aligned shape and the whole bulk
+// range. Note that N=512 (S=16) never had a chain to walk and still gains: two
+// thirds of the win is the ring fold and the blocked partialTile body, not the
+// chain. The README has the full grid.
+//
+// Halving back down was NOT the cheap alternative it looks like: a 16-row ring
+// tile costs ~0.11 us at the margin, so the 15 small tiles that cover a
+// 255-sample span lose to four serialized big ones, and a two-level form (S
+// then 16) measured 0.78-0.86x -- slower than the chain it was meant to fix.
+// The short span wants ONE big masked tile, which is what maskedTile gives it.
+template <uint32_t N, uint32_t S>
+AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
+                     uint32_t &sample, uint32_t end) {
+  const uint32_t base = sample;
+  const uint32_t span = end - base;
+  if (span == 0) {
+    return;
   }
+  if (span >= S) {
+    runRing<N, S>(x, h, y, base, end, (span + S - 1) / S);
+  } else {
+    maskedTile<N, S>(x, h, y, base, span);
+  }
+  sample = end;
 }
 
 template <uint32_t N, uint32_t S>

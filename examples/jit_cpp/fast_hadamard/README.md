@@ -363,21 +363,29 @@ Reading it:
   remains the only kernel for `N < 64`.
 - Overall: **one-sided takes 20 of the 60 cells, two-sided 40.**
 
-#### One host-side cost the device-time grid hides: `batch < 16`
+#### One host-side cost the device-time grid hid: `batch < 16` (SUPERSEDED)
 
-The one-sided kernel's smallest tile is 16 samples, so its wrapper pads a
-shorter batch into a cached 16-row scratch. That costs two extra torch copies
-around the launch, and each one forces another `torch_npu` task-queue drain:
-wall-clock goes from ~63 us at `batch >= 16` to **243 - 279 us below it**,
-against ~57 - 59 us for the vector kernel at the same shapes. Device time is
-unchanged -- the kernel still runs one 16-sample tile -- so this does not appear
-anywhere in the grid above.
+**This no longer describes the code.** It is kept because the host-vs-device
+trap it records is worth knowing, but the padding it blames is gone: the tile is
+16 rows while the TRANSFERS around it are not, so the kernel masks a short batch
+instead of the wrapper padding it, and `grep pad cube/jit_util_hadamard_onesided.py`
+now finds only the comment saying so. The wall-clock figures below were measured
+against the padding wrapper and have NOT been re-measured since it was removed.
 
-It matters because `auto` routes every `N <= 512` to this kernel, so at
-`batch < 16` the dispatcher returns the kernel that is ~4.3x slower in
-wall-clock while being 1.4 - 2.1x faster on device. If short batches are a real
-workload, the fix is to pad without the round trip (launch directly on a
-16-row view of a caller-sized allocation), not to re-route.
+As recorded then: the wrapper padded a shorter batch into a cached 16-row
+scratch, which cost two extra torch copies around the launch, each forcing
+another `torch_npu` task-queue drain. Wall-clock went from ~63 us at
+`batch >= 16` to **243 - 279 us below it**, against ~57 - 59 us for the vector
+kernel at the same shapes, while device time was unchanged -- so none of it
+appeared anywhere in the grid above. It mattered because `auto` routes every
+`N <= 512` to this kernel, so at `batch < 16` the dispatcher returned the kernel
+that was ~4.3x slower in wall-clock while being 1.4 - 2.1x faster on device.
+
+The lesson that outlived the code: **a device-time grid cannot see a host-side
+regression, and this kernel's launch overhead dwarfs its device time at small
+batch.** Re-measure wall-clock, not just msprof, before calling a short-batch
+shape fixed. The device side of that regime did separately get 1.28x - 1.36x
+faster -- see **The per-core remainder** below.
 
 Bandwidth shows where the two-sided margin comes from and where it goes: the
 cube path peaks at **2.30 - 2.45 TB/s** while the working set (`2*N*batch*2`
@@ -944,7 +952,7 @@ accumulation) and the per-N samples-per-tile overrides. Removed:
 | `PTO_TS_FORCE_S1` | one sample per tile | a probe for the tile-size sweep, now recorded above |
 | `PTO_OS_BLOCKED` | blocked accumulation on/off | always on; the dense form it falls back to was 0.6-0.8x of the vector kernel |
 | `PTO_OS_BIG`, `PTO_OS_S1024`, `PTO_OS_S2048` | one-sided N=1024/2048 | correct but 1.7-4.8x slower than the two-sided kernel |
-| `PTO_OS_TILE_SPLIT` | split per-core work by samples instead of tiles | the sample split walks the halving chain on most cores |
+| `PTO_OS_TILE_SPLIT` | split per-core work by samples instead of tiles | the sample split walks the halving chain on most cores -- **that reason has since expired**, there is no chain any more; see *The per-core remainder* |
 | `PTO_TS_BITPLAN` (host) | bit-plan on/off | always on; it is 2.19-2.42x at the one size it applies to |
 
 Two whole code paths went with them, both **provably** dead rather than merely
@@ -1136,6 +1144,101 @@ against their nearest neighbour. It reported 1.013x - 1.031x worst regret; the
 real cost at N=64 batch 8192 was 1.12x, because 32 tiles divide evenly over 16
 cores and badly over 15. Refitted over all 24 values: worst regret 1.000x -
 1.041x, against 1.18x - 1.21x for a constant 24.
+
+#### The per-core remainder: one unit of work, not a chain of them (1.28x - 1.56x)
+
+`runTiles` used to consume a core's span with a recursive power-of-two
+**halving** chain: run `span/S` whole tiles, tail-recurse on `S/2`, down to 16,
+and hand the last 1..15 rows to `partialTile`. It was correct, and in bulk it
+cost **nothing** -- which is why it survived so long, and why a bulk A/B could
+never have found the problem:
+
+- Work is split by **tiles**, so every core except the last-with-work has a span
+  that is a whole multiple of `S`. Those cores see `span == 0` at every lower
+  level, compute `n == 0`, and never descend. The chain runs on **at most one
+  core per launch**.
+- That one core is the **truncated** one, so it is also the *under*-loaded one,
+  and its serialization hides in its own slack. At N=64 the theoretical worst
+  case is invisible: batch 65535, where the tail core walks `128+64+32+16` plus
+  a 15-row partial, measures **5.46 us against 5.48** for batch 65536, which
+  walks nothing.
+- Depth also bounds it by size: at N=512 (`S = 16`) there is **no chain at all**,
+  and at N=256 (`S = 32`) there is at most one extra level. Only N=64 and N=128
+  have one worth walking.
+
+What it cost was the regime where that slack is gone -- `tiles_per_core` of 1 or
+2, where the descending core **is** the critical path. There every level is a
+full prime/ring/drain for a single tile with no predecessor to overlap it, and a
+255-sample span at N=64 walks five of them back to back.
+
+The replacement makes a core's span exactly **one** unit of work:
+
+- `span >= S`: `m = ceil(span/S)` tiles through the existing 4-deep ring, with
+  the **last tile backed up** to finish at `end`. The remainder rides the ring
+  as an ordinary tile instead of being a second unit behind its own drain.
+- `span < S`: **one** masked tile, at the smallest instantiated tile size that
+  covers the span, masked exactly as `partialTile` already did.
+
+The back-up recomputes `(-span) mod S` rows and stores them twice. That is safe
+because the transform is per-**sample** (a duplicated row gets the same bytes
+both times) and FIX retires a core's stores in issue order; and it stays inside
+the core's own range, because `end - S >= base` *is* the `span >= S` guard. So
+`block_dim` still cannot change an output byte. When the span is a whole
+multiple of `S` the back-up is the natural position and nothing is duplicated.
+
+msprof device time, median of 3 interleaved passes of 30 reps, scheduled
+`block_dim`, old -> new:
+
+| N | exposed case | before | after | | aligned / bulk control | before | after |
+|---:|---|---:|---:|---|---|---:|---:|
+| 64 | batch 255 | 2.62 | **1.68** (1.56x) | | batch 256 | 1.78 | 1.78 |
+| 64 | batch 511 | 2.66 | **1.76** (1.51x) | | batch 65536 | 5.40 | 5.40 |
+| 128 | batch 127 | 2.68 | **1.94** (1.38x) | | batch 128 | 2.18 | 2.18 |
+| 256 | batch 17 | 2.14 | **1.56** (1.37x) | | batch 65536 | 27.02 | 27.02 |
+| 512 | batch 15 | 2.64 | **1.94** (1.36x) | | batch 16 | 2.10 | 2.12 |
+| 512 | batch 31 | 2.66 | **2.08** (1.28x) | | batch 65536 | 99.80 | 99.76 |
+
+Over a 115-case sweep: 53 cases at >= 1.05x, 60 inside 0.98 - 1.02x, **none
+below**. Run-to-run spread is 0.02 - 0.06 us, and the profiler quantises to
+~0.02 us, so every "parity" cell above is parity to the resolution available.
+The `.so` shrinks 22% (49352 -> 38568 bytes): one ring form instead of five
+recursive instantiations per N.
+
+**Only about a third of the win is the chain.** Three costs were measured apart,
+and the other two are independent of how the span was divided:
+
+1. The chain itself (N=64/128 only) -- 1.26x - 1.56x.
+2. **`partialTile`'s blocked body was serialized**: it synced `M -> MTE1` after
+   every one of the `B` blocks. One tile is the whole of a short-span core's
+   work, so that *is* the critical path. Using the ring's own `blockStep`
+   instead is **1.35x at N=512 and 1.14x at N=256** -- at N=512, where no chain
+   ever existed. This was the cheapest single fix on the list.
+3. The remainder being a drained standalone unit when the core also has whole
+   tiles; the back-up folds it into the ring (1.20x - 1.34x).
+
+**Halving back down is not the cheap alternative it looks like.** A 16-row ring
+tile costs ~0.11 us at the margin, so the 15 small tiles covering a 255-sample
+span lose to four serialized big ones. A two-level form (`S` then 16) measured
+**0.78x - 0.86x** -- slower than the chain it was meant to fix -- and so did a
+back-up with a 16-level fallback (0.86x - 0.91x). A short span wants ONE big
+masked tile.
+
+**Masking is free on the transfers but not on the tile**: the cube runs all `S`
+rows whatever the row count says. A 1..15 row span in an `S = 256` tile wastes
+240 rows of TMOV and MACs -- 0.19 us at N=64 and 0.32 us at N=128, 15-20% of a
+short-span core, which is why the masked tile picks its level instead of always
+using the top one. Masking at the top level alone **regresses** batch 1..15 to
+0.83x - 0.85x.
+
+Two consequences for things recorded elsewhere in this file. The sample split
+(`PTO_OS_TILE_SPLIT`, in **Switches removed for release**) was rejected because
+it "walks the halving chain on most cores" -- there is no chain now, so that
+rejection no longer holds and the split is safe to revisit. A single-core probe
+puts a masked tile at `1.42 us + 1.26 ns/row`, and the new N=64 batch-255 figure
+sits exactly on that line, i.e. it is already at the single-core movement floor;
+spreading those 255 rows over the 3 cores the schedule launches could save at
+most ~0.20 us, and only if bandwidth scaled with cores, which **Why N=256 is the
+weak case** shows it does not in the shallow regime. Worth 1.1x at best.
 
 #### Three gotchas worth recording
 
