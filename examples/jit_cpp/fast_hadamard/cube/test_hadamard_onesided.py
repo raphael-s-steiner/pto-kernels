@@ -189,11 +189,11 @@ def test_batch_partition_boundaries(onesided_hadamard_kernel, npu_device, n):
 
 @pytest.mark.parametrize("n", TEST_HIDDEN_DIMS)
 def test_short_batch(onesided_hadamard_kernel, npu_device, n):
-    """batch 1..15 is below the kernel's smallest tile, so it runs runShort,
-    which sets the GM row count on the load and the valid row count on the
-    store to the real batch. The result must be right, and the rows past
-    `batch` in the caller's buffer must be left alone -- that containment is
-    the whole reason the store is narrowed rather than the input padded."""
+    """batch 1..15 leaves the tile loop with no whole tile to run, so the rows
+    go straight to partialTile -- the same masked path any batch's last 1..15
+    rows take. The result must be right, and the rows past `batch` in the
+    caller's buffer must be left alone: that containment is the whole reason
+    the store is narrowed rather than the input padded."""
     rows = MIN_ONESIDED_BATCH + 4
     torch.manual_seed(11)
     x_cpu = torch.randn(rows, n, dtype=DTYPE)
@@ -216,18 +216,18 @@ def test_short_batch(onesided_hadamard_kernel, npu_device, n):
 
 @pytest.mark.parametrize("n", [64, 512])
 def test_short_batch_stale_l1_tail(onesided_hadamard_kernel, npu_device, n):
-    """runShort loads only `batch` rows into the L1 X slot, so rows
-    [batch, 16) still hold whatever the previous call left there and the cube
-    folds them into output rows that are never stored. Dropping the host
-    scratch did not remove that hazard, it moved it from GM into L1. Walk the
-    batch down so every call inherits a longer stale tail than it writes."""
+    """partialTile loads only `rows` rows into the L1 X slot, so the rest of
+    the slot still holds whatever the previous call left there and the cube
+    folds it into output rows that are never stored. Dropping the host scratch
+    did not remove that hazard, it moved it from GM into L1. Walk the batch
+    down so every call inherits a longer stale tail than it writes."""
     for batch in (15, 1, 9, 2, 14, 3):
         check_shape(onesided_hadamard_kernel, npu_device, batch, n, seed=batch)
 
 
 @pytest.mark.parametrize("n", [64, 512])
 def test_input_is_not_modified(onesided_hadamard_kernel, npu_device, n):
-    # 9 goes through runShort, 100 through the tile loop.
+    # 9 is all partial tile; 100 is whole tiles plus a 4-row partial tile.
     for batch in (9, 100):
         torch.manual_seed(0)
         x_cpu = torch.randn(batch, n, dtype=DTYPE)

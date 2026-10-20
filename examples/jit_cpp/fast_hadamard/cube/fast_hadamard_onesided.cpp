@@ -386,112 +386,32 @@ AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample) {
   set_flag(PIPE_FIX, PIPE_M, EV_ACC);
 }
 
-// Tile i starts at base + i*stride, except a tail tile, which ends at `end`.
-AICORE inline uint32_t tileStart(uint32_t base, uint32_t stride,
-                                 uint32_t n_full, uint32_t end, uint32_t i) {
-  return (i < n_full) ? (base + i * stride) : (end - stride);
-}
-
-// Consume [sample, end) with the largest power-of-two tile that still fits,
-// halving on the way down. 16 is the smallest: a tile's Rows IS S here, and PTO
-// wants Rows a multiple of 16 while TMOV's TExtract rejects even Rows == 1. So
-// the last 1..15 samples are covered by backing one more 16-tile up to END,
-// which recomputes up to 15 samples -- harmless, because the transform is
-// per-sample and the overlapping store writes byte-identical values. It does
-// mean batch >= 16; the host wrapper pads below that.
+// The 1..15 rows a core is left with once its full tiles are done. The tile
+// size is a compile-time 16, but the TRANSFERS are not: an ND->NZ load moves
+// the GM source's row count (A2/A3) and TSTORE moves `src.GetValidRow()`, so
+// MTE2 reads exactly `rows` rows and FIX writes exactly `rows` rows. The cube
+// still runs a full 16-row tile over whatever else L1 holds -- the transform is
+// per-sample, so those rows only reach output rows that are never stored.
 //
-// The X ring is four deep so MTE2 stays two tiles ahead of MTE1; the tile body
-// touches each pipe once, so nothing further is needed to keep them overlapped.
-template <uint32_t N, uint32_t S>
-AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
-                     uint32_t &sample, uint32_t end) {
-  constexpr bool kTail = (S == 16);  // the level that mops up a short remainder
-  const uint32_t base = sample;
-  const uint32_t span = end - base;
-  const uint32_t n_full = span / S;
-  const uint32_t n = n_full + ((kTail && (span % S) != 0) ? 1u : 0u);
-
-  if (n > 0) {
-    set_flag(PIPE_MTE1, PIPE_MTE2, EV_X0);  // all four slots start free
-    set_flag(PIPE_MTE1, PIPE_MTE2, EV_X1);
-    set_flag(PIPE_MTE1, PIPE_MTE2, EV_X2);
-    set_flag(PIPE_MTE1, PIPE_MTE2, EV_X3);
-    set_flag(PIPE_FIX, PIPE_M, EV_ACC);  // one credit per accumulator slot
-    if constexpr (Layout<N, S>::kAccSlots == 2u) {
-      set_flag(PIPE_FIX, PIPE_M, EV_ACC);
-    }
-    set_flag(PIPE_M, PIPE_MTE1, EV_A0);  // both L0A/L0B slots start free
-    set_flag(PIPE_M, PIPE_MTE1, EV_A1);
-
-    issueTileLoad<N, S, 0, EV_X0>(x, tileStart(base, S, n_full, end, 0));
-    if (n > 1) issueTileLoad<N, S, 1, EV_X1>(x, tileStart(base, S, n_full, end, 1));
-    if (n > 2) issueTileLoad<N, S, 2, EV_X2>(x, tileStart(base, S, n_full, end, 2));
-
-    for (uint32_t i = 0; i < n; ++i) {
-      // Slot and accumulator parity follow i, and the flag ids must be literal,
-      // so the loop is a four-way switch over i mod 4.
-      switch (i & 3u) {
-        case 0:
-          if (i + 3 < n) issueTileLoad<N, S, 3, EV_X3>(x, tileStart(base, S, n_full, end, i + 3));
-          onesidedTile<N, S, 0, false, EV_X0, EV_A0>(h, y, tileStart(base, S, n_full, end, i));
-          break;
-        case 1:
-          if (i + 3 < n) issueTileLoad<N, S, 0, EV_X0>(x, tileStart(base, S, n_full, end, i + 3));
-          onesidedTile<N, S, 1, true, EV_X1, EV_A1>(h, y, tileStart(base, S, n_full, end, i));
-          break;
-        case 2:
-          if (i + 3 < n) issueTileLoad<N, S, 1, EV_X1>(x, tileStart(base, S, n_full, end, i + 3));
-          onesidedTile<N, S, 2, false, EV_X2, EV_A0>(h, y, tileStart(base, S, n_full, end, i));
-          break;
-        default:
-          if (i + 3 < n) issueTileLoad<N, S, 2, EV_X2>(x, tileStart(base, S, n_full, end, i + 3));
-          onesidedTile<N, S, 3, true, EV_X3, EV_A1>(h, y, tileStart(base, S, n_full, end, i));
-          break;
-      }
-    }
-    sample = kTail ? end : (base + n_full * S);
-
-    wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X0);  // drain the four primes
-    wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X1);
-    wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X2);
-    wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X3);
-    wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
-    if constexpr (Layout<N, S>::kAccSlots == 2u) {
-      wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
-    }
-    wait_flag(PIPE_M, PIPE_MTE1, EV_A0);
-    wait_flag(PIPE_M, PIPE_MTE1, EV_A1);
-  }
-  if constexpr (S > 16) {
-    runTiles<N, S / 2>(x, h, y, sample, end);
-  }
-}
-
-// Batch below the smallest tile. The tile size is a compile-time 16, but the
-// TRANSFERS are not: an ND->NZ load moves the GM source's row count (A2/A3) and
-// TSTORE moves `src.GetValidRow()`, so MTE2 reads exactly `rows` rows and FIX
-// writes exactly `rows` rows. The cube still runs a full 16-row tile over
-// whatever else L1 holds -- the transform is per-sample, so those rows only
-// reach output rows that are never stored. Nothing is padded and nothing
-// outside [0, rows) is touched on either side.
-//
-// One core, one tile, no ring: this runs once per launch, so it syncs straight
-// through instead of buying pipelining it cannot use. Flag id 7 is unused by
-// the tile loop's protocol.
+// This is the only way a partial tile is ever handled, at any batch: nothing is
+// padded, no row is computed twice, and nothing outside [sample, sample + rows)
+// is touched on either side. H is already resident (runOnesided loaded it, and
+// its offsets do not depend on S), and the caller has drained the ring, so this
+// owns slot 0 outright and syncs straight through rather than buying
+// pipelining a single tile cannot use. Flag id 7 is unused by the ring.
 template <uint32_t N>
-AICORE void runShort(__gm__ half *x, __gm__ half *h, __gm__ half *y,
-                     uint32_t rows) {
+AICORE void partialTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
+                        uint32_t sample, uint32_t rows) {
   constexpr uint32_t S = 16;
   using L = Layout<N, S>;
-
-  loadHadamard<N, S>(h);
 
   {
     MatTileV<S, N, DYNAMIC> x_l1;
     TASSIGN(x_l1, L::xSlot(0));
     x_l1.SetValidRow(rows);
-    GmTileDyn<S, N> x_gm(x);
-    TASSIGN(x_gm, x);
+    __gm__ half *x_tile = x + sample * N;
+    GmTileDyn<S, N> x_gm(x_tile);
+    TASSIGN(x_gm, x_tile);
     x_gm.template SetShape<GlobalTensorDim::DIM_3>(rows);
     TLOAD(x_l1, x_gm);
   }
@@ -536,10 +456,93 @@ AICORE void runShort(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   TileAcc<float, S, N, DYNAMIC> acc_out;
   TASSIGN(acc_out, L::l0cAcc(false));
   acc_out.SetValidRow(rows);
-  GmTileDyn<S, N> y_gm(y);
-  TASSIGN(y_gm, y);
+  __gm__ half *y_tile = y + sample * N;
+  GmTileDyn<S, N> y_gm(y_tile);
+  TASSIGN(y_gm, y_tile);
   y_gm.template SetShape<GlobalTensorDim::DIM_3>(rows);
   TSTORE(y_gm, acc_out);
+  Sync<PIPE_FIX, PIPE_M>(7);  // the store has drained; L0C is free again
+}
+
+// Consume [sample, end) with the largest power-of-two tile that still fits,
+// halving on the way down. 16 is the smallest: a tile's Rows IS S here, and PTO
+// wants Rows a multiple of 16 while TMOV's TExtract rejects even Rows == 1.
+// Every level therefore runs WHOLE tiles only, and the 1..15 rows left at the
+// bottom go to partialTile, which masks the transfers instead of rounding the
+// tile up. That holds at any batch -- there is no separate short-batch case and
+// no batch >= 16 precondition, so the host never pads.
+//
+// The X ring is four deep so MTE2 stays two tiles ahead of MTE1; the tile body
+// touches each pipe once, so nothing further is needed to keep them overlapped.
+template <uint32_t N, uint32_t S>
+AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
+                     uint32_t &sample, uint32_t end) {
+  constexpr bool kTail = (S == 16);  // the level that mops up a short remainder
+  const uint32_t base = sample;
+  const uint32_t span = end - base;
+  const uint32_t n = span / S;                      // whole tiles at this level
+  const uint32_t rest = kTail ? (span - n * S) : 0u;  // 1..15, bottom level only
+
+  if (n > 0) {
+    set_flag(PIPE_MTE1, PIPE_MTE2, EV_X0);  // all four slots start free
+    set_flag(PIPE_MTE1, PIPE_MTE2, EV_X1);
+    set_flag(PIPE_MTE1, PIPE_MTE2, EV_X2);
+    set_flag(PIPE_MTE1, PIPE_MTE2, EV_X3);
+    set_flag(PIPE_FIX, PIPE_M, EV_ACC);  // one credit per accumulator slot
+    if constexpr (Layout<N, S>::kAccSlots == 2u) {
+      set_flag(PIPE_FIX, PIPE_M, EV_ACC);
+    }
+    set_flag(PIPE_M, PIPE_MTE1, EV_A0);  // both L0A/L0B slots start free
+    set_flag(PIPE_M, PIPE_MTE1, EV_A1);
+
+    issueTileLoad<N, S, 0, EV_X0>(x, base);
+    if (n > 1) issueTileLoad<N, S, 1, EV_X1>(x, base + S);
+    if (n > 2) issueTileLoad<N, S, 2, EV_X2>(x, base + 2 * S);
+
+    for (uint32_t i = 0; i < n; ++i) {
+      // Slot and accumulator parity follow i, and the flag ids must be literal,
+      // so the loop is a four-way switch over i mod 4.
+      switch (i & 3u) {
+        case 0:
+          if (i + 3 < n) issueTileLoad<N, S, 3, EV_X3>(x, base + (i + 3) * S);
+          onesidedTile<N, S, 0, false, EV_X0, EV_A0>(h, y, base + i * S);
+          break;
+        case 1:
+          if (i + 3 < n) issueTileLoad<N, S, 0, EV_X0>(x, base + (i + 3) * S);
+          onesidedTile<N, S, 1, true, EV_X1, EV_A1>(h, y, base + i * S);
+          break;
+        case 2:
+          if (i + 3 < n) issueTileLoad<N, S, 1, EV_X1>(x, base + (i + 3) * S);
+          onesidedTile<N, S, 2, false, EV_X2, EV_A0>(h, y, base + i * S);
+          break;
+        default:
+          if (i + 3 < n) issueTileLoad<N, S, 2, EV_X2>(x, base + (i + 3) * S);
+          onesidedTile<N, S, 3, true, EV_X3, EV_A1>(h, y, base + i * S);
+          break;
+      }
+    }
+    sample = base + n * S;
+
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X0);  // drain the four primes
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X1);
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X2);
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X3);
+    wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
+    if constexpr (Layout<N, S>::kAccSlots == 2u) {
+      wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
+    }
+    wait_flag(PIPE_M, PIPE_MTE1, EV_A0);
+    wait_flag(PIPE_M, PIPE_MTE1, EV_A1);
+  }
+  if constexpr (kTail) {
+    // The ring is drained above, so the partial tile owns slot 0 outright.
+    if (rest > 0) {
+      partialTile<N>(x, h, y, base + n * S, rest);
+    }
+  }
+  if constexpr (S > 16) {
+    runTiles<N, S / 2>(x, h, y, sample, end);
+  }
 }
 
 template <uint32_t N, uint32_t S>
@@ -570,19 +573,9 @@ AICORE void runOnesided(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   runTiles<N, S>(x, h, y, sample, end);
 }
 
-// Below kShortBatch the tile loop's tail trick has no room to back a tile up
-// to `end`, so that range gets runShort instead and the host needs no scratch.
-constexpr uint32_t kShortBatch = 16;
-
 #define FAST_HADAMARD_ONESIDED_DISPATCH_CASE(NVal, SVal) \
   case NVal:                                             \
-    if (batch < kShortBatch) {                           \
-      if (get_block_idx() == 0) {                        \
-        runShort<NVal>(x, h, y, batch);                  \
-      }                                                  \
-    } else {                                             \
-      runOnesided<NVal, SVal>(x, h, y, batch);           \
-    }                                                    \
+    runOnesided<NVal, SVal>(x, h, y, batch);             \
     return;
 
 AICORE void dispatchOnesided(__gm__ half *x, __gm__ half *h, __gm__ half *y,

@@ -26,11 +26,11 @@ MAX_ONESIDED_N = 512
 
 # A tile's Rows is S here, and PTO requires 16-aligned rows (TMOV's TExtract
 # rejects even Rows == 1), so the kernel's smallest tile is 16 samples. The TILE
-# is 16 rows; the TRANSFERS around it need not be, so a shorter batch is not
-# padded: the kernel routes it to runShort, which sets the GM row count on the
-# load and the valid row count on the store to the real batch. Kept here because
-# it is the kernel's routing threshold and the tests place batches either side
-# of it. See runShort for why the rows in between are safe to compute.
+# is 16 rows; the TRANSFERS around it need not be, so no batch is ever padded:
+# the kernel runs whole tiles and hands the last 1..15 rows to partialTile,
+# which sets the GM row count on the load and the valid row count on the store.
+# Nothing here depends on this value any more -- it is kept because the tests
+# place batches either side of it.
 MIN_ONESIDED_BATCH = 16
 
 _H_CACHE: dict = {}
