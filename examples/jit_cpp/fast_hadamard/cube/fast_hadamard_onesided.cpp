@@ -132,6 +132,20 @@ using GmTile =
     GlobalTensor<half, TileShape2D<half, Rows, Cols, Layout::ND>,
                  BaseShape2D<half, Rows, Cols, Layout::ND>, Layout::ND>;
 
+// Same as MatTile but with a settable valid row count. The short-batch load's
+// destination must agree with a GM source whose row count is a runtime value.
+template <uint32_t Rows, uint32_t Cols, int RowValid>
+using MatTileV = Tile<TileType::Mat, half, Rows, Cols, BLayout::ColMajor,
+                      RowValid, Cols, SLayout::RowMajor, 512>;
+
+// Same as GmTile but with a DYNAMIC row count. The base shape keeps the static
+// row stride (Cols); the DIM_0..2 strides it also carries are unused, because
+// the ND shape's leading dims are 1.
+template <uint32_t Rows, uint32_t Cols>
+using GmTileDyn =
+    GlobalTensor<half, TileShape2D<half, DYNAMIC, Cols, Layout::ND>,
+                 BaseShape2D<half, Rows, Cols, Layout::ND>, Layout::ND>;
+
 template <uint32_t N, uint32_t S>
 struct Layout {
   static constexpr uint32_t kTileElems = S * N;
@@ -453,6 +467,81 @@ AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   }
 }
 
+// Batch below the smallest tile. The tile size is a compile-time 16, but the
+// TRANSFERS are not: an ND->NZ load moves the GM source's row count (A2/A3) and
+// TSTORE moves `src.GetValidRow()`, so MTE2 reads exactly `rows` rows and FIX
+// writes exactly `rows` rows. The cube still runs a full 16-row tile over
+// whatever else L1 holds -- the transform is per-sample, so those rows only
+// reach output rows that are never stored. Nothing is padded and nothing
+// outside [0, rows) is touched on either side.
+//
+// One core, one tile, no ring: this runs once per launch, so it syncs straight
+// through instead of buying pipelining it cannot use. Flag id 7 is unused by
+// the tile loop's protocol.
+template <uint32_t N>
+AICORE void runShort(__gm__ half *x, __gm__ half *h, __gm__ half *y,
+                     uint32_t rows) {
+  constexpr uint32_t S = 16;
+  using L = Layout<N, S>;
+
+  loadHadamard<N, S>(h);
+
+  {
+    MatTileV<S, N, DYNAMIC> x_l1;
+    TASSIGN(x_l1, L::xSlot(0));
+    x_l1.SetValidRow(rows);
+    GmTileDyn<S, N> x_gm(x);
+    TASSIGN(x_gm, x);
+    x_gm.template SetShape<GlobalTensorDim::DIM_3>(rows);
+    TLOAD(x_l1, x_gm);
+  }
+  Sync<PIPE_MTE2, PIPE_MTE1>(7);
+
+  TileAcc<float, S, N> acc;
+  TASSIGN(acc, L::l0cAcc(false));
+  if constexpr (L::kResident) {
+    MatTile<S, N> x_l1;
+    TileLeft<half, S, N> x_l0a;
+    TASSIGN(x_l1, L::xSlot(0));
+    TASSIGN(x_l0a, L::l0aX(0));
+    TMOV(x_l0a, x_l1);
+    TileRight<half, N, N> h_l0b;
+    TASSIGN(h_l0b, L::kL0bH);
+    Sync<PIPE_MTE1, PIPE_M>(7);
+    TMATMUL(acc, x_l0a, h_l0b);
+  } else {
+    for (uint32_t i = 0; i < L::kBlk; ++i) {
+      MatTile<S, L::kM> x_l1;
+      TileLeft<half, S, L::kM> x_l0a;
+      TASSIGN(x_l1, L::xBlock(0, i));
+      TASSIGN(x_l0a, L::l0aX(0));
+      TMOV(x_l0a, x_l1);
+      Sync<PIPE_MTE1, PIPE_M>(7);
+      for (uint32_t j = 0; j < L::kBlk; ++j) {
+        TileAcc<float, S, L::kM> acc_j;
+        TASSIGN(acc_j, L::l0cBlock(0, j));
+        TileRight<half, L::kM, L::kM> h_j;
+        TASSIGN(h_j, L::l0bH(blockSign(i, j)));
+        if (i == 0) {
+          TMATMUL(acc_j, x_l0a, h_j);
+        } else {
+          TMATMUL_ACC(acc_j, x_l0a, h_j);
+        }
+      }
+      Sync<PIPE_M, PIPE_MTE1>(7);  // one L0A slot, so reuse waits for the MACs
+    }
+  }
+  Sync<PIPE_M, PIPE_FIX>();
+
+  TileAcc<float, S, N, DYNAMIC> acc_out;
+  TASSIGN(acc_out, L::l0cAcc(false));
+  acc_out.SetValidRow(rows);
+  GmTileDyn<S, N> y_gm(y);
+  TASSIGN(y_gm, y);
+  y_gm.template SetShape<GlobalTensorDim::DIM_3>(rows);
+  TSTORE(y_gm, acc_out);
+}
+
 template <uint32_t N, uint32_t S>
 AICORE void runOnesided(__gm__ half *x, __gm__ half *h, __gm__ half *y,
                         uint32_t batch) {
@@ -481,13 +570,27 @@ AICORE void runOnesided(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   runTiles<N, S>(x, h, y, sample, end);
 }
 
+// Below kShortBatch the tile loop's tail trick has no room to back a tile up
+// to `end`, so that range gets runShort instead and the host needs no scratch.
+constexpr uint32_t kShortBatch = 16;
+
 #define FAST_HADAMARD_ONESIDED_DISPATCH_CASE(NVal, SVal) \
   case NVal:                                             \
-    runOnesided<NVal, SVal>(x, h, y, batch);             \
+    if (batch < kShortBatch) {                           \
+      if (get_block_idx() == 0) {                        \
+        runShort<NVal>(x, h, y, batch);                  \
+      }                                                  \
+    } else {                                             \
+      runOnesided<NVal, SVal>(x, h, y, batch);           \
+    }                                                    \
     return;
 
 AICORE void dispatchOnesided(__gm__ half *x, __gm__ half *h, __gm__ half *y,
                              uint32_t batch, uint32_t n) {
+  // Every transfer below needs a row count > 0, and an empty batch has no work.
+  if (batch == 0) {
+    return;
+  }
   switch (n) {
     FAST_HADAMARD_ONESIDED_CASES(FAST_HADAMARD_ONESIDED_DISPATCH_CASE)
     default:

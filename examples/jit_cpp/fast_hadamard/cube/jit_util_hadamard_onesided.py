@@ -25,12 +25,15 @@ MIN_ONESIDED_N = 64
 MAX_ONESIDED_N = 512
 
 # A tile's Rows is S here, and PTO requires 16-aligned rows (TMOV's TExtract
-# rejects even Rows == 1), so the kernel's smallest tile is 16 samples and it
-# needs batch >= 16. Shorter batches are padded up on the host.
+# rejects even Rows == 1), so the kernel's smallest tile is 16 samples. The TILE
+# is 16 rows; the TRANSFERS around it need not be, so a shorter batch is not
+# padded: the kernel routes it to runShort, which sets the GM row count on the
+# load and the valid row count on the store to the real batch. Kept here because
+# it is the kernel's routing threshold and the tests place batches either side
+# of it. See runShort for why the rows in between are safe to compute.
 MIN_ONESIDED_BATCH = 16
 
 _H_CACHE: dict = {}
-_PAD_CACHE: dict = {}
 
 # Samples per tile, mirroring FAST_HADAMARD_ONESIDED_CASES in the kernel. Only
 # N <= 128 follows S * N == PTO_OS_TILE_ELEMS; 256 and 512 run the blocked form
@@ -112,21 +115,6 @@ def hadamard_full(n: int, device, block: int | None = None):
     return cached
 
 
-def _pad_pair(n: int, device):
-    """Cached (x, y) scratch of MIN_ONESIDED_BATCH rows for short batches."""
-    key = (n, device)
-    cached = _PAD_CACHE.get(key)
-    if cached is None:
-        cached = (
-            torch.zeros((MIN_ONESIDED_BATCH, n), device=device,
-                        dtype=torch.float16),
-            torch.empty((MIN_ONESIDED_BATCH, n), device=device,
-                        dtype=torch.float16),
-        )
-        _PAD_CACHE[key] = cached
-    return cached
-
-
 def validate_onesided_hadamard_args(x, y):
     if x.dim() != 2 or y.dim() != 2:
         raise ValueError("x and y must be 2D tensors with shape [batch, n].")
@@ -186,15 +174,6 @@ def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE):
             raise ValueError("n must match the input tensor shape.")
 
         if resolved_batch == 0:
-            return
-        if resolved_batch < MIN_ONESIDED_BATCH:
-            # The smallest tile is 16 samples and the kernel's tail trick backs a
-            # tile up to `end`, which needs batch >= 16. Run the padded scratch
-            # instead; the rows past `batch` are zeros and are discarded.
-            px, py = _pad_pair(resolved_n, x.device)
-            px[:resolved_batch].copy_(x)
-            hadamard_func(px, py, block_dim=block_dim, stream_ptr=stream_ptr)
-            y.copy_(py[:resolved_batch])
             return
 
         launch_block_dim = (

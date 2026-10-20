@@ -253,6 +253,13 @@ still not amortised. The single cell where the size rule is not optimal is
 kernel's padded 2.18 us -- 0.22 us at a 2 us shape, inside what a per-library
 offset produces, so it is not worth a batch condition.
 
+**This table predates the bit-plan tile and the batch-aware N=512 routing**, so
+that weakest column has since improved: at batch 256 - 1024 the entry point now
+returns the bit-plan two-sided tile and reads 1.28x - 1.45x rather than 1.24x -
+1.26x. Every other column reproduces: re-measured at batch 1024, N=16384 is
+120.4 -> 44.3 us against the 120.5 -> 44.4 recorded here, and N=8192 is
+57.6 -> 16.0 against 57.6 -> 16.1.
+
 Two measurement notes. The vector kernel is **in place**, so relaunching it on
 one buffer makes its values diverge (`H*H = n*I`, and fp16 saturates to inf
 within a few reps); a control at N=4096 with a fresh buffer per launch read
@@ -263,11 +270,129 @@ kernels rather than a pool.
 
 ### Measured device time
 
+#### The full grid: which kernel wins where
+
+Every (N, batch) in the supported range, each kernel at the `block_dim` its own
+wrapper ships, msprof `op_summary`, median of 20 launches after 5 warmups.
+Microseconds; **bold** is the winner. "two-sided" is the wrapper as shipped, so
+at N=512 it is the bit-plan tile.
+
+| N | batch | vector | one-sided | two-sided | fastest | margin |
+|---:|------:|-------:|----------:|----------:|:--------|-------:|
+| 64 | 16 | 2.96 | 1.41 | n/a | **one-sided** | 2.10x |
+| 64 | 64 | 3.07 | 1.44 | n/a | **one-sided** | 2.13x |
+| 64 | 256 | 3.21 | 1.87 | n/a | **one-sided** | 1.72x |
+| 64 | 1024 | 3.90 | 2.01 | n/a | **one-sided** | 1.94x |
+| 64 | 4096 | 6.78 | 2.50 | n/a | **one-sided** | 2.71x |
+| 64 | 16384 | 18.11 | 3.30 | n/a | **one-sided** | 5.49x |
+| 128 | 16 | 3.01 | 1.66 | n/a | **one-sided** | 1.81x |
+| 128 | 64 | 3.02 | 1.90 | n/a | **one-sided** | 1.59x |
+| 128 | 256 | 3.36 | 2.35 | n/a | **one-sided** | 1.43x |
+| 128 | 1024 | 4.30 | 2.62 | n/a | **one-sided** | 1.64x |
+| 128 | 4096 | 7.90 | 3.59 | n/a | **one-sided** | 2.20x |
+| 128 | 16384 | 22.34 | 5.00 | n/a | **one-sided** | 4.47x |
+| 256 | 16 | 3.03 | 1.67 | 2.33 | **one-sided** | 1.40x |
+| 256 | 64 | 3.22 | 2.00 | 2.46 | **one-sided** | 1.23x |
+| 256 | 256 | 3.28 | 2.25 | 3.79 | **one-sided** | 1.46x |
+| 256 | 1024 | 4.17 | 2.90 | 6.20 | **one-sided** | 1.44x |
+| 256 | 4096 | 7.87 | 4.30 | 11.08 | **one-sided** | 1.83x |
+| 256 | 16384 | 22.67 | 8.91 | 20.66 | **one-sided** | 2.32x |
+| 512 | 16 | 3.15 | 2.19 | 2.26 | **one-sided** | 1.03x |
+| 512 | 64 | 3.20 | 2.35 | 2.54 | **one-sided** | 1.08x |
+| 512 | 256 | 3.70 | 2.94 | 2.88 | **two-sided** | 1.02x |
+| 512 | 1024 | 5.56 | 4.33 | 3.84 | **two-sided** | 1.13x |
+| 512 | 4096 | 12.45 | 8.86 | 6.30 | **two-sided** | 1.41x |
+| 512 | 16384 | 40.00 | 27.08 | 15.92 | **two-sided** | 1.70x |
+| 1024 | 16 | 3.25 | n/a | 2.00 | **two-sided** | 1.63x |
+| 1024 | 64 | 3.56 | n/a | 2.22 | **two-sided** | 1.60x |
+| 1024 | 256 | 4.47 | n/a | 2.81 | **two-sided** | 1.59x |
+| 1024 | 1024 | 8.43 | n/a | 4.72 | **two-sided** | 1.79x |
+| 1024 | 4096 | 23.71 | n/a | 10.86 | **two-sided** | 2.18x |
+| 1024 | 16384 | 84.54 | n/a | 35.38 | **two-sided** | 2.39x |
+| 2048 | 16 | 3.63 | n/a | 2.16 | **two-sided** | 1.68x |
+| 2048 | 64 | 4.15 | n/a | 2.49 | **two-sided** | 1.67x |
+| 2048 | 256 | 6.28 | n/a | 3.46 | **two-sided** | 1.81x |
+| 2048 | 1024 | 14.76 | n/a | 6.04 | **two-sided** | 2.44x |
+| 2048 | 4096 | 48.19 | n/a | 15.96 | **two-sided** | 3.02x |
+| 2048 | 16384 | 186.20 | n/a | 56.26 | **two-sided** | 3.31x |
+| 4096 | 16 | 4.25 | n/a | 2.39 | **two-sided** | 1.78x |
+| 4096 | 64 | 5.42 | n/a | 2.85 | **two-sided** | 1.90x |
+| 4096 | 256 | 10.18 | n/a | 4.52 | **two-sided** | 2.25x |
+| 4096 | 1024 | 28.47 | n/a | 9.36 | **two-sided** | 3.04x |
+| 4096 | 4096 | 101.34 | n/a | 29.16 | **two-sided** | 3.48x |
+| 4096 | 16384 | 397.29 | n/a | 215.43 | **two-sided** | 1.84x |
+| 8192 | 16 | 5.62 | n/a | 2.82 | **two-sided** | 1.99x |
+| 8192 | 64 | 8.10 | n/a | 3.80 | **two-sided** | 2.13x |
+| 8192 | 256 | 18.02 | n/a | 6.34 | **two-sided** | 2.84x |
+| 8192 | 1024 | 57.55 | n/a | 16.04 | **two-sided** | 3.59x |
+| 8192 | 4096 | 219.51 | n/a | 54.90 | **two-sided** | 4.00x |
+| 8192 | 16384 | 852.17 | n/a | 456.98 | **two-sided** | 1.86x |
+| 16384 | 16 | 8.41 | n/a | 4.50 | **two-sided** | 1.87x |
+| 16384 | 64 | 13.94 | n/a | 6.00 | **two-sided** | 2.32x |
+| 16384 | 256 | 35.30 | n/a | 13.74 | **two-sided** | 2.57x |
+| 16384 | 1024 | 120.40 | n/a | 44.28 | **two-sided** | 2.72x |
+| 16384 | 4096 | 464.79 | n/a | 193.44 | **two-sided** | 2.40x |
+| 16384 | 16384 | 1827.18 | n/a | 920.43 | **two-sided** | 1.99x |
+| 32768 | 16 | n/a | n/a | 5.46 | **two-sided** | -- |
+| 32768 | 64 | n/a | n/a | 11.82 | **two-sided** | -- |
+| 32768 | 256 | n/a | n/a | 36.00 | **two-sided** | -- |
+| 32768 | 1024 | n/a | n/a | 132.96 | **two-sided** | -- |
+| 32768 | 4096 | n/a | n/a | 525.44 | **two-sided** | -- |
+| 32768 | 16384 | n/a | n/a | 2086.01 | **two-sided** | -- |
+
+Reading it:
+
+- **`N <= 256`: the one-sided kernel wins everywhere**, by 1.23x - 2.58x over
+  the two-sided split and 1.43x - 5.49x over the vector butterfly. Its tile
+  touches each pipe once; at these sizes the extra `sqrt(N)/2` MACs are cheaper
+  than the two-sided tile's L1 turnaround.
+- **`N = 512` is the one crossover, and batch decides it.** One-sided wins at
+  batch 16 and 64 (1.03x, 1.08x); the two-sided bit-plan tile wins from batch
+  256 up (1.02x, 1.13x, 1.41x, 1.70x). `BITPLAN_BATCH_MIN = 256` in `auto/` is
+  exactly this boundary, and the 1.02x at the boundary itself says the fit is
+  tight rather than lucky.
+- **`N >= 1024`: the two-sided split wins everywhere**, 1.59x - 4.00x over the
+  vector kernel. The one-sided product's `N*N` MACs grow 4x per doubling against
+  2x for its bytes, which is why its table stops at 512.
+- **`auto` picks the faster of the two cube kernels at all 60 shapes**, the
+  N=512 boundary included.
+- **The vector kernel wins 0 of the 54 cells it can run.** It does beat the
+  *two-sided* kernel in three of them -- N=256 at batch 256, 1024 and 4096, by
+  1.16x, 1.49x and 1.41x, the weak case analysed below -- but the one-sided
+  kernel is faster than both there, so it never takes a cell outright. It
+  remains the only kernel for `N < 64`.
+- Overall: **one-sided takes 20 of the 60 cells, two-sided 40.**
+
+#### One host-side cost the device-time grid hides: `batch < 16`
+
+The one-sided kernel's smallest tile is 16 samples, so its wrapper pads a
+shorter batch into a cached 16-row scratch. That costs two extra torch copies
+around the launch, and each one forces another `torch_npu` task-queue drain:
+wall-clock goes from ~63 us at `batch >= 16` to **243 - 279 us below it**,
+against ~57 - 59 us for the vector kernel at the same shapes. Device time is
+unchanged -- the kernel still runs one 16-sample tile -- so this does not appear
+anywhere in the grid above.
+
+It matters because `auto` routes every `N <= 512` to this kernel, so at
+`batch < 16` the dispatcher returns the kernel that is ~4.3x slower in
+wall-clock while being 1.4 - 2.1x faster on device. If short batches are a real
+workload, the fix is to pad without the round trip (launch directly on a
+16-row view of a caller-sized allocation), not to re-route.
+
+Bandwidth shows where the two-sided margin comes from and where it goes: the
+cube path peaks at **2.30 - 2.45 TB/s** while the working set (`2*N*batch*2`
+bytes) stays under ~134 MB and settles at **1.0 - 1.2 TB/s** past that, as L2
+stops absorbing the traffic. The vector kernel never exceeds ~800 GB/s at any
+footprint, so the ratio compresses from ~4x to ~1.9x at the largest shapes
+without either kernel changing behaviour.
+
+#### The two-sided-vs-vector ratio, at a wider batch range
+
 msprof `op_summary`, median of 20 launches over 3 interleaved passes, 910B2,
-with the shipped `block_dim` schedule. The ratio is `vector_us / cube_us`, so
-**above 1.0 means the cube kernel is faster** and below 1.0 means the vector
-kernel in `standard/` wins. The `cube_speedup_vs_vector` column in the CSV uses
-the same convention.
+with the shipped `block_dim` schedule. The ratio is `vector_us / twosided_us`,
+so **above 1.0 means the two-sided kernel is faster** and below 1.0 means the
+vector kernel in `standard/` wins. The `twosided_speedup_vs_vector` column in
+the CSV uses the same convention.
 
 | batch | N=256 | N=1024 | N=4096 |
 |------:|------:|-------:|-------:|
@@ -289,7 +414,8 @@ exactly the problem. See **Why N=256 is the weak case** below. The alternative
 for small `N` is the one-sided `Y = X * H_N` product, which trades 8x the FLOPs
 for a tile body that touches each pipe once; that lives in the one-sided kernel rather
 than here, because it is no longer the two-sided split this kernel is about, and
-it is 1.25x - 2.44x faster than this kernel at every `N <= 512`.
+it is 1.23x - 2.58x faster than this kernel at `N <= 256`, and faster at N=512
+too until the bit-plan tile turns that size around at batch 256.
 
 ### Why N=256 is the weak case
 
@@ -913,6 +1039,14 @@ share (geomean 1.69x). N=512 is the size that changed: it was 0.58x - 0.78x of
 the vector kernel and 0.54x of the two-sided one, and is now 1.28x - 1.50x and
 1.11x - 2.44x. The kernel also covers N=64 and N=128, which the two-sided split
 cannot reach at all (it needs `N = R * C` with both factors 16-aligned).
+
+**The two-sided column here is the CLASSIC path**, which is what that kernel ran
+when this table was measured. At N=512 it now ships the bit-plan tile instead,
+and that reverses the last two rows: from batch 256 up the two-sided kernel is
+1.02x - 1.70x FASTER, which is why `auto` routes N=512 by batch. N <= 256 is
+unaffected -- the bit-plan has no entry there -- and the one-sided kernel still
+wins every shape at those sizes. See the full grid under **Measured device
+time**.
 
 Against the previous dense-H version of this same kernel, paired with the tile
 geometry and `block_dim` retune the change licensed: **1.33x - 1.56x at N=256,
