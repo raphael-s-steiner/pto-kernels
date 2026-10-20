@@ -275,13 +275,14 @@ AICORE void loadHadamard(__gm__ half *h) {
 
 // GM -> L1 X slot, signalling MTE2->MTE1. The caller already holds the slot.
 template <uint32_t N, uint32_t S, uint32_t Slot, event_t EvX>
-AICORE void issueTileLoad(__gm__ half *x, uint32_t sample) {
+AICORE void issueTileLoad(__gm__ half *x, uint32_t sample, uint32_t rows) {
   using L = Layout<N, S>;
 
   wait_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // slot free
 
-  MatTile<S, N> x_l1;
+  MatTileV<S, N, DYNAMIC> x_l1;
   TASSIGN(x_l1, L::xSlot(Slot));
+  x_l1.SetValidRow(rows);
   __gm__ half *x_tile = x + sample * N;
 
   // A CONVERTING ND->NZ load, and it cannot be made conversion-free. H_N is a
@@ -296,8 +297,9 @@ AICORE void issueTileLoad(__gm__ half *x, uint32_t sample) {
   // NZ, p[0,4) under ND, both non-empty for every N in the table. Covering both
   // means a left multiply as well, which is the two-sided kernel: "one-sided"
   // and "conversion-free GM transfers" are mutually exclusive by construction.
-  GmTile<S, N> x_gm(x_tile);
+  GmTileDyn<S, N> x_gm(x_tile);
   TASSIGN(x_gm, x_tile);
+  x_gm.template SetShape<GlobalTensorDim::DIM_3>(rows);
   TLOAD(x_l1, x_gm);
   set_flag(PIPE_MTE2, PIPE_MTE1, EvX);
 }
@@ -340,7 +342,8 @@ AICORE void blockStep(unsigned accBase, uint32_t i) {
 // is never stuck behind this tile's matmul.
 template <uint32_t N, uint32_t S, uint32_t Slot, bool Par, event_t EvX,
           event_t EvA>
-AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample) {
+AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample,
+                         uint32_t rows) {
   using L = Layout<N, S>;
 
   wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);  // this tile's load has landed
@@ -379,10 +382,16 @@ AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample) {
   }
   Sync<PIPE_M, PIPE_FIX>();
 
+  // The cube ran all S rows whatever `rows` says -- the transform is per-sample,
+  // so the rows past `rows` only reach output rows that are never stored.
+  TileAcc<float, S, N, DYNAMIC> acc_out;
+  TASSIGN(acc_out, L::l0cAcc(Par));
+  acc_out.SetValidRow(rows);
   __gm__ half *y_tile = y + sample * N;
-  GmTile<S, N> y_gm(y_tile);
+  GmTileDyn<S, N> y_gm(y_tile);
   TASSIGN(y_gm, y_tile);
-  TSTORE(y_gm, acc);
+  y_gm.template SetShape<GlobalTensorDim::DIM_3>(rows);
+  TSTORE(y_gm, acc_out);
   set_flag(PIPE_FIX, PIPE_M, EV_ACC);
 }
 
@@ -455,74 +464,86 @@ AICORE void partialTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   Sync<PIPE_FIX, PIPE_M>(7);
 }
 
-// A core's whole span as ONE ring: m = ceil(span / S) tiles, the LAST of them
-// BACKED UP to finish exactly at `end` rather than running off it.
+// A core's span as ONE ring of `m` tiles, every one at its natural position
+// and every one MASKED to `rowsAt` rows.
 //
-// The back-up overlaps its predecessor by (-span) mod S rows, and those rows
-// are recomputed and stored twice. That is safe for two reasons and both are
-// load-bearing: the transform is per-SAMPLE, so a duplicated row gets the same
-// bytes both times, and FIX retires a core's stores in issue order, so the
-// second write of a row cannot be overtaken by the first. It also stays inside
-// the core's own range -- `end - S >= base` is exactly the `span >= S` guard in
-// runTiles -- so no core ever writes into another's rows, and `block_dim`
-// cannot change a single output byte (test_block_dim_does_not_change_result).
-// When span is a whole multiple of S the back-up is the natural position and
-// nothing is duplicated at all.
+// A full tile is simply the case where that min picks S, so there is no special
+// last tile: no back-up, no duplicated rows, and no separate remainder unit
+// behind its own prime and drain. The remainder is an ordinary ring tile, which
+// means it overlaps its predecessor like any other, and it is a FULL-SIZE S
+// tile with a short transfer rather than a small tile of its own.
 //
-// The point of it is that the remainder rides the ring as an ordinary tile: it
-// is pipelined against its predecessor instead of being a separate unit behind
-// its own prime and drain. See `runTiles` for what this replaced.
+// The masking is free on the transfers -- an ND->NZ load moves the GM source's
+// row count and TSTORE moves `src.GetValidRow()` -- but not on the tile: the
+// cube runs all S rows regardless. That costs nothing here because the only
+// tile ever short is the last one, and it is overlapped.
 template <uint32_t N, uint32_t S>
 AICORE void runRing(__gm__ half *x, __gm__ half *h, __gm__ half *y,
-                    uint32_t base, uint32_t end, uint32_t m) {
-  {
-    set_flag(PIPE_MTE1, PIPE_MTE2, EV_X0);  // all four slots start free
-    set_flag(PIPE_MTE1, PIPE_MTE2, EV_X1);
-    set_flag(PIPE_MTE1, PIPE_MTE2, EV_X2);
-    set_flag(PIPE_MTE1, PIPE_MTE2, EV_X3);
-    set_flag(PIPE_FIX, PIPE_M, EV_ACC);  // one credit per accumulator slot
-    if constexpr (Layout<N, S>::kAccSlots == 2u) {
-      set_flag(PIPE_FIX, PIPE_M, EV_ACC);
-    }
-    set_flag(PIPE_M, PIPE_MTE1, EV_A0);  // both L0A/L0B slots start free
-    set_flag(PIPE_M, PIPE_MTE1, EV_A1);
+                    uint32_t base, uint32_t end) {
+  // The span fixes the tile count, so the caller has nothing to pass but the
+  // range. Exactly ONE tile is ever short -- tile `last`, with `rest` rows --
+  // so every row count below is a pick between `rest` and the constant S, and
+  // there is no arithmetic per tile.
+  const uint32_t span = end - base;
+  const uint32_t last = (span - 1) / S;        // span >= S, so this is m - 1
+  const uint32_t rest = span - last * S;       // 1..S
 
-    issueTileLoad<N, S, 0, EV_X0>(x, (0 + 1 < m ? base + 0 * S : end - S));
-    if (m > 1) issueTileLoad<N, S, 1, EV_X1>(x, (1 + 1 < m ? base + 1 * S : end - S));
-    if (m > 2) issueTileLoad<N, S, 2, EV_X2>(x, (2 + 1 < m ? base + 2 * S : end - S));
-
-    for (uint32_t i = 0; i < m; ++i) {
-      switch (i & 3u) {
-        case 0:
-          if (i + 3 < m) issueTileLoad<N, S, 3, EV_X3>(x, ((i + 3) + 1 < m ? base + (i + 3) * S : end - S));
-          onesidedTile<N, S, 0, false, EV_X0, EV_A0>(h, y, (i + 1 < m ? base + i * S : end - S));
-          break;
-        case 1:
-          if (i + 3 < m) issueTileLoad<N, S, 0, EV_X0>(x, ((i + 3) + 1 < m ? base + (i + 3) * S : end - S));
-          onesidedTile<N, S, 1, true, EV_X1, EV_A1>(h, y, (i + 1 < m ? base + i * S : end - S));
-          break;
-        case 2:
-          if (i + 3 < m) issueTileLoad<N, S, 1, EV_X1>(x, ((i + 3) + 1 < m ? base + (i + 3) * S : end - S));
-          onesidedTile<N, S, 2, false, EV_X2, EV_A0>(h, y, (i + 1 < m ? base + i * S : end - S));
-          break;
-        default:
-          if (i + 3 < m) issueTileLoad<N, S, 2, EV_X2>(x, ((i + 3) + 1 < m ? base + (i + 3) * S : end - S));
-          onesidedTile<N, S, 3, true, EV_X3, EV_A1>(h, y, (i + 1 < m ? base + i * S : end - S));
-          break;
-      }
-    }
-
-    wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X0);  // drain the four primes
-    wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X1);
-    wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X2);
-    wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X3);
-    wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
-    if constexpr (Layout<N, S>::kAccSlots == 2u) {
-      wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
-    }
-    wait_flag(PIPE_M, PIPE_MTE1, EV_A0);
-    wait_flag(PIPE_M, PIPE_MTE1, EV_A1);
+  set_flag(PIPE_MTE1, PIPE_MTE2, EV_X0);  // all four slots start free
+  set_flag(PIPE_MTE1, PIPE_MTE2, EV_X1);
+  set_flag(PIPE_MTE1, PIPE_MTE2, EV_X2);
+  set_flag(PIPE_MTE1, PIPE_MTE2, EV_X3);
+  set_flag(PIPE_FIX, PIPE_M, EV_ACC);  // one credit per accumulator slot
+  if constexpr (Layout<N, S>::kAccSlots == 2u) {
+    set_flag(PIPE_FIX, PIPE_M, EV_ACC);
   }
+  set_flag(PIPE_M, PIPE_MTE1, EV_A0);  // both L0A/L0B slots start free
+  set_flag(PIPE_M, PIPE_MTE1, EV_A1);
+
+  issueTileLoad<N, S, 0, EV_X0>(x, base, last == 0 ? rest : S);
+  if (last > 0) issueTileLoad<N, S, 1, EV_X1>(x, base + S, last == 1 ? rest : S);
+  if (last > 1) issueTileLoad<N, S, 2, EV_X2>(x, base + 2 * S, last == 2 ? rest : S);
+
+  for (uint32_t i = 0; i <= last; ++i) {
+    // Slot and accumulator parity follow i, and the flag ids must be literal,
+    // so the loop is a four-way switch over i mod 4. Each arm prefetches the
+    // tile three ahead, if there is one, and runs tile i.
+    const uint32_t cur = base + i * S;
+    const uint32_t crow = (i == last) ? rest : S;
+    // `next` and `nrow` are only read under `prefetch`, so neither needs a
+    // guard of its own -- an address three tiles past the end is never used.
+    const bool prefetch = (i + 3 <= last);
+    const uint32_t next = cur + 3 * S;
+    const uint32_t nrow = (i + 3 == last) ? rest : S;
+    switch (i & 3u) {
+      case 0:
+        if (prefetch) issueTileLoad<N, S, 3, EV_X3>(x, next, nrow);
+        onesidedTile<N, S, 0, false, EV_X0, EV_A0>(h, y, cur, crow);
+        break;
+      case 1:
+        if (prefetch) issueTileLoad<N, S, 0, EV_X0>(x, next, nrow);
+        onesidedTile<N, S, 1, true, EV_X1, EV_A1>(h, y, cur, crow);
+        break;
+      case 2:
+        if (prefetch) issueTileLoad<N, S, 1, EV_X1>(x, next, nrow);
+        onesidedTile<N, S, 2, false, EV_X2, EV_A0>(h, y, cur, crow);
+        break;
+      default:
+        if (prefetch) issueTileLoad<N, S, 2, EV_X2>(x, next, nrow);
+        onesidedTile<N, S, 3, true, EV_X3, EV_A1>(h, y, cur, crow);
+        break;
+    }
+  }
+
+  wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X0);  // drain the four primes
+  wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X1);
+  wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X2);
+  wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X3);
+  wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
+  if constexpr (Layout<N, S>::kAccSlots == 2u) {
+    wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
+  }
+  wait_flag(PIPE_M, PIPE_MTE1, EV_A0);
+  wait_flag(PIPE_M, PIPE_MTE1, EV_A1);
 }
 
 // One masked tile at the SMALLEST instantiated tile size that covers `rows`.
@@ -549,10 +570,16 @@ AICORE void maskedTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   partialTile<N, S>(x, h, y, sample, rows);
 }
 
-// Consume [sample, end) as exactly ONE unit of work: a ring of whole tiles with
-// its last one backed up, or -- when the span is shorter than a single tile --
-// one masked tile. Either way nothing is left over, so there is no second unit
-// and no chain of them.
+// Consume [sample, end) as exactly ONE unit of work: a ring whose every tile
+// carries its own row count, or -- when the span is shorter than a single tile
+// -- one standalone masked tile. Either way nothing is left over, so there is
+// no second unit and no chain of them.
+//
+// The two arms exist because a LONE tile has nothing to overlap. Inside the
+// ring the short tile is free, since it pipelines against its predecessor; on
+// its own it would pay the ring's prime and drain for no overlap at all, which
+// measured 1.05-1.11x. Hence: ring when there is something to overlap with,
+// standalone when there is not.
 //
 // This replaced a recursive power-of-two HALVING chain: run span/S whole tiles,
 // then tail-recurse on S/2, down to 16, and mask the last 1..15 rows. That was
@@ -577,17 +604,28 @@ AICORE void maskedTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
 // 255-sample span lose to four serialized big ones, and a two-level form (S
 // then 16) measured 0.78-0.86x -- slower than the chain it was meant to fix.
 // The short span wants ONE big masked tile, which is what maskedTile gives it.
+//
+// Two further shapes were built and measured before this one was settled on,
+// and both are worse. Running the ring over WHOLE tiles only and leaving the
+// remainder to a standalone maskedTile is simpler still, but the remainder
+// then overlaps nothing: 1.045x and 1.071x at N=64, where S = 256 makes it a
+// large un-overlapped tile. Putting EVERY span through the ring, the short
+// ones included, fixes that but loses the other end, 1.05-1.11x on spans below
+// one tile. The split above takes the better arm of each.
 template <uint32_t N, uint32_t S>
 AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
                      uint32_t &sample, uint32_t end) {
   const uint32_t base = sample;
   const uint32_t span = end - base;
-  if (span == 0) {
-    return;
-  }
   if (span >= S) {
-    runRing<N, S>(x, h, y, base, end, (span + S - 1) / S);
-  } else {
+    // The mask rides the RING: every tile is full-size S and carries its own
+    // row count, so the remainder is an ordinary ring tile rather than a
+    // separate drained unit -- and nothing is recomputed.
+    runRing<N, S>(x, h, y, base, end);
+  } else if (span > 0) {
+    // A span shorter than one tile is a single tile either way, and a lone
+    // tile has nothing to overlap, so it skips the ring's prime/drain and runs
+    // standalone. Putting it through the ring instead measured 1.05-1.11x.
     maskedTile<N, S>(x, h, y, base, span);
   }
   sample = end;

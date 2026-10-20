@@ -1173,18 +1173,31 @@ full prime/ring/drain for a single tile with no predecessor to overlap it, and a
 
 The replacement makes a core's span exactly **one** unit of work:
 
-- `span >= S`: `m = ceil(span/S)` tiles through the existing 4-deep ring, with
-  the **last tile backed up** to finish at `end`. The remainder rides the ring
-  as an ordinary tile instead of being a second unit behind its own drain.
-- `span < S`: **one** masked tile, at the smallest instantiated tile size that
-  covers the span, masked exactly as `partialTile` already did.
+- `span >= S`: `m = ceil(span/S)` tiles through the existing 4-deep ring, every
+  tile at its natural position and every tile carrying its own row count,
+  `min(S, end - start)`. A full tile is just the case where that min picks `S`,
+  so there is no special last tile and the remainder is an ordinary ring tile —
+  overlapped like any other, and a **full-size `S` tile with a short transfer**
+  rather than a small tile of its own.
+- `span < S`: **one** standalone masked tile, at the smallest instantiated tile
+  size that covers the span.
 
-The back-up recomputes `(-span) mod S` rows and stores them twice. That is safe
-because the transform is per-**sample** (a duplicated row gets the same bytes
-both times) and FIX retires a core's stores in issue order; and it stays inside
-the core's own range, because `end - S >= base` *is* the `span >= S` guard. So
-`block_dim` still cannot change an output byte. When the span is a whole
-multiple of `S` the back-up is the natural position and nothing is duplicated.
+The two arms exist because a **lone** tile has nothing to overlap. Inside the
+ring a short tile is free; on its own it would pay the ring's prime and drain
+for no overlap at all. Both ends were measured, and each loses at the other's
+end of the range:
+
+| shape of `runTiles` | mixed span (whole tiles + remainder) | span < one tile |
+|---|---|---|
+| ring over whole tiles, remainder standalone | **1.045x / 1.071x slower** at N=64 | parity |
+| every span through the ring | parity or faster | **1.05x - 1.11x slower** |
+| **the split above** | **parity or faster** | **parity** |
+
+0 regressions over 29 shapes against the first shipped form of this change, and
+0.974x - 0.99x on the N=64 mixed cases. Earlier revisions of this kernel instead
+backed the last tile up to `end` and recomputed the overlap; masking it is the
+same speed, duplicates no rows, and drops the address-rewriting helper the
+back-up needed.
 
 msprof device time, median of 3 interleaved passes of 30 reps, scheduled
 `block_dim`, old -> new:
@@ -1214,14 +1227,16 @@ and the other two are independent of how the span was divided:
    instead is **1.35x at N=512 and 1.14x at N=256** -- at N=512, where no chain
    ever existed. This was the cheapest single fix on the list.
 3. The remainder being a drained standalone unit when the core also has whole
-   tiles; the back-up folds it into the ring (1.20x - 1.34x).
+   tiles; folding it into the ring is worth 1.20x - 1.34x. **This is the one
+   that decides the shape of `runTiles`** -- it is why the remainder is a
+   masked ring tile and not a tile of its own.
 
 **Halving back down is not the cheap alternative it looks like.** A 16-row ring
 tile costs ~0.11 us at the margin, so the 15 small tiles covering a 255-sample
 span lose to four serialized big ones. A two-level form (`S` then 16) measured
 **0.78x - 0.86x** -- slower than the chain it was meant to fix -- and so did a
-back-up with a 16-level fallback (0.86x - 0.91x). A short span wants ONE big
-masked tile.
+form that covered the remainder with extra 16-row tiles (0.86x - 0.91x). A
+short span wants ONE big masked tile.
 
 **Masking is free on the transfers but not on the tile**: the cube runs all `S`
 rows whatever the row count says. A 1..15 row span in an `S = 256` tile wastes

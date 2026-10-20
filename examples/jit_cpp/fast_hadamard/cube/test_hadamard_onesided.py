@@ -157,15 +157,15 @@ def test_sample_tile_boundaries(onesided_hadamard_kernel, npu_device, n):
 
 
 @pytest.mark.parametrize("n", TEST_HIDDEN_DIMS)
-def test_backed_up_tail(onesided_hadamard_kernel, npu_device, n):
-    """A core whose span is not a whole number of tiles covers the remainder by
-    backing its LAST tile up to end, so up to S-1 samples are recomputed and
-    stored twice. Both stores must write the same bytes.
+def test_unaligned_tail(onesided_hadamard_kernel, npu_device, n):
+    """A core whose span is not a whole number of tiles covers the remainder
+    with a SHORT last ring tile: a full-size tile whose load and store carry a
+    row count of 1..S-1. Nothing outside the span may be read or written, and
+    the rows past the row count must not leak into the output.
 
-    The duplicated rows are what this is really testing, so the batches below
-    have to straddle a tile boundary rather than merely a 16-row one: a span
-    shorter than one tile takes the masked path instead and duplicates
-    nothing."""
+    The batches below straddle a tile boundary rather than merely a 16-row one,
+    so the short tile really is the last of several and has a predecessor to
+    overlap; a span shorter than one tile takes the standalone path instead."""
     s = samples_per_tile(n)
     batches = sorted(
         {
