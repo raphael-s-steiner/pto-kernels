@@ -98,8 +98,16 @@ constexpr uint32_t L0C_BYTES = 128 * 1024;
 #define EV_PB0 EVENT_ID6  // deep: phase B, even tile
 #define EV_PB1 EVENT_ID7  // deep: phase B, odd tile
 
+// Intra-tile sequencing. A credit is keyed on the SOURCE pipe and the id, not
+// on the destination, so an id is safe only if no other channel out of the
+// same source pipe carries it on the same path. Every Sync below is in a
+// shallow body or in loadHadamardFactors, and the shallow path spends ids 1-7
+// out of MTE2/MTE1/M/FIX (EV_X*, EV_ACC, EV_SW*, EV_SRA*) and never 0 -- which
+// is what makes 0 correct here, and why it is written rather than defaulted.
+#define EV_SEQ EVENT_ID0
+
 template <pipe_t SrcPipe, pipe_t DstPipe>
-AICORE inline void Sync(uint32_t id = 0) {
+AICORE inline void Sync(uint32_t id) {
   set_flag(SrcPipe, DstPipe, static_cast<event_t>(id));
   wait_flag(SrcPipe, DstPipe, static_cast<event_t>(id));
 }
@@ -120,6 +128,33 @@ template <uint32_t Rows, uint32_t Cols>
 using GmTile =
     GlobalTensor<half, TileShape2D<half, Rows, Cols, Layout::ND>,
                  BaseShape2D<half, Rows, Cols, Layout::ND>, Layout::ND>;
+
+// A tile's Rows is a template parameter but the TRANSFERS around it are not,
+// so a full-size tile can load and store fewer rows than it computes. That is
+// what lets one masked ring tile carry a core's 1..S-1 sample remainder and
+// deletes the power-of-two halving chain below. A two-sided tile is S samples
+// of R matrix rows each, so a row count is always a multiple of R and stays
+// 16-aligned whatever the sample count is.
+template <uint32_t Rows, uint32_t Cols, int RowValid>
+using MatTileV = Tile<TileType::Mat, half, Rows, Cols, BLayout::ColMajor,
+                      RowValid, Cols, SLayout::RowMajor, 512>;
+
+template <uint32_t Rows, uint32_t Cols>
+using GmTileDyn =
+    GlobalTensor<half, TileShape2D<half, DYNAMIC, Cols, Layout::ND>,
+                 BaseShape2D<half, Rows, Cols, Layout::ND>, Layout::ND>;
+
+// The NZ view has to stay NZ when the tile is masked. A C == 16 tile is a
+// SINGLE block-column, so an ND transfer of it is a 32-byte-per-row gather
+// rather than one burst -- dropping to GmTileDyn for the short tile measured
+// 0.49x - 0.78x at N=256 and nothing anywhere else, because N=256 is the only
+// size with C == 16. The two layouts index their shape differently:
+// ND is Shape<1,1,1,rows,cols> so the row count is DIM_3, while NZ is
+// Shape<1,cols/C0,rows/16,16,C0> so it is DIM_2 and counts FRACTALS.
+template <uint32_t Rows, uint32_t Cols>
+using GmNzDyn = GlobalTensor<half, TileShape2D<half, DYNAMIC, Cols, Layout::NZ>,
+                             BaseShape2D<half, Rows, Cols, Layout::NZ>,
+                             Layout::NZ>;
 
 // Buffer map. Addresses that hold the two Hadamard factors must not depend on
 // S: they are loaded once and reused by every tile size the driver picks.
@@ -313,7 +348,7 @@ AICORE void loadHadamardFactors(__gm__ half *h_left, __gm__ half *h_right) {
     TASSIGN(hc_gm, h_right);
     TLOAD(hc_l1, hc_gm);
   }
-  Sync<PIPE_MTE2, PIPE_MTE1>();
+  Sync<PIPE_MTE2, PIPE_MTE1>(EV_SEQ);
 
   if constexpr (L::kBlkB) {
     for (uint32_t neg = 0; neg < 2; ++neg) {
@@ -345,7 +380,7 @@ AICORE void loadHadamardFactors(__gm__ half *h_left, __gm__ half *h_right) {
     TASSIGN(hc_l0, L::kL0bHc);
     TMOV(hc_l0, hc_l1);
   }
-  Sync<PIPE_MTE1, PIPE_M>();
+  Sync<PIPE_MTE1, PIPE_M>(EV_SEQ);
 }
 
 // One column block of the blocked shallow right multiply. Slot and flag ids
@@ -369,14 +404,41 @@ AICORE inline uint32_t blockSign(uint32_t i, uint32_t j) {
 // Issue the GM->L1 load for one tile into slot `pong` and signal MTE2->MTE1.
 // The caller must already hold the slot (MTE1->MTE2 on the same event).
 template <uint32_t R, uint32_t C, uint32_t S, uint32_t Slot, event_t EvX>
-AICORE void issueTileLoad(__gm__ half *x, uint32_t sample) {
+AICORE void issueTileLoad(__gm__ half *x, uint32_t sample, uint32_t rows,
+                          bool waitSlot) {
   using L = Layout<R, C, S>;
 
-  wait_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // slot free
+  if (waitSlot) wait_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // slot free
+
+  __gm__ half *x_tile = x + sample * L::kN;
+
+  // At most ONE tile per core is ever short, so this branch is taken once a
+  // launch and never at S == 1, where a tile is a single sample.
+  if constexpr (S > 1) {
+    if (rows != S) {
+      // Masked, but on the SAME layout the full tile uses -- a short tile is
+      // not a reason to give up the burst.
+      MatTileV<L::kStackRows, C, DYNAMIC> x_l1;
+      TASSIGN(x_l1, L::xSlot(Slot));
+      x_l1.SetValidRow(rows * R);
+      if constexpr (L::kNzGm) {
+        GmNzDyn<L::kStackRows, C> x_gm(x_tile);
+        TASSIGN(x_gm, x_tile);
+        x_gm.template SetShape<GlobalTensorDim::DIM_2>(rows * R / 16);
+        TLOAD(x_l1, x_gm);
+      } else {
+        GmTileDyn<L::kStackRows, C> x_gm(x_tile);
+        TASSIGN(x_gm, x_tile);
+        x_gm.template SetShape<GlobalTensorDim::DIM_3>(rows * R);
+        TLOAD(x_l1, x_gm);
+      }
+      set_flag(PIPE_MTE2, PIPE_MTE1, EvX);
+      return;
+    }
+  }
 
   MatTile<L::kStackRows, C> x_l1;
   TASSIGN(x_l1, L::xSlot(Slot));
-  __gm__ half *x_tile = x + sample * L::kN;
 
   if constexpr (L::kNzGm) {
     // One contiguous burst instead of the default ND2NZ gather. At C == 16 a
@@ -396,7 +458,8 @@ AICORE void issueTileLoad(__gm__ half *x, uint32_t sample) {
 // Y[sample .. sample+S) = H_R * X * H_C, for a tile whose load has already
 // been issued into slot Pong.
 template <uint32_t R, uint32_t C, uint32_t S, bool Pong, event_t EvX>
-AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
+AICORE void hadamardTile(__gm__ half *y, uint32_t sample, bool freeSlot,
+                         bool waitAcc, bool freeAcc) {
   using L = Layout<R, C, S>;
   constexpr uint32_t kStackRows = L::kStackRows;
 
@@ -416,15 +479,15 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
     TASSIGN(x_cat, L::xSlot(Pong ? 1u : 0u));  // same bytes as x_l1, read the other way
     TASSIGN(x_l0b, L::kL0bT);
     TMOV(x_l0b, x_cat);
-    set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // slot free for the load after next
-    Sync<PIPE_MTE1, PIPE_M>();
+    if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // load after next
+    Sync<PIPE_MTE1, PIPE_M>(EV_SEQ);
 
     TileLeft<half, R, R> hl_l0;
     TileAcc<float, R, kCat> acc_cat;
     TASSIGN(hl_l0, L::kL0aHl);
     TASSIGN(acc_cat, L::kL0cStack);
     TMATMUL(acc_cat, hl_l0, x_l0b);
-    Sync<PIPE_M, PIPE_FIX>();
+    Sync<PIPE_M, PIPE_FIX>(EV_SEQ);
 
     // Same reinterpret on the accumulator: an Acc fractal is 16x16 fp32, so
     // (R x S*R) and (S*R x R) are again one block-column of S fractals.
@@ -433,20 +496,20 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
     TASSIGN(acc_vert, L::kL0cStack);
     TASSIGN(t_l1, L::kL1T);
     TMOV(t_l1, acc_vert);
-    Sync<PIPE_FIX, PIPE_MTE1>();
+    Sync<PIPE_FIX, PIPE_MTE1>(EV_SEQ);
 
     TileLeft<half, kStackRows, C> t_l0a;
     TASSIGN(t_l0a, L::kL0aX);
     TMOV(t_l0a, t_l1);
-    Sync<PIPE_MTE1, PIPE_M>();
+    Sync<PIPE_MTE1, PIPE_M>(EV_SEQ);
 
     TileRight<half, C, C> hc_l0;
     TileAcc<float, kStackRows, C> acc_out;
     TASSIGN(hc_l0, L::kL0bHc);
     TASSIGN(acc_out, L::kL0cCat);
-    wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous tile's TSTORE has drained
+    if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous tile's TSTORE has drained
     TMATMUL(acc_out, t_l0a, hc_l0);
-    Sync<PIPE_M, PIPE_FIX>();
+    Sync<PIPE_M, PIPE_FIX>(EV_SEQ);
 
     __gm__ half *y_tile = y + sample * L::kN;
     if constexpr (L::kNzGm) {
@@ -458,7 +521,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
       TASSIGN(y_gm, y_tile);
       TSTORE(y_gm, acc_out);
     }
-    set_flag(PIPE_FIX, PIPE_M, EV_ACC);
+    if (freeAcc) set_flag(PIPE_FIX, PIPE_M, EV_ACC);
   } else if constexpr (L::kBlkA || L::kBlkB) {
     // Blocked shallow body: the same two multiplies as below, applied as blocks
     // against a resident +-H_M so neither factor is ever in L0A or L0B whole.
@@ -470,7 +533,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
       // The two accumulators share one L0C range here, so the previous tile's
       // stores must have drained before this tile's FIRST matmul -- not merely
       // before the left multiply, as in the unaliased form below.
-      wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
+      if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
     }
 
     // --- right multiply: X * H_C, as kC1 column blocks summed in L0C ---
@@ -485,8 +548,8 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
         shallowBlockA<R, C, S, kSlot, 0, EV_SRA0, EV_SWA0>(i);
       }
     }
-    set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // X slot free (all blocks read)
-    Sync<PIPE_M, PIPE_FIX>();
+    if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // all blocks read
+    Sync<PIPE_M, PIPE_FIX>(EV_SEQ);
 
     // --- vertical stack -> horizontal concatenation, in L1 ---
     // Grouped by the left multiply's ROW blocks, so each of its kR1 slices is
@@ -500,7 +563,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
         TEXTRACT(t_block, acc_stack, sm * R + a * L::kMa, 0);
       }
     }
-    Sync<PIPE_FIX, PIPE_MTE1>();
+    Sync<PIPE_FIX, PIPE_MTE1>(EV_SEQ);
 
     // --- left multiply: H_R * T, as kR1 row blocks summed in L0C ---
     // Under kAlias this writes over acc_stack. The extracts have drained it and
@@ -515,10 +578,10 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
         wait_flag(PIPE_M, PIPE_MTE1, EV_SWB);
       }
       TMOV(t_l0, t_l1_ap);
-      Sync<PIPE_MTE1, PIPE_M>();
+      Sync<PIPE_MTE1, PIPE_M>(EV_SEQ);
       if constexpr (!L::kAlias) {
         if (ap == 0) {
-          wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous tile's stores drained
+          if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous tile's stores drained
         }
       }
       for (uint32_t a = 0; a < L::kR1; ++a) {
@@ -536,7 +599,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
         set_flag(PIPE_M, PIPE_MTE1, EV_SWB);
       }
     }
-    Sync<PIPE_M, PIPE_FIX>();
+    Sync<PIPE_M, PIPE_FIX>(EV_SEQ);
 
     for (uint32_t a = 0; a < L::kR1; ++a) {
       for (uint32_t sm = 0; sm < S; ++sm) {
@@ -553,7 +616,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
         TSTORE(y_gm, acc_block);
       }
     }
-    set_flag(PIPE_FIX, PIPE_M, EV_ACC);
+    if (freeAcc) set_flag(PIPE_FIX, PIPE_M, EV_ACC);
   } else {
     // --- right multiply: X * H_C, S samples stacked vertically ---
     TileLeft<half, kStackRows, C> x_l0;
@@ -564,10 +627,10 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
     TASSIGN(acc_stack, L::kL0cStack);
 
     TMOV(x_l0, x_l1);
-    set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // slot free for the load after next
-    Sync<PIPE_MTE1, PIPE_M>();
+    if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // load after next
+    Sync<PIPE_MTE1, PIPE_M>(EV_SEQ);
     TMATMUL(acc_stack, x_l0, hc_l0);
-    Sync<PIPE_M, PIPE_FIX>();
+    Sync<PIPE_M, PIPE_FIX>(EV_SEQ);
 
     // --- vertical stack -> horizontal concatenation, in L1 ---
     // Block-columns are contiguous in NZ, so sample s's (R x C) result lands
@@ -577,7 +640,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
       TASSIGN(t_block, L::kL1T + s * R * C * sizeof(half));
       TEXTRACT(t_block, acc_stack, s * R, 0);
     }
-    Sync<PIPE_FIX, PIPE_MTE1>();
+    Sync<PIPE_FIX, PIPE_MTE1>(EV_SEQ);
 
     // --- left multiply: H_R * T, S samples side by side ---
     MatTile<R, S * C> t_l1;
@@ -586,16 +649,16 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
     TASSIGN(t_l0, L::kL0bT);
 
     TMOV(t_l0, t_l1);
-    Sync<PIPE_MTE1, PIPE_M>();
+    Sync<PIPE_MTE1, PIPE_M>(EV_SEQ);
 
     TileLeft<half, R, R> hl_l0;
     TileAcc<float, R, S * C> acc_cat;
     TASSIGN(hl_l0, L::kL0aHl);
     TASSIGN(acc_cat, L::kL0cCat);
 
-    wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous tile's TSTORE has drained
+    if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous tile's TSTORE has drained
     TMATMUL(acc_cat, hl_l0, t_l0);
-    Sync<PIPE_M, PIPE_FIX>();
+    Sync<PIPE_M, PIPE_FIX>(EV_SEQ);
 
     // Each sample is a contiguous (R x C) block-column range of acc_cat.
     // The fixpipe L0C->GM path is 2D-to-2D only (TStoreAccNz2nd asserts the
@@ -621,7 +684,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample) {
         TSTORE(y_gm, acc_block);
       }
     }
-    set_flag(PIPE_FIX, PIPE_M, EV_ACC);
+    if (freeAcc) set_flag(PIPE_FIX, PIPE_M, EV_ACC);
   }
 }
 
@@ -678,7 +741,7 @@ AICORE void shallowBlockA(uint32_t i) {
 // leaves t_l1(Par) ready, signalled FIX->MTE1 on EvPA.
 template <uint32_t R, uint32_t C, uint32_t S, uint32_t Slot, bool Par,
           event_t EvX, event_t EvPA>
-AICORE void tilePhaseA() {
+AICORE void tilePhaseA(bool freeSlot) {
   using L = Layout<R, C, S>;
 
   if constexpr (C != 16) {
@@ -696,7 +759,7 @@ AICORE void tilePhaseA() {
 
     wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);  // this tile's load has landed
     TMOV(x_l0a, x_l1);
-    set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // X slot free for the load 4 tiles on
+    if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // load 4 tiles on
     set_flag(PIPE_MTE1, PIPE_M, EvPA);
 
     wait_flag(PIPE_MTE1, PIPE_M, EvPA);
@@ -724,7 +787,7 @@ AICORE void tilePhaseA() {
   TASSIGN(x_l0b, L::l0bT(Par));
   wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);  // this tile's load has landed
   TMOV(x_l0b, x_cat);
-  set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // X slot free for the load 4 tiles on
+  if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // load 4 tiles on
   set_flag(PIPE_MTE1, PIPE_M, EvPA);
 
   TileLeft<half, R, R> hl_l0;
@@ -749,7 +812,7 @@ AICORE void tilePhaseA() {
 // L1 T slot -> L0A, T * H_C -> L0C, L0C -> GM.
 template <uint32_t R, uint32_t C, uint32_t S, bool Par, event_t EvPA,
           event_t EvPB>
-AICORE void tilePhaseB(__gm__ half *y, uint32_t sample) {
+AICORE void tilePhaseB(__gm__ half *y, uint32_t sample, uint32_t rows) {
   using L = Layout<R, C, S>;
 
   if constexpr (C != 16) {
@@ -777,8 +840,10 @@ AICORE void tilePhaseB(__gm__ half *y, uint32_t sample) {
     // the write-after-read on slot Par is already ordered, because B(i+2)'s
     // TMOV waits on A(i+2)'s FIX->MTE1 flag and A(i+2)'s TEXTRACTs follow
     // B(i)'s TSTOREs on the in-order FIX pipe.
+    // The cube ran all S samples whatever `rows` says; the transform is
+    // per-sample, so the surplus reaches only output rows this loop skips.
     wait_flag(PIPE_M, PIPE_FIX, EvPB);
-    for (uint32_t s = 0; s < S; ++s) {
+    for (uint32_t s = 0; s < rows; ++s) {
       TileAcc<float, R, C> acc_block;
       TASSIGN(acc_block, L::l0cCat(Par) + s * R * C * sizeof(float));
       __gm__ half *y_row = y + (sample + s) * L::kN;
@@ -815,6 +880,28 @@ AICORE void tilePhaseB(__gm__ half *y, uint32_t sample) {
 
   __gm__ half *y_tile = y + sample * L::kN;
   wait_flag(PIPE_M, PIPE_FIX, EvPB);
+
+  // Same masking on the single whole-tile store, and on the same layout.
+  if constexpr (S > 1) {
+    if (rows != S) {
+      TileAcc<float, kStackRows, C, DYNAMIC> acc_short;
+      TASSIGN(acc_short, L::l0cCat(Par));
+      acc_short.SetValidRow(rows * R);
+      if constexpr (L::kNzGm) {
+        GmNzDyn<kStackRows, C> y_gm(y_tile);
+        TASSIGN(y_gm, y_tile);
+        y_gm.template SetShape<GlobalTensorDim::DIM_2>(rows * R / 16);
+        TSTORE(y_gm, acc_short);
+      } else {
+        GmTileDyn<kStackRows, C> y_gm(y_tile);
+        TASSIGN(y_gm, y_tile);
+        y_gm.template SetShape<GlobalTensorDim::DIM_3>(rows * R);
+        TSTORE(y_gm, acc_short);
+      }
+      return;
+    }
+  }
+
   if constexpr (L::kNzGm) {
     GmNz<kStackRows, C> y_gm(y_tile);
     TASSIGN(y_gm, y_tile);
@@ -834,118 +921,181 @@ template <uint32_t R, uint32_t C, uint32_t S, uint32_t SlotLoad,
           uint32_t SlotA, bool ParA, bool ParB, event_t EvXLoad, event_t EvXA,
           event_t EvPA_A, event_t EvPA_B, event_t EvPB_B>
 AICORE void deepStep(__gm__ half *x, __gm__ half *y, uint32_t base, uint32_t i,
-                     uint32_t n) {
+                     uint32_t n, uint32_t rest) {
+  // Tile j's load reuses tile j-4's slot, so it waits iff j >= 4; here j = i+3.
+  // Only the LAST tile can be short, so every row count picks between `rest`
+  // and the constant S.
   if (i + 3 < n) {
-    issueTileLoad<R, C, S, SlotLoad, EvXLoad>(x, base + (i + 3) * S);
+    issueTileLoad<R, C, S, SlotLoad, EvXLoad>(
+        x, base + (i + 3) * S, (i + 3 == n - 1) ? rest : S, i >= 1);
   }
+  // Tile j frees its slot iff tile j+4 exists to reuse it; here j = i+1.
   if (i + 1 < n) {
-    tilePhaseA<R, C, S, SlotA, ParA, EvXA, EvPA_A>();
+    tilePhaseA<R, C, S, SlotA, ParA, EvXA, EvPA_A>(i + 5 < n);
   }
-  tilePhaseB<R, C, S, ParB, EvPA_B, EvPB_B>(y, base + i * S);
+  tilePhaseB<R, C, S, ParB, EvPA_B, EvPB_B>(y, base + i * S,
+                                            (i == n - 1) ? rest : S);
 }
 
 template <uint32_t R, uint32_t C, uint32_t S>
 AICORE void runTilesDeep(__gm__ half *x, __gm__ half *y, uint32_t &sample,
                          uint32_t end) {
   const uint32_t base = sample;
-  const uint32_t n = (end - base) / S;
-  if (n == 0) {
-    return;
-  }
+  const uint32_t span = end - base;
+  // ceil, not floor: a core's remainder is the last tile of this ring, masked
+  // to the rows it really holds, not a separate smaller tile and not a chain
+  // of them. A full tile is just where the row count picks S.
+  const uint32_t n = DIV_ROUNDUP(span, S);
+  const uint32_t rest = span - (n - 1) * S;
 
-  set_flag(PIPE_MTE1, PIPE_MTE2, EV_D0);  // all four slots start free
-  set_flag(PIPE_MTE1, PIPE_MTE2, EV_D1);
-  set_flag(PIPE_MTE1, PIPE_MTE2, EV_D2);
-  set_flag(PIPE_MTE1, PIPE_MTE2, EV_D3);
+  // No primed credits and none drained. A credit says a resource is free
+  // again, which is only worth saying once someone has held it: tile j reuses
+  // tile j-4's slot, so its load waits iff j >= 4 and tile j frees its slot
+  // iff tile j+4 exists. The pairing is exact, and tile j's load is issued an
+  // iteration after tile j-4 was consumed, so the credit always precedes the
+  // wait. 8 flag ops a core paid whether it ran 1 tile or 200.
+  //
+  // The ring therefore does NOT drain itself. Nothing follows it any more --
+  // that is what deleting the halving chain below bought. Anything placed
+  // after it that reuses L1, L0A or L0C would first have to hand the buffers
+  // over on MTE1 -> MTE2, and a three-edge handoff instead of that one edge
+  // measured 0.79x - 0.95x on exactly the spans it runs on.
 
   // Fill the ring three deep and open phase A of tile 0, so the first loop
   // iteration already has MTE2 two tiles ahead of MTE1.
-  issueTileLoad<R, C, S, 0, EV_D0>(x, base);
+  issueTileLoad<R, C, S, 0, EV_D0>(x, base, n == 1 ? rest : S, false);
   if (n > 1) {
-    issueTileLoad<R, C, S, 1, EV_D1>(x, base + S);
+    issueTileLoad<R, C, S, 1, EV_D1>(x, base + S, n == 2 ? rest : S, false);
   }
   if (n > 2) {
-    issueTileLoad<R, C, S, 2, EV_D2>(x, base + 2 * S);
+    issueTileLoad<R, C, S, 2, EV_D2>(x, base + 2 * S, n == 3 ? rest : S, false);
   }
-  tilePhaseA<R, C, S, 0, false, EV_D0, EV_PA0>();
+  tilePhaseA<R, C, S, 0, false, EV_D0, EV_PA0>(4 < n);
 
   for (uint32_t i = 0; i < n; ++i) {
     switch (i & 3u) {
       case 0:  // load slot 3, A slot 1 (odd), B even
         deepStep<R, C, S, 3, 1, true, false, EV_D3, EV_D1, EV_PA1, EV_PA0,
-                 EV_PB0>(x, y, base, i, n);
+                 EV_PB0>(x, y, base, i, n, rest);
         break;
       case 1:  // load slot 0, A slot 2 (even), B odd
         deepStep<R, C, S, 0, 2, false, true, EV_D0, EV_D2, EV_PA0, EV_PA1,
-                 EV_PB1>(x, y, base, i, n);
+                 EV_PB1>(x, y, base, i, n, rest);
         break;
       case 2:  // load slot 1, A slot 3 (odd), B even
         deepStep<R, C, S, 1, 3, true, false, EV_D1, EV_D3, EV_PA1, EV_PA0,
-                 EV_PB0>(x, y, base, i, n);
+                 EV_PB0>(x, y, base, i, n, rest);
         break;
       default:  // load slot 2, A slot 0 (even), B odd
         deepStep<R, C, S, 2, 0, false, true, EV_D2, EV_D0, EV_PA0, EV_PA1,
-                 EV_PB1>(x, y, base, i, n);
+                 EV_PB1>(x, y, base, i, n, rest);
         break;
     }
   }
-  sample = base + n * S;
-
-  wait_flag(PIPE_MTE1, PIPE_MTE2, EV_D0);  // drain the four primes
-  wait_flag(PIPE_MTE1, PIPE_MTE2, EV_D1);
-  wait_flag(PIPE_MTE1, PIPE_MTE2, EV_D2);
-  wait_flag(PIPE_MTE1, PIPE_MTE2, EV_D3);
+  sample = end;
 }
 
 
-// Consume [sample, end) with the largest power-of-two tile that still fits,
-// halving on the way down: 43 samples run 32 + 8 + 2 + 1. Each size runs its
-// own two-slot pipeline, issuing the next tile's TLOAD before the current
-// tile's compute, and primes and drains its slot flags so the next size starts
-// balanced.
+// One tile, standalone. It has no neighbour to wait for or signal to, so every
+// credit is skipped. Not the ring: that would instantiate its loop and all
+// four slot/parity combinations at every size runShortSpan can reach.
+template <uint32_t R, uint32_t C, uint32_t S>
+AICORE void oneTile(__gm__ half *x, __gm__ half *y, uint32_t sample,
+                    uint32_t rows) {
+  if constexpr (Layout<R, C, S>::kDbuf) {
+    issueTileLoad<R, C, S, 0, EV_D0>(x, sample, rows, false);
+    tilePhaseA<R, C, S, 0, false, EV_D0, EV_PA0>(false);
+    tilePhaseB<R, C, S, false, EV_PA0, EV_PB0>(y, sample, rows);
+  } else {
+    issueTileLoad<R, C, S, 0, EV_X0>(x, sample, rows, false);
+    hadamardTile<R, C, S, false, EV_X0>(y, sample, false, false, false);
+  }
+}
+
+// A span of 1..S-1 samples, as ONE tile of the smallest size that covers it.
+// Masking is free on the TRANSFERS but not on the tile -- the cube runs all S
+// samples whatever the row count says -- and a lone tile has no predecessor to
+// hide those wasted rows behind. Inside the ring the same waste IS hidden,
+// which is why only this path picks a size and the ring's last tile does not.
+// A compile-time choice, not a chain: exactly one tile ever runs, because a
+// level is entered with span <= S and stays with span > S/2.
+template <uint32_t R, uint32_t C, uint32_t S>
+AICORE void runShortSpan(__gm__ half *x, __gm__ half *y, uint32_t sample,
+                         uint32_t span) {
+  if constexpr (S > 1) {
+    if (span <= S / 2) {
+      runShortSpan<R, C, S / 2>(x, y, sample, span);
+      return;
+    }
+  }
+  oneTile<R, C, S>(x, y, sample, span);
+}
+
+// Consume [sample, end) as ONE unit of work: a single ring of S-sample tiles
+// whose last tile is masked to whatever is left. There is no power-of-two
+// halving chain any more, so no level boundary to hand buffers over at, and
+// the remainder is an ordinary ring tile -- overlapped like any other instead
+// of a drained standalone unit in front of a pipeline flush.
 template <uint32_t R, uint32_t C, uint32_t S>
 AICORE void runTiles(__gm__ half *x, __gm__ half *y, uint32_t &sample,
                      uint32_t end) {
+  if (sample >= end) {
+    return;
+  }
+  // A core with no whole tile at all: one masked tile at its own size. A core
+  // that HAS whole tiles keeps its remainder in the ring, where it overlaps.
+  if constexpr (S > 1) {
+    if (end - sample < S) {
+      runShortSpan<R, C, S>(x, y, sample, end - sample);
+      sample = end;
+      return;
+    }
+  }
   if constexpr (Layout<R, C, S>::kDbuf) {
     runTilesDeep<R, C, S>(x, y, sample, end);
-  } else if (end - sample >= S) {
-    set_flag(PIPE_MTE1, PIPE_MTE2, EV_X0);  // both slots start free
-    set_flag(PIPE_MTE1, PIPE_MTE2, EV_X1);
+  } else {
+    // The shallow path is only ever reached at the top level, where kDbuf is
+    // monotone in S, and every shallow size in the case table has S == 1 -- so
+    // a shallow tile is one sample and can never be short.
+    static_assert(S == 1, "a shallow tile size > 1 would need a masked last tile");
+    // Same lazy credits as the deep ring, at depth 2 and with a depth-1
+    // accumulator: tile i's load waits iff i >= 2, tile i frees its slot iff
+    // tile i+2 exists, and the EV_ACC edge runs between neighbours only, so
+    // tile 0 does not wait on it and the last tile does not set it. That is
+    // what deletes the prime/drain pair in runTwosided as well.
+    const uint32_t last = (end - sample) / S - 1;
 
     // bisheng needs the flag id to be a compile-time literal, so the slot
     // parity is a template argument and the loop dispatches to one of two
     // instantiations rather than carrying it in a variable.
     uint32_t cur = sample;
-    bool pong = false;
-    issueTileLoad<R, C, S, 0, EV_X0>(x, cur);
+    issueTileLoad<R, C, S, 0, EV_X0>(x, cur, S, false);
 
-    while (true) {
+    for (uint32_t i = 0;; ++i) {
       const uint32_t next = cur + S;
-      const bool has_next = (end - next >= S);
-      if (pong) {
+      const bool has_next = (i < last);
+      const bool free_slot = (i + 2 <= last);
+      const bool wait_acc = (i >= 1);
+      const bool free_acc = (i < last);
+      if (i & 1u) {
         if (has_next) {
-          issueTileLoad<R, C, S, 0, EV_X0>(x, next);
+          issueTileLoad<R, C, S, 0, EV_X0>(x, next, S, i >= 1);
         }
-        hadamardTile<R, C, S, true, EV_X1>(y, cur);
+        hadamardTile<R, C, S, true, EV_X1>(y, cur, free_slot, wait_acc,
+                                           free_acc);
       } else {
         if (has_next) {
-          issueTileLoad<R, C, S, 1, EV_X1>(x, next);
+          issueTileLoad<R, C, S, 1, EV_X1>(x, next, S, i >= 1);
         }
-        hadamardTile<R, C, S, false, EV_X0>(y, cur);
+        hadamardTile<R, C, S, false, EV_X0>(y, cur, free_slot, wait_acc,
+                                            free_acc);
       }
       if (!has_next) {
         break;
       }
       cur = next;
-      pong = !pong;
     }
     sample = cur + S;
-
-    wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X0);  // drain the two primes
-    wait_flag(PIPE_MTE1, PIPE_MTE2, EV_X1);
-  }
-  if constexpr (S > 1) {
-    runTiles<R, C, S / 2>(x, y, sample, end);
   }
 }
 
@@ -975,12 +1125,11 @@ AICORE void runTwosided(__gm__ half *x, __gm__ half *y,
 
   loadHadamardFactors<R, C, S>(h_left, h_right);
 
-  set_flag(PIPE_FIX, PIPE_M, EV_ACC);  // output accumulator starts free
-
+  // No EV_ACC prime: the shallow ring's first tile skips the wait and its last
+  // tile skips the set, so the credit never outlives the ring. The deep path
+  // never used EV_ACC at all and was paying this pair for nothing.
   uint32_t sample = begin;
   runTiles<R, C, S>(x, y, sample, end);
-
-  wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
 }
 
 AICORE void dispatchTwosided(__gm__ half *x, __gm__ half *y,
