@@ -2,6 +2,22 @@
 
 using namespace pto;
 
+// Y = X * H_N on the cube unit, as a single right multiplication.
+//
+// H_N is separable: with N = B * M in the Sylvester (natural) ordering,
+// H_N = H_B (x) H_M, and H_B[i,j] = (-1)^popcount(i & j) is a SIGN rather
+// than a matrix. A tile's product is therefore a sum of M-sized matmuls
+// against +-H_M, summed in the L0C accumulator, and the only operands the
+// cube ever sees are +H_M and -H_M. Sizes whose H_N fits L0B whole skip the
+// split and multiply once instead.
+//
+// A tile is S consecutive samples, one contiguous (S x N) block of GM. Its
+// body touches each pipe exactly once -- GM -MTE2-> L1 -MTE1-> L0A -M-> L0C
+// -FIX-> GM -- which is what lets tiles overlap in a ring, and is why the
+// event credits below carry the whole dependency structure.
+//
+// See the README for the measurements behind every constant here.
+
 #define DIV_ROUNDUP(x, y) (((x) + (y) - 1) / (y))
 
 #ifndef PTO_OS_TILE_ELEMS
