@@ -90,6 +90,8 @@ def onesided_block_dim_schedule(batch: int, n: int, max_block_dim: int) -> int:
     """
     samples = onesided_samples_per_tile(n, batch)
     tiles = -(-int(batch) // samples)
+    if tiles == 0:  # the launcher short-circuits batch 0; this keeps it total
+        return 1
     table = (_TILE_RUN_K if samples == _SAMPLES_PER_TILE.get(int(n), 1)
              else _TILE_RUN_K_SHALLOW)
     k = table.get(int(n), _DEFAULT_TILE_RUN_K)

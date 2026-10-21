@@ -84,10 +84,22 @@ constexpr uint32_t L1_BYTES = 512 * 1024;
 constexpr uint32_t L0AB_BYTES = 64 * 1024;
 constexpr uint32_t L0C_BYTES = 128 * 1024;
 
-// Ids are unique per (src pipe, dst pipe) pair, and one id must not carry two
-// channels out of the SAME pipe: a waiter on one channel can take the other's
-// credit and run ahead. Hence the L0A write-after-read edge (M -> MTE1) keeps
-// ids clear of the end-of-tile handoff (M -> FIX).
+// A credit on (src pipe, dst pipe, id) says either that data has landed or
+// that a resource is free again. One id per channel:
+//
+//   EV_X0..3  MTE2->MTE1  an L1 input slot is filled
+//             MTE1->MTE2  that same slot is free again
+//   EV_A0/A1  M->MTE1     an L0A slot is free, the matmul has read it
+//   EV_ACC    FIX->M      an L0C accumulator is free, the store has read it
+//   EV_MOV    MTE1->M     the TMOV into L0A has landed
+//   EV_OUT    M->FIX      the accumulator holds the finished product
+//
+// One id must not carry two channels out of the SAME pipe: credits are keyed
+// on the source, so a waiter on one channel can take the other's and run
+// ahead. Read the map by source and no id repeats -- MTE1 drives EV_X* and
+// EV_MOV, M drives EV_A* and EV_OUT. The two reuses of EVENT_ID0 are both
+// outside that rule: EV_OUT leaves a different pipe than EV_X0, and the
+// operand loader, which shares EV_X0 outright, completes before the ring opens.
 #define EV_X0 EVENT_ID0
 #define EV_X1 EVENT_ID1
 #define EV_X2 EVENT_ID2
@@ -97,12 +109,17 @@ constexpr uint32_t L0C_BYTES = 128 * 1024;
 #define EV_A1 EVENT_ID5
 #define EV_ACC EVENT_ID6
 
-// Default id 0 collides with EV_X0 on (MTE2, MTE1), so this must not be called
-// on that pair inside the tile loop.
+#define EV_MOV EVENT_ID7
+#define EV_OUT EVENT_ID0
+
+// A set and its wait, adjacent: an ordering point between two pipes rather
+// than a credit some later tile consumes. The id has no default, because a
+// default puts every Sync on one id and drops it from the call site, which is
+// how the rule above gets broken without anything looking wrong.
 template <pipe_t SrcPipe, pipe_t DstPipe>
-AICORE inline void Sync(uint32_t id = 0) {
-  set_flag(SrcPipe, DstPipe, static_cast<event_t>(id));
-  wait_flag(SrcPipe, DstPipe, static_cast<event_t>(id));
+AICORE inline void Sync(event_t id) {
+  set_flag(SrcPipe, DstPipe, id);
+  wait_flag(SrcPipe, DstPipe, id);
 }
 
 template <uint32_t Rows, uint32_t Cols>
@@ -221,7 +238,7 @@ AICORE void loadHadamard(__gm__ half *h) {
       TASSIGN(h_gm, src);
       TLOAD(h_l1, h_gm);
     }
-    Sync<PIPE_MTE2, PIPE_MTE1>();
+    Sync<PIPE_MTE2, PIPE_MTE1>(EV_X0);
     for (uint32_t s = 0; s < 2; ++s) {
       MatTile<L::kM, L::kM> h_l1;
       TileRight<half, L::kM, L::kM> h_l0b;
@@ -229,19 +246,19 @@ AICORE void loadHadamard(__gm__ half *h) {
       TASSIGN(h_l0b, L::l0bH(s));
       TMOV(h_l0b, h_l1);
     }
-    Sync<PIPE_MTE1, PIPE_M>();
+    Sync<PIPE_MTE1, PIPE_M>(EV_MOV);
   } else if constexpr (L::kResident) {
     MatTile<N, N> h_l1;
     TASSIGN(h_l1, L::kL1H);
     GmTile<N, N> h_gm(h);
     TASSIGN(h_gm, h);
     TLOAD(h_l1, h_gm);
-    Sync<PIPE_MTE2, PIPE_MTE1>();
+    Sync<PIPE_MTE2, PIPE_MTE1>(EV_X0);
 
     TileRight<half, N, N> h_l0b;
     TASSIGN(h_l0b, L::kL0bH);
     TMOV(h_l0b, h_l1);
-    Sync<PIPE_MTE1, PIPE_M>();
+    Sync<PIPE_MTE1, PIPE_M>(EV_MOV);
   }
 }
 
@@ -280,7 +297,7 @@ AICORE void blockStep(unsigned accBase, uint32_t i) {
 
   wait_flag(PIPE_M, PIPE_MTE1, EvA);
   TMOV(x_l0a, x_l1);
-  Sync<PIPE_MTE1, PIPE_M>();
+  Sync<PIPE_MTE1, PIPE_M>(EV_MOV);
 
   for (uint32_t j = 0; j < L::kBlk; ++j) {
     TileAcc<float, S, L::kM> acc_j;
@@ -304,9 +321,6 @@ AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample,
                          bool freeAcc, bool waitA, bool freeA) {
   using L = Layout<N, S>;
 
-  // Nothing else holds MTE1 back -- a tile touches each pipe once -- so
-  // without the EvA write-after-read edge below MTE1 runs ahead by slots and
-  // lands tile i+2's TMOV on the slot tile i's TMATMUL is still reading.
   wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);
 
   TileAcc<float, S, N> acc;
@@ -318,6 +332,9 @@ AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample,
     TileLeft<half, S, N> x_l0a;
     TASSIGN(x_l1, L::xSlot(Slot));
     TASSIGN(x_l0a, L::l0aX(Par ? 1u : 0u));
+    // Nothing else holds MTE1 back -- a tile touches each pipe once -- so
+    // without this write-after-read edge MTE1 runs ahead by slots and lands
+    // tile i+2's TMOV on the slot tile i's TMATMUL is still reading.
     if (waitA) wait_flag(PIPE_M, PIPE_MTE1, EvA);
     TMOV(x_l0a, x_l1);
     if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);
@@ -326,7 +343,7 @@ AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample,
     TASSIGN(h_l0b, L::kL0bH);
 
     if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
-    Sync<PIPE_MTE1, PIPE_M>();
+    Sync<PIPE_MTE1, PIPE_M>(EV_MOV);
     TMATMUL(acc, x_l0a, h_l0b);
     if (freeA) set_flag(PIPE_M, PIPE_MTE1, EvA);
   } else if constexpr (L::kBlocked) {
@@ -343,7 +360,7 @@ AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample,
     if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);
   }
 
-  Sync<PIPE_M, PIPE_FIX>();
+  Sync<PIPE_M, PIPE_FIX>(EV_OUT);
 
   // The cube ran all S rows whatever `rows` says. The transform is per-sample,
   // so the surplus rows reach only output rows this store never writes.
@@ -379,9 +396,9 @@ AICORE void runRing(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   using L = Layout<N, S>;
   constexpr uint32_t kAcc = L::kAccSlots;
 
-  // No primed credits, and none drained. A credit says a resource is free
-  // again, which is only worth saying once someone has held it: tile j reuses
-  // tile j-4's slot, so it waits iff j >= 4 and signals iff tile j+4 exists.
+  // No primed credits, and none drained: a resource is only worth declaring
+  // free once someone has held it. Tile j reuses tile j-4's slot, so it waits
+  // iff j >= 4 and signals iff tile j+4 exists.
   // The pairing is exact, and tile j's load is issued an iteration after tile
   // j-4 was consumed, so a credit is always produced before it is awaited.
   //

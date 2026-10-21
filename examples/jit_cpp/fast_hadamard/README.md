@@ -1558,6 +1558,65 @@ buffer's prime/drain is a *fixed* cost, so it is invisible in the bulk A/B that
 usually justifies the buffering and it dominates exactly where runs are short.
 The same reasoning is why a lone tile does not go through the ring at all.
 
+#### Auditing the flags: balance, liveness, and the one thing neither catches
+
+Three properties, each needing its own check, all run over the same 520
+control-flow paths (`runRing` trip counts 1..64 x resident/blocked x
+`kBlk` in {2,4,8} x `kAccSlots` in {1,2}, plus the single-tile path):
+
+| property | question | result |
+|---|---|---|
+| balance | per `(src, dst, id)`, does `#set == #wait`? | yes, on every path |
+| liveness | does any wait precede the credit that satisfies it? | no |
+| aliasing | can a wait pop a credit posted by a *different* channel? | no, but see below |
+
+Balance is the rule every flag must obey, and the lazy-credit form above is
+what makes it provable: the producer guard and the consumer guard are the same
+proposition written at both sites, so they pair off by construction rather than
+by counting. Liveness is separate -- balanced counts do not make a schedule
+live -- and holds because each credit is produced an iteration before it is
+awaited.
+
+Aliasing is the one a balance check cannot see, because `Sync<A,B>()` is a set
+and a wait on one line and so is self-balancing on every path. The hardware
+keys a credit on the **source pipe and id**, not on the destination, so two
+channels out of one pipe sharing an id let a waiter take the other's credit and
+run ahead -- the defect recorded above under *one event id must not carry two
+channels out of one pipe*. Grouping this kernel's ids by source pipe:
+
+| source | id 0-3 | id 4,5 | id 6 | id 7 |
+|---|---|---|---|---|
+| MTE2 | -> MTE1 (X data ready) | | | |
+| MTE1 | -> MTE2 (L1 slot free) | | | -> M (TMOV to TMATMUL) |
+| M | -> FIX (acc ready) | -> MTE1 (L0A write-after-read) | | |
+| FIX | | | -> M (acc slot free) | |
+
+`Sync<MTE1,M>` used to spend the default id 0, which `(MTE1 -> MTE2)` also
+carries. That was **not** a live bug: the slot-free `set_flag` is guarded by
+`i + 4 <= last` at tile `i`, the prefetch wait that consumes it by
+`(i + 4 <= last)` at tile `i+1`, and the prefetch runs before the tile body --
+so the credit is always taken one instruction group before any `Sync` can
+reach it, and the aliasing simulation finds zero steals. But that safety rests
+on an invariant nothing states or enforces: change the prefetch distance, move
+the `set_flag`, or add one `Sync` and it becomes the recorded defect, which was
+intermittent (4 failures in 30 repeats of one shape) and passed 252 validation
+cases first.
+
+So `Sync<MTE1,M>` was given `EVENT_ID7`. Against a byte-identical null arm in
+the same profiling session the change is inside the resolution floor -- null
+geomean 0.996 with per-cell spread 0.973-1.024, measured 1.004 with spread
+0.987-1.031, and the sign flips between sessions -- while `.aicore_binary`
+drops 384 bytes and `.text` is unchanged. Gated like the other sync-protocol
+change on 0 failures in 15 full sweeps.
+
+`Sync` also lost its `id = 0` default, which is what made the collision easy to
+write in the first place: the id decides which channel the call lands on, so a
+default silently puts every `Sync` on the one id most likely to be in use
+elsewhere, and the call site stops saying which channel it is. With the id
+required, the table above can be read straight off the source. The `.so` is
+byte-identical before and after that change, so it is purely a source-level
+guard.
+
 #### Three gotchas worth recording
 
 **The straight pipe needs WAR flags the turnaround body got for free** -- the
@@ -1596,3 +1655,250 @@ The two tuning constants are documented at the top of the kernel;
 `cube/test_hadamard_onesided.py` checks a prebuilt variant against the exact fp64
 reference over 168 cases. Validate before timing: a variant that computes the
 wrong answer is a broken lever, not a slow technique.
+
+### Back-porting the one-sided kernel's changes to the two-sided one
+
+Every change the one-sided kernel took after the `d2d9a59` restructure, checked
+against `cube/fast_hadamard_twosided.cpp` and **measured rather than argued**.
+Four of the six ported, one does not apply, and one is recorded with its
+numbers and left on the shelf.
+
+| one-sided change | ports? | measured on the two-sided kernel |
+|---|---|---|
+| `lru_cache` on the `block_dim` schedule | **yes** | **1.0847x** host path (1.117x where it is called twice) |
+| launch only the cores that have work | **yes** | **1.0162x** device, **+0.50% per idle core** |
+| credits primed lazily | **yes**, after the chain | **1.0289x** device, geomean over 40 shapes |
+| per-core remainder as one masked ring tile | **yes** | with the above, **1.0972x** / best **1.6339x** / worst **0.9994x** |
+| tile size and core count are one knob | applies | 1.05x - 1.28x, **batch <= 64 only**; not taken, see below |
+| `static_assert(kL0aSlots == 2)` | **no** | the defect cannot occur here |
+
+Combined, the two kernel-side changes are **1.0972x geomean over 176 shapes,
+96 of them at >= 1.05x, none below 0.98x**, and the `.so` shrinks 17%
+(75944 -> 63336 bytes). The host-side changes are a further 1.085x on the
+launch path and 1.016x on device.
+
+The rig's floor first: 19 shapes, two byte-identical `.so` under different
+names, interleaved in one profiling session -- geomean **0.9997**, band
+**0.9933 - 1.0050**. Everything below is read against that.
+
+#### The two host-side changes port unchanged
+
+`twosided_block_dim_schedule` is a pure function of `(batch, n, max_block_dim)`
+on the per-launch path, so it memoises exactly as the one-sided one does.
+Priced by `METH-360` (host clock, synchronise outside the window, `b =
+(t1-t0)/I` at `I = 400`), as a within-process paired A/B over six interleaved
+alternations:
+
+| N | batch | plain | memoised | ratio | schedule calls per launch |
+|---:|------:|------:|---------:|------:|---:|
+| 256 | 1024 | 49.63 | 46.35 | 1.0706 | 1 |
+| 512 | 1024 | 54.46 | 48.74 | **1.1173** | **2** |
+| 1024 | 1024 | 51.32 | 47.40 | 1.0827 | 1 |
+| 4096 | 256 | 51.17 | 47.16 | 1.0849 | 1 |
+| 16384 | 64 | 50.38 | 46.75 | 1.0776 | 1 |
+| 32768 | 32 | 49.78 | 46.29 | 1.0754 | 1 |
+
+Geomean **1.0847x**. N=512 is the outlier and it is the mechanism confirming
+itself: that is the one size whose launch splits into a bit-plan bulk plus a
+remainder, so the wrapper calls the schedule **twice**, and it gains most.
+
+The `block_dim` clamp is the same one expression, and it is worth **more** here
+than in the one-sided kernel because this schedule's `k` is larger relative to
+the tile count. It fires on **118 of 272** shapes, shedding up to **8** idle
+cores (N=32768 batch 22 asks for 19 and eleven have work). It is exactly
+split-preserving for this kernel's split too: over all
+(tiles <= 6000) x (block_dim <= 24), `ceil(tiles / ceil(tiles / bd))` leaves
+`tiles_per_core` unchanged in every case, and every active core's `[begin, end)`
+with it.
+
+50 pairs that differ **only** in the launched block count -- same `.so`, same
+tile, same split:
+
+| idle cores | pairs | geomean |
+|---:|---:|---:|
+| 1 | 7 | 1.0036 |
+| 2 | 14 | 1.0071 |
+| 3 | 7 | 1.0204 |
+| 4 | 14 | 1.0200 |
+| 5 | 4 | 1.0406 |
+| 7 - 8 | 3 | 1.0271 |
+
+**1.0162x geomean, +0.503% per idle core**, best 1.0797x, worst 0.9806x,
+against 10 null pairs at 0.9966x (0.9837 - 1.0090). The monotone trend in idle
+count is the evidence that the mechanism is block dispatch and not noise.
+
+One thing the port surfaced: `tiles == 0` makes the clamp divide by zero, which
+`test_batch_partition_boundaries` catches because it covers `batch = 0`. The
+one-sided kernel carries the same guard, so this is its guard, not a new one.
+
+#### Lazy credits port, but the drain was load-bearing and cost 1.25x to replace
+
+The deep ring primes four `(MTE1 -> MTE2)` slot credits and drains four, and
+`runTwosided` primes and drains `EV_ACC` -- which the deep path, six of the
+eight sizes, never uses at all. Ten flag ops a core pays whether it runs one
+tile or two hundred, the same fixed cost the one-sided ring shed.
+
+Removing them the obvious way **fails 157 of 864 correctness cases, every one of
+them at an unaligned batch**. The four drains were not bookkeeping: they were
+the handoff between levels of the power-of-two halving chain, the one place
+where something *follows* a ring and reuses its L1 slots. Priced on aligned
+batches, where no lower level runs and the defect cannot fire, the credits alone
+are worth **1.0271x** over 40 shapes, decaying monotonically with how much work
+the constant is spread over:
+
+| tiles per core | speedup |
+|---|---|
+| 1 | 1.03x - 1.07x |
+| 2 | 1.02x - 1.06x |
+| 8 | 1.01x - 1.03x |
+| 86 - 2048 | 1.000x |
+
+So the drain has to be replaced by an explicit handoff, and **how many edges it
+needs is a measurement, not a derivation**. The one-sided README names three
+(`FIX -> M`, `M -> MTE1`, `MTE1 -> MTE2`); only the last is load-bearing here,
+and the other two are pure cost:
+
+| handoff | geomean (40 shapes) | worst |
+|---|---:|---:|
+| `MTE1 -> MTE2` only | **1.0289x** | **0.9821x** |
+| `+ M -> MTE1` | 1.0185x | 0.9521x |
+| `+ FIX -> M` as well | 0.9723x | **0.7929x** |
+
+Three barriers in front of a tile that then overlaps nothing turn a 1.03x win
+into a 1.1x - 1.25x loss on exactly the spans they run on. Take the cheapest
+handoff that validates, and price each edge rather than copying the set.
+
+#### The halving chain, replaced by one masked ring tile (1.0972x, best 1.6339x)
+
+`runTiles` consumed a core's span with the same power-of-two halving chain the
+one-sided kernel deleted -- 43 samples as 32 + 8 + 2 + 1, each level priming and
+draining its own slot flags. It is exposed here for the same reason and to the
+same degree. Measuring an unaligned batch against the aligned one just below it,
+so the unaligned case does strictly **less** work:
+
+| N | S | batch | aligned us | unaligned batch | us | cost |
+|---:|--:|------:|-----------:|----------------:|---:|-----:|
+| 256 | 32 | 32 | 2.340 | 31 | 3.180 | **1.36x** |
+| 256 | 32 | 256 | 7.160 | 255 | 8.000 | 1.12x |
+| 512 | 16 | 16 | 2.700 | 15 | 3.320 | **1.23x** |
+| 1024 | 8 | 8 | 1.880 | 7 | 2.190 | 1.17x |
+| 2048 | 4 | 4 | 1.900 | 3 | 2.000 | 1.05x |
+| 4096 | 2 | 2 | 2.020 | 1 | 1.760 | none |
+
+A two-sided tile is S samples of R matrix rows each, so a row count is always a
+multiple of R and stays 16-aligned whatever the sample count is -- which makes
+`MatTileV` / `SetValidRow` and a `DYNAMIC`-row `GlobalTensor` enough to carry
+any remainder in a full-size tile. `runTiles` becomes one ring over
+`ceil(span/S)` tiles with the last one masked, and the whole chain, its level
+handoffs and its four recursive instantiations per N go away.
+
+Two things had to be got right, and each was found by measuring, not by reading.
+
+**A masked tile must keep its LAYOUT.** Falling back to `GmTileDyn` (ND) for the
+short tile -- which looks free at N=256, where `C == 16` makes the NZ image the
+row-major bytes -- costs **0.49x - 0.78x there and nothing anywhere else**,
+because a 16-column ND transfer is a 32-byte-per-row gather rather than one
+burst. N=256 is the only size in the table with `C == 16`, which is exactly why
+the regression was confined to it. Keeping the burst with a `DYNAMIC`-row NZ
+tensor is worth **1.1129x geomean, best 3.2222x**. The two layouts index their
+shape differently and the difference is easy to get silently wrong:
+`TileShape2D<..., ND>` is `Shape<1,1,1,rows,cols>`, so the row count is
+**DIM_3** and counts rows; `TileShape2D<..., NZ>` is
+`Shape<1, cols/C0, rows/16, 16, C0>`, so it is **DIM_2** and counts **fractals**.
+
+**A short span must pick its tile size.** Masking at the top `S` alone regresses
+`batch = 1` to **0.8655x - 0.9783x** at every size with `S > 1`: the cube runs
+all S samples whatever the row count says, and a lone tile has no predecessor to
+hide the waste behind. Inside the ring the same waste **is** hidden, which is
+why only the short-span path picks a size and the ring's last tile does not.
+The size pick is worth **1.0156x geomean, best 1.3008x**, and it is what takes
+the worst case from 0.8655x to 0.9994x.
+
+Combined, against the shipped kernel, msprof device time, median of 3
+interleaved passes of 40 reps at each shape's own scheduled `block_dim`:
+
+| N | S | shapes | geomean | best | worst | sub-tile band | aligned / bulk |
+|---:|--:|---:|---:|---:|---:|---:|---:|
+| 256 | 32 | 47 | **1.1983** | 1.6339 | 1.0090 | 1.2310 | 1.1375 |
+| 512 | 16 | 32 | 1.0998 | 1.3822 | 0.9994 | 1.1255 | 1.0776 |
+| 1024 | 8 | 23 | 1.0690 | 1.2584 | 1.0017 | 1.1116 | 1.0509 |
+| 2048 | 4 | 20 | 1.0699 | 1.2757 | 1.0000 | 1.1029 | 1.0642 |
+| 4096 | 2 | 18 | 1.0456 | 1.1406 | 1.0055 | 1.0976 | 1.0426 |
+| 8192 | 1 | 12 | 1.0456 | 1.0962 | 1.0007 | -- | 1.0456 |
+| 16384 | 1 | 12 | 1.0299 | 1.0642 | 1.0025 | -- | 1.0299 |
+| 32768 | 1 | 12 | 1.0172 | 1.0478 | 0.9995 | -- | 1.0172 |
+| **all** | | **176** | **1.0972** | **1.6339** | **0.9994** | | |
+
+**96 shapes at >= 1.05x, 80 inside 0.98 - 1.05x, none below 0.98x.** The gain is
+monotone in S, which is the signature of the chain: S is what set its depth. The
+three `S == 1` sizes have no chain at all, so their 1.017x - 1.046x is the lazy
+credits on their own.
+
+Because this is a sync-protocol change -- the class of defect that is
+intermittent and shape-dependent -- it was gated on more than one green run:
+**18600 shape-checks over 15 sweeps** of 1240 shapes (8 N x 31 batches x 5
+`block_dim`), each sweep required to be **bit-identical** to the first and the
+first checked against an exact fp64 transform. 0 non-deterministic, 0 out of
+tolerance, plus an 864-case fp64 sweep and the repo's 265 tests.
+
+#### Measured, applicable, and not taken: the tile-size / core-count crossover
+
+The one-sided kernel's largest tuning finding is that at small batch the tile
+height **is** the core count, so `(S, tiles_per_core)` must be swept jointly.
+That is true here too. 2374 configs, every candidate `S` for every N crossed
+with every reachable core count, each `S` then judged at **its own** best count:
+
+| N | batch | shipped S | us | best S | us | gain |
+|---:|------:|---:|---:|---:|---:|---:|
+| 256 | 16 | 32 | 2.485 | **8** | 1.935 | **1.284** |
+| 256 | 32 | 32 | 2.150 | 16 | 2.040 | 1.054 |
+| 512 | 16 | 16 | 2.340 | 8 | 2.175 | 1.076 |
+| 1024 | 16 | 8 | 1.935 | **2** | 1.685 | **1.148** |
+| 1024 | 32 | 8 | 1.975 | 4 | 1.860 | 1.062 |
+| 1024 | 64 | 8 | 2.190 | 4 | 2.075 | 1.055 |
+| 2048 | 16 | 4 | 1.975 | 2 | 1.790 | 1.103 |
+| 2048 | 32 | 4 | 2.110 | 2 | 1.990 | 1.060 |
+| 4096 | 16 | 2 | 2.175 | 1 | 2.040 | 1.066 |
+
+**At batch >= 128 the shipped `S` is optimal at every N and every core count --
+gain 1.000x, not 1.00x-ish.** The whole opportunity is batch <= 64, where a
+shorter tile yields more tiles to overlap, and it is worth 1.05x - 1.28x there.
+
+It is **not taken**, for a reason specific to this kernel: the crossover is not
+at a uniform tile count. N=256 crosses at **2** tall tiles while N=1024 crosses
+at **32**, so the one-sided kernel's trick of stating the threshold in tiles
+(`PTO_OS_TILES_TO_PIPELINE = 32`, one constant for every N) does not fit, and a
+second tier would need a per-N threshold plus a per-tier `_TILE_RUN_K` refit.
+Recorded here with its numbers so the decision is a decision and not an
+oversight.
+
+#### What does not port, and one method note
+
+**`static_assert(kL0aSlots == 2)` has nothing to guard.** The one-sided kernel
+needs it because a tall `S` silently drops its L0A slot count to 1 while the
+ring's edges still alternate by parity -- two event ids guarding one buffer.
+This kernel's equivalent, `kSlotsA`, is already read through
+`if constexpr (L::kSlotsA == 2)`, and the `kSlotsA == 1` arm uses a single
+`(EV_SRA0, EV_SWA0)` pair on a single slot. The parity-addressed buffers are
+likewise gated: `l0aX(par)` and `l0cStack(par)` only ever see `par == true` when
+`kBuf == 2`, which the L0A and L0C capacity asserts already enforce. The defect
+is unreachable by construction, so an assert would document a different kernel.
+
+The uncommitted one-sided **flag audit** is the newest change and it splits.
+Grouping this kernel's ids by **source** pipe shows the same shape of hazard:
+`Sync`'s `id = 0` default lands on `(MTE2 -> MTE1)` and `(MTE1 -> MTE2)` id 0,
+which the deep ring spends as `EV_D0`. Making the id **mandatory** so every call
+site names its channel compiles to a **byte-identical** `.so` -- a free
+source-level guard, taken. Moving the two `loadHadamardFactors` sequencing
+points off id 0 is **not** taken: it measures 0.9994x against a null band of
+0.9925x - 1.0276x for +288 bytes, and unlike the one-sided case the collision is
+not live -- `loadHadamardFactors` runs once per core strictly before any tile
+load, and the lazy form primes nothing, so no `EV_D0` credit can be in flight
+when it runs.
+
+**A codegen diff only proves neutrality when both arms compile from one
+identical path.** `.aicore_binary` encodes the source **file name**: the same
+content built as `k.cpp` and as `k_copy.cpp` produces different section hashes,
+which reads exactly like a codegen change. Build both arms over one path,
+and keep a null arm -- same content, same path, twice -- to show the comparison
+can return "identical" at all.
