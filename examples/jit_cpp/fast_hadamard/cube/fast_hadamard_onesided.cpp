@@ -4,39 +4,9 @@ using namespace pto;
 
 #define DIV_ROUNDUP(x, y) (((x) + (y) - 1) / (y))
 
-// One-sided Hadamard transform on the cube unit: Y = X * H_N as a single right
-// multiplication. H is symmetric, so the right operand alone gives the natural
-// (Sylvester) ordered transform, there is no transpose, and nothing is turned
-// around through L1 -- a tile touches each pipe ONCE:
-//
-//     GM --MTE2--> L1 --MTE1--> L0A --M--> L0C --FIX--> GM
-//
-// The two-sided kernel beside it cannot: its tile visits MTE1 and M twice, so
-// consecutive tiles serialize behind the second visit. This one spends
-// sqrt(N)/2 times as many MACs -- N*N per sample against 2*N*sqrt(N) -- to buy
-// that straight pipe, which is the right side of the trade while N is small,
-// and it rounds to fp16 exactly ONCE, the most accurate of the three kernels
-// here. Past 512 the MACs grow 4x per doubling while the bytes only double, so
-// the two-sided kernel takes over: the table below stops there at a compute
-// crossover, not a capacity limit.
-//
-// Above N=128, H_N is not applied as one dense (N x N) operand. It is factored
-// H_N = H_B (x) H_M and applied as B*B matmuls of a FIXED size M against a
-// resident +-H_M, summed in L0C -- see BLOCKED ACCUMULATION below, which is
-// what lets N=512 work at all (1.33-1.56x at N=256 and 1.64-2.55x at N=512 over
-// the dense form, whose H streamed from GM every tile; N <= 128 is untouched,
-// B == 1 there and that IS the dense matmul).
-//
-// Dropping the matmuls measures this kernel at 51-91% MOVEMENT, and its GM legs
-// cannot be made conversion-free the way the two-sided kernel's can -- see
-// issueTileLoad, where that is a counting argument and not a tuning gap.
-//
-// See the README for the measurements behind every constant here.
-
-// Samples per tile, as S * N, for N <= 128 -- where B == 1 and all of H sits in
-// L0B. 16384 keeps two L0C accumulators (S*N*4 each) inside 128 KB and two L0A
-// slots inside 64 KB.
 #ifndef PTO_OS_TILE_ELEMS
+// Samples per tile for N <= 128, where all of H is resident in L0B. Sized so
+// two fp32 accumulators and two L0A slots fit their buffers.
 #define PTO_OS_TILE_ELEMS 16384
 #endif
 #ifndef PTO_OS_S64
@@ -45,40 +15,21 @@ using namespace pto;
 #ifndef PTO_OS_S128
 #define PTO_OS_S128 (PTO_OS_TILE_ELEMS / 128)
 #endif
-// N >= 256 runs the blocked form, whose L0A slice is only (S x M), and it wants
-// a SMALLER tile than TILE_ELEMS / N would give it: a tall tile was justified
-// only by halving H's per-tile L1->L0B traffic, which blocking makes zero, and
-// with that gone a short tile's deeper buffering wins (1.24x at N=512). 16 at
-// N=256 is a cliff rather than a continuation -- below 32 the tile stops
-// covering the fan-out over B output blocks.
+
 #ifndef PTO_OS_S256
+// N >= 256 runs the blocked form, whose L0A slice is only (S x M). It wants a
+// shorter tile than TILE_ELEMS / N: deeper buffering beats a tall tile once
+// per-tile H traffic is zero. Tuned per N -- resweep on any geometry change.
 #define PTO_OS_S256 32
 #endif
 #ifndef PTO_OS_S512
 #define PTO_OS_S512 16
 #endif
 
-// BLOCKED ACCUMULATION -- the vector butterfly's staging, done on the cube.
-//
-// With N = B*M and H_N = H_B (x) H_M, blocking the product by M columns gives
-//
-//     Y[:, jM:(j+1)M] = sum_i  X[:, iM:(i+1)M] * (H_B[i,j] * H_M)
-//
-// and H_B[i,j] is +-1, so the ONLY right operands that ever occur are +H_M and
-// -H_M. The matmul is restricted to a fixed efficient size, the sum over i runs
-// in the L0C accumulator exactly as the vector core accumulates its log2(N)
-// butterfly stages, and H near the matmul shrinks from N*N to 2*M*M -- resident
-// in L0B for every N, so per-tile H traffic is zero, not merely smaller. Same
-// MAC count as the dense form, same single fp32 rounding, still one pass over
-// each pipe per block. H_B is never materialized: H_B[i,j] = (-1)^popcount(i&j).
-//
-// M MUST match _BLOCK in the host wrapper, which builds +-H_M; a mismatch hands
-// the kernel a wrong-sized operand and it computes garbage. 64, not the 128
-// that would still fit L0B: what matters is that the (S x M) L0A slice stays
-// small enough to double-buffer deeply, not that the matmuls are few and large
-// (3.01x over M=32 and 1.24x over M=128 at N=512). Resweep it if the tile
-// geometry changes -- it did not survive a geometry change once already.
 #ifndef PTO_OS_BLOCK
+// M of the blocked form, H_N = H_B (x) H_M. MUST equal _BLOCK in the host
+// wrapper, which builds the +-H_M operand: a mismatch hands the kernel a
+// wrong-sized operand and it silently computes garbage.
 #define PTO_OS_BLOCK 64
 #endif
 
@@ -97,32 +48,27 @@ constexpr uint32_t L1_BYTES = 512 * 1024;
 constexpr uint32_t L0AB_BYTES = 64 * 1024;
 constexpr uint32_t L0C_BYTES = 128 * 1024;
 
-// Ids are unique only per (src pipe, dst pipe) pair. Macros, not constexpr:
-// bisheng accepts only a literal EVENT_ID* token or a template non-type
-// argument as the third set_flag / wait_flag argument.
-#define EV_X0 EVENT_ID0  // L1 X ring slot 0
-#define EV_X1 EVENT_ID1  // L1 X ring slot 1
-#define EV_X2 EVENT_ID2  // L1 X ring slot 2
-#define EV_X3 EVENT_ID3  // L1 X ring slot 3
-// L0A slot free again: the consumer telling the producer it may overwrite. NOT
-// optional -- the two-sided kernel gets this for free from its L1 turnaround,
-// but here each pipe is touched once, so nothing holds MTE1 back and it runs
-// ahead by slots, letting tile i+2's TMOV land on the slot tile i's TMATMUL is
-// still reading. Its absence is a race that moves with the shape.
-#define EV_A0 EVENT_ID4  // (M->MTE1)    L0A/L0B slot 0 free
-#define EV_A1 EVENT_ID5  // (M->MTE1)    L0A/L0B slot 1 free
-#define EV_ACC EVENT_ID6  // (FIX->M)     L0C accumulator free
+// Ids are unique per (src pipe, dst pipe) pair, and one id must not carry two
+// channels out of the SAME pipe: a waiter on one channel can take the other's
+// credit and run ahead. Hence the L0A write-after-read edge (M -> MTE1) keeps
+// ids clear of the end-of-tile handoff (M -> FIX).
+#define EV_X0 EVENT_ID0
+#define EV_X1 EVENT_ID1
+#define EV_X2 EVENT_ID2
+#define EV_X3 EVENT_ID3
 
-// Sync<>'s default id 0 collides with EV_X0 on (MTE2, MTE1), so it must not be
-// called on that pair anywhere inside the tile loop.
+#define EV_A0 EVENT_ID4
+#define EV_A1 EVENT_ID5
+#define EV_ACC EVENT_ID6
 
+// Default id 0 collides with EV_X0 on (MTE2, MTE1), so this must not be called
+// on that pair inside the tile loop.
 template <pipe_t SrcPipe, pipe_t DstPipe>
 AICORE inline void Sync(uint32_t id = 0) {
   set_flag(SrcPipe, DstPipe, static_cast<event_t>(id));
   wait_flag(SrcPipe, DstPipe, static_cast<event_t>(id));
 }
 
-// The only Mat layout TLOAD / TMOV accept on A2/A3.
 template <uint32_t Rows, uint32_t Cols>
 using MatTile = Tile<TileType::Mat, half, Rows, Cols, BLayout::ColMajor, Rows,
                      Cols, SLayout::RowMajor, 512>;
@@ -132,15 +78,10 @@ using GmTile =
     GlobalTensor<half, TileShape2D<half, Rows, Cols, Layout::ND>,
                  BaseShape2D<half, Rows, Cols, Layout::ND>, Layout::ND>;
 
-// Same as MatTile but with a settable valid row count. The short-batch load's
-// destination must agree with a GM source whose row count is a runtime value.
 template <uint32_t Rows, uint32_t Cols, int RowValid>
 using MatTileV = Tile<TileType::Mat, half, Rows, Cols, BLayout::ColMajor,
                       RowValid, Cols, SLayout::RowMajor, 512>;
 
-// Same as GmTile but with a DYNAMIC row count. The base shape keeps the static
-// row stride (Cols); the DIM_0..2 strides it also carries are unused, because
-// the ND shape's leading dims are 1.
 template <uint32_t Rows, uint32_t Cols>
 using GmTileDyn =
     GlobalTensor<half, TileShape2D<half, DYNAMIC, Cols, Layout::ND>,
@@ -153,23 +94,22 @@ struct Layout {
   static constexpr unsigned kAccBytes = kTileElems * sizeof(float);
   static constexpr unsigned kHBytes = N * N * sizeof(half);
 
-  // All of H fits half of L0B, so the single resident copy is also
-  // double-bufferable: one dense matmul per tile and no H traffic at all.
-  // Otherwise: blocked accumulation against a resident +-H_M pair, which is no
-  // more traffic. Those are the only two forms, so every size's H is loaded
-  // once per core and no tile ever touches MTE2 for H.
-  static constexpr bool kResident = (kHBytes * 2 <= L0AB_BYTES);  // N <= 128
+  // Two forms only, and every size reaches one: H resident in L0B whole, or
+  // the +-H_M pair resident instead. Either way no tile ever loads H.
+  static constexpr bool kResident = (kHBytes * 2 <= L0AB_BYTES);
   static constexpr uint32_t kM = (N < PTO_OS_BLOCK) ? N : (uint32_t)PTO_OS_BLOCK;
-  static constexpr uint32_t kBlk = N / kM;  // B, the number of M-column blocks
+  static constexpr uint32_t kBlk = N / kM;
   static constexpr bool kBlocked = !kResident && (kBlk > 1);
   static_assert(kResident || kBlocked, "every size must reach one of the bodies");
   static_assert(!kBlocked || (kBlk * kM == N && kM % 16 == 0),
                 "M must divide N in whole fractal columns");
 
-  static constexpr unsigned kHPair = kM * kM * sizeof(half);  // one of +-H_M
+  static constexpr unsigned kHPair = kM * kM * sizeof(half);
+
+  // Four, because runRing prefetches three tiles ahead: tile i and tile i+4
+  // share a slot, which is the distance its credit arithmetic assumes.
   static constexpr unsigned kXSlots = 4;
 
-  // L1: H, either all of it or the +-H_M pair, then the X ring.
   static constexpr unsigned kL1H = 0;
   static constexpr unsigned kL1X =
       kL1H + (kResident ? kHBytes : 2 * kHPair);
@@ -178,14 +118,11 @@ struct Layout {
   static constexpr unsigned xSlot(uint32_t slot) {
     return kL1X + slot * kTileBytes;
   }
-  // The +-H_M pair in L1, indexed by SIGN: 0 is +H_M and 1 is -H_M.
+
   static constexpr unsigned l1HSign(uint32_t sign) {
     return kL1H + (sign & 1u) * kHPair;
   }
 
-  // L0A: the whole (S x N) tile when resident, else one (S x M) block of X.
-  // Two slots wherever they fit -- both counts are derived, so a tile size that
-  // does not fit gets shallower buffers instead of failing to compile.
   static constexpr unsigned kL0aX = 0;
   static constexpr unsigned kL0aSlot =
       kResident ? kTileBytes : S * kM * sizeof(half);
@@ -195,14 +132,11 @@ struct Layout {
   static constexpr unsigned l0aX(uint32_t i) {
     return kL0aX + (kL0aSlots == 2u ? (i & 1u) : 0u) * kL0aSlot;
   }
-  // Columns [i*M, (i+1)*M) of the L1 X tile. An L1 Mat tile is
-  // block-column-major, so whole 16-column groups are one contiguous range --
-  // the slice an L0A Left tile canNOT do, being fractal-ROW-major.
+
   static constexpr unsigned xBlock(uint32_t slot, uint32_t i) {
     return xSlot(slot) + i * kM * S * sizeof(half);
   }
 
-  // L0B: H resident in full, or the resident +-H_M pair indexed by SIGN.
   static constexpr unsigned kL0bH = 0;
   static_assert(kResident ? (kHBytes <= L0AB_BYTES) : (2 * kHPair <= L0AB_BYTES),
                 "L0B overflow");
@@ -210,21 +144,18 @@ struct Layout {
     return kL0bH + (kResident ? 0u : (sign & 1u) * kHPair);
   }
 
-  // L0C: the accumulator, two slots where they fit.
   static_assert(kAccBytes <= L0C_BYTES, "L0C overflow");
   static constexpr unsigned l0cAcc(bool par) {
     return (kAccSlots == 2u && par) ? kAccBytes : 0;
   }
-  // Output block j: columns [j*M, (j+1)*M) of the accumulator, contiguous for
-  // the same reason -- an L0C tile is block-column-major too.
+
   static constexpr unsigned l0cBlock(unsigned base, uint32_t j) {
     return base + j * kM * S * sizeof(float);
   }
 };
 
-// H_B[i,j] = (-1)^popcount(i & j) for the Sylvester matrix, so the sign of
-// block (i,j) is a parity, and H_B itself is never built or read. Returns 1 for
-// -H_M and 0 for +H_M, which are also their L0B slot indices.
+// H_B[i,j] = (-1)^popcount(i & j), so H_B is a parity of the loop indices and
+// is never built or read.
 AICORE inline uint32_t blockSign(uint32_t i, uint32_t j) {
   uint32_t v = i & j;
   v ^= v >> 8;
@@ -234,16 +165,16 @@ AICORE inline uint32_t blockSign(uint32_t i, uint32_t j) {
   return v & 1u;
 }
 
-// GM -> L1 -> L0B for H, once per core. The host buffer is the row-major
-// (N x N) matrix followed by +H_M and -H_M at offset N*N, so one buffer feeds
-// either form and only one of the two is ever read.
+// GM -> L1 -> L0B once per core. The host buffer holds the (N x N) matrix
+// followed by +H_M and -H_M at offset N*N; only one of the two forms is read.
 template <uint32_t N, uint32_t S>
 AICORE void loadHadamard(__gm__ half *h) {
   using L = Layout<N, S>;
   if constexpr (L::kBlocked) {
-    for (uint32_t s = 0; s < 2; ++s) {  // s = 0 is +H_M, s = 1 is -H_M
+    for (uint32_t s = 0; s < 2; ++s) {
       MatTile<L::kM, L::kM> h_l1;
       TASSIGN(h_l1, L::l1HSign(s));
+
       __gm__ half *src = h + N * N + s * L::kM * L::kM;
       GmTile<L::kM, L::kM> h_gm(src);
       TASSIGN(h_gm, src);
@@ -273,14 +204,11 @@ AICORE void loadHadamard(__gm__ half *h) {
   }
 }
 
-// GM -> L1 X slot, signalling MTE2->MTE1. The caller already holds the slot.
 template <uint32_t N, uint32_t S, uint32_t Slot, event_t EvX>
 AICORE void issueTileLoad(__gm__ half *x, uint32_t sample, uint32_t rows,
                           bool waitSlot) {
   using L = Layout<N, S>;
 
-  // Only tiles 4.. reuse a slot, so only they wait for one to come free. The
-  // first four find their slot untouched, which is why no credit is primed.
   if (waitSlot) wait_flag(PIPE_MTE1, PIPE_MTE2, EvX);
 
   MatTileV<S, N, DYNAMIC> x_l1;
@@ -288,18 +216,11 @@ AICORE void issueTileLoad(__gm__ half *x, uint32_t sample, uint32_t rows,
   x_l1.SetValidRow(rows);
   __gm__ half *x_tile = x + sample * N;
 
-  // A CONVERTING ND->NZ load, and it cannot be made conversion-free. H_N is a
-  // tensor power of H_2, so a compile-time operand can apply anything to one
-  // FIELD of the GM byte index p, and the layout fixes which fields exist: NZ
-  // gives the right operand p[0,4) u p[a+4,t) and the left operand p[4,a+4);
-  // ND is the mirror image, since TMOV from an ND L1 tile reads the bytes as
-  // fractals AND TRANSPOSES (measured) rather than converting.
-  //
-  // Every operand here, dense or blocked, is a RIGHT operand, so exactly one
-  // field is covered and the other keeps live transform bits -- p[4,a+4) under
-  // NZ, p[0,4) under ND, both non-empty for every N in the table. Covering both
-  // means a left multiply as well, which is the two-sided kernel: "one-sided"
-  // and "conversion-free GM transfers" are mutually exclusive by construction.
+  // A converting ND->NZ load, and it cannot be avoided here. A compile-time
+  // operand can absorb the layout change for one field of the GM byte index;
+  // every operand in a one-sided product is a RIGHT operand, so it covers one
+  // field and the other keeps live transform bits. Conversion-free transfers
+  // would need a left multiply too, which is the two-sided kernel.
   GmTileDyn<S, N> x_gm(x_tile);
   TASSIGN(x_gm, x_tile);
   x_gm.template SetShape<GlobalTensorDim::DIM_3>(rows);
@@ -307,9 +228,6 @@ AICORE void issueTileLoad(__gm__ half *x, uint32_t sample, uint32_t rows,
   set_flag(PIPE_MTE2, PIPE_MTE1, EvX);
 }
 
-// One input block of the blocked form: an (S x M) column slice of X to L0A,
-// then B matmuls against +-H_M, one into each output block's accumulator. Slot
-// parity is a template argument because the flag ids must be literal.
 template <uint32_t N, uint32_t S, uint32_t XSlot, bool APar, event_t EvA>
 AICORE void blockStep(unsigned accBase, uint32_t i) {
   using L = Layout<N, S>;
@@ -319,7 +237,7 @@ AICORE void blockStep(unsigned accBase, uint32_t i) {
   TASSIGN(x_l1, L::xBlock(XSlot, i));
   TASSIGN(x_l0a, L::l0aX(APar ? 1u : 0u));
 
-  wait_flag(PIPE_M, PIPE_MTE1, EvA);  // block i-2 has finished with the slot
+  wait_flag(PIPE_M, PIPE_MTE1, EvA);
   TMOV(x_l0a, x_l1);
   Sync<PIPE_MTE1, PIPE_M>();
 
@@ -328,21 +246,16 @@ AICORE void blockStep(unsigned accBase, uint32_t i) {
     TASSIGN(acc_j, L::l0cBlock(accBase, j));
     TileRight<half, L::kM, L::kM> h_j;
     TASSIGN(h_j, L::l0bH(blockSign(i, j)));
-    // i == 0 initializes every output block; every later block accumulates.
-    // Both run on PIPE_M in order, so the read-after-write between them needs
-    // no flag.
+
     if (i == 0) {
       TMATMUL(acc_j, x_l0a, h_j);
     } else {
       TMATMUL_ACC(acc_j, x_l0a, h_j);
     }
   }
-  set_flag(PIPE_M, PIPE_MTE1, EvA);  // slot free for block i+2
+  set_flag(PIPE_M, PIPE_MTE1, EvA);
 }
 
-// Y[sample .. sample+S) = X * H, for a tile already loaded into X slot Slot.
-// One pass over the contraction with no L1 turnaround, so the next tile's MTE1
-// is never stuck behind this tile's matmul.
 template <uint32_t N, uint32_t S, uint32_t Slot, bool Par, event_t EvX,
           event_t EvA>
 AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample,
@@ -350,30 +263,34 @@ AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample,
                          bool freeAcc, bool waitA, bool freeA) {
   using L = Layout<N, S>;
 
-  wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);  // this tile's load has landed
+  // Nothing else holds MTE1 back -- a tile touches each pipe once -- so
+  // without the EvA write-after-read edge below MTE1 runs ahead by slots and
+  // lands tile i+2's TMOV on the slot tile i's TMATMUL is still reading.
+  wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);
 
   TileAcc<float, S, N> acc;
   TASSIGN(acc, L::l0cAcc(Par));
 
   if constexpr (L::kResident) {
-    // H is already in L0B and stays there: one matmul, nothing to move.
+
     MatTile<S, N> x_l1;
     TileLeft<half, S, N> x_l0a;
     TASSIGN(x_l1, L::xSlot(Slot));
     TASSIGN(x_l0a, L::l0aX(Par ? 1u : 0u));
-    if (waitA) wait_flag(PIPE_M, PIPE_MTE1, EvA);  // tile i-2 done with the slot
+    if (waitA) wait_flag(PIPE_M, PIPE_MTE1, EvA);
     TMOV(x_l0a, x_l1);
-    if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // X slot free again
+    if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);
 
     TileRight<half, N, N> h_l0b;
     TASSIGN(h_l0b, L::kL0bH);
-    if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous store drained
+
+    if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
     Sync<PIPE_MTE1, PIPE_M>();
     TMATMUL(acc, x_l0a, h_l0b);
-    if (freeA) set_flag(PIPE_M, PIPE_MTE1, EvA);  // slot free for tile i+2
+    if (freeA) set_flag(PIPE_M, PIPE_MTE1, EvA);
   } else if constexpr (L::kBlocked) {
-    // +-H_M likewise, so a block costs one TMOV and B matmuls.
-    if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous store drained
+
+    if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
     const unsigned accBase = L::l0cAcc(Par);
     for (uint32_t i = 0; i < L::kBlk; ++i) {
       if (i & 1u) {
@@ -382,12 +299,13 @@ AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample,
         blockStep<N, S, Slot, false, EV_A0>(accBase, i);
       }
     }
-    if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // last block read it
+    if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);
   }
+
   Sync<PIPE_M, PIPE_FIX>();
 
-  // The cube ran all S rows whatever `rows` says -- the transform is per-sample,
-  // so the rows past `rows` only reach output rows that are never stored.
+  // The cube ran all S rows whatever `rows` says. The transform is per-sample,
+  // so the surplus rows reach only output rows this store never writes.
   TileAcc<float, S, N, DYNAMIC> acc_out;
   TASSIGN(acc_out, L::l0cAcc(Par));
   acc_out.SetValidRow(rows);
@@ -399,57 +317,35 @@ AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample,
   if (freeAcc) set_flag(PIPE_FIX, PIPE_M, EV_ACC);
 }
 
-
-// A core's span as ONE ring of `m` tiles, every one at its natural position
-// and every one MASKED to `rowsAt` rows.
+// A core's span as one ring: every tile at its natural position, every tile
+// masked to min(S, rows left). A full tile is just where that min picks S, so
+// there is no special last tile.
 //
-// A full tile is simply the case where that min picks S, so there is no special
-// last tile: no back-up, no duplicated rows, and no separate remainder unit
-// behind its own prime and drain. The remainder is an ordinary ring tile, which
-// means it overlaps its predecessor like any other, and it is a FULL-SIZE S
-// tile with a short transfer rather than a small tile of its own.
-//
-// The masking is free on the transfers -- an ND->NZ load moves the GM source's
-// row count and TSTORE moves `src.GetValidRow()` -- but not on the tile: the
-// cube runs all S rows regardless. That costs nothing here because the only
-// tile ever short is the last one, and it is overlapped.
+// NOTE: the ring does NOT drain itself. Anything placed after it that reuses
+// L1, L0A or the accumulator must first hand the buffers over on FIX -> M,
+// M -> MTE1 and MTE1 -> MTE2, or the cube faults with FIXP reading L0C while
+// M overwrites it.
 template <uint32_t N, uint32_t S>
 AICORE void runRing(__gm__ half *x, __gm__ half *h, __gm__ half *y,
                     uint32_t base, uint32_t end) {
-  // The span fixes the tile count, so the caller has nothing to pass but the
-  // range. Exactly ONE tile is ever short -- tile `last`, with `rest` rows --
-  // so every row count below is a pick between `rest` and the constant S, and
-  // there is no arithmetic per tile.
+
+  // Exactly one tile is ever short, so every row count below picks between
+  // `rest` and the constant S.
   const uint32_t span = end - base;
-  const uint32_t last = (span - 1) / S;        // span >= S, so this is m - 1
-  const uint32_t rest = span - last * S;       // 1..S
+  const uint32_t last = (span - 1) / S;
+  const uint32_t rest = span - last * S;
 
   using L = Layout<N, S>;
   constexpr uint32_t kAcc = L::kAccSlots;
 
-  // NO primed credits for the X ring or the accumulator, and none drained.
+  // No primed credits, and none drained. A credit says a resource is free
+  // again, which is only worth saying once someone has held it: tile j reuses
+  // tile j-4's slot, so it waits iff j >= 4 and signals iff tile j+4 exists.
+  // The pairing is exact, and tile j's load is issued an iteration after tile
+  // j-4 was consumed, so a credit is always produced before it is awaited.
   //
-  // A credit means "this resource is free again", which is only worth saying
-  // when someone had it. Priming asserts it up front for all four slots and
-  // both accumulators, then drains whatever nobody consumed -- 16 flag ops
-  // that a core pays whether it runs 1 tile or 200. Instead each tile waits
-  // only if an earlier tile used its slot and signals only if a later tile
-  // will reuse it, so the flag traffic scales with the work and not with the
-  // ring's capacity.
-  //
-  // The pairing is exact, which is why nothing is left outstanding: tile j
-  // reuses the slot of tile j-4, so its wait exists iff j >= 4 and matches the
-  // set of tile j-4, whose own set exists iff j <= last. Tile j's load is
-  // issued one iteration AFTER tile j-4 was consumed, so the credit is always
-  // produced before it is awaited. Same argument for the accumulator at depth
-  // kAccSlots and for resident L0A at depth 2.
-  //
-  // Worth 1.02x - 1.13x, largest where it should be: 0.89x - 0.95x at one tile
-  // per core, decaying to 0.998x at 171, since the saving is a fixed 16 ops.
-  //
-  // The blocked body is the exception. Its L0A credits rotate between the B
-  // blocks WITHIN a tile, not between tiles, so the first two blocks of the
-  // whole run have no predecessor to wait on and the pair must be primed.
+  // The blocked body is the exception: its L0A credits rotate between the B
+  // blocks within a tile, so the run's first two blocks have no predecessor.
   if constexpr (!L::kResident) {
     set_flag(PIPE_M, PIPE_MTE1, EV_A0);
     set_flag(PIPE_M, PIPE_MTE1, EV_A1);
@@ -467,13 +363,14 @@ AICORE void runRing(__gm__ half *x, __gm__ half *h, __gm__ half *y,
     const bool prefetch = (i + 3 <= last);
     const uint32_t next = cur + 3 * S;
     const uint32_t nrow = (i + 3 == last) ? rest : S;
-    // Tile i+3 lands in the slot tile i-1 used, so it waits iff i >= 1.
+
     const bool pwait = (i >= 1);
-    const bool fslot = (i + 4 <= last);   // some later tile reuses this slot
+    const bool fslot = (i + 4 <= last);
     const bool wacc = (i >= kAcc);
     const bool facc = (i + kAcc <= last);
-    const bool wa = (i >= 2);             // resident only; blocked is primed
+    const bool wa = (i >= 2);
     const bool fa = (i + 2 <= last);
+
     switch (i & 3u) {
       case 0:
         if (prefetch) issueTileLoad<N, S, 3, EV_X3>(x, next, nrow, pwait);
@@ -504,15 +401,14 @@ AICORE void runRing(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   }
 }
 
-// One tile, standalone: the ring's own load and body on slot 0. It has no
-// neighbour to wait for or signal to, so every credit is skipped -- six flag
-// ops. Not runRing: that would instantiate the loop and all four slot/parity
-// combinations at every size tailTile can reach.
+// One tile, standalone. It has no neighbour to wait for or signal to, so
+// every credit is skipped. Not runRing: that would instantiate its loop and
+// all four slot/parity combinations at every size runShortSpan can reach.
 template <uint32_t N, uint32_t S>
 AICORE void oneTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
                     uint32_t sample, uint32_t rows) {
   using L = Layout<N, S>;
-  if constexpr (!L::kResident) {  // blocked L0A credits rotate between blocks
+  if constexpr (!L::kResident) {
     set_flag(PIPE_M, PIPE_MTE1, EV_A0);
     set_flag(PIPE_M, PIPE_MTE1, EV_A1);
   }
@@ -525,15 +421,11 @@ AICORE void oneTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   }
 }
 
-// A span of 1..S samples, as ONE tile of the smallest size that covers it.
-//
-// Masking is free on the TRANSFERS but not on the tile -- the cube runs all S
-// rows whatever the row count says -- so serving every short span from a
-// top-level tile is 1.09x - 1.22x slower below ~100 samples. Recursing while
-// the span fits in half the tile picks the smallest size that covers it, which
-// caps the waste below half a tile. A compile-time CHOICE, not a chain: every
-// size below the chosen one returns without doing work, so exactly one tile
-// runs, and 16 is the floor because TMOV's TExtract rejects fewer rows.
+// A span of 1..S samples, as one tile of the smallest size that covers it.
+// Masking is free on the transfers but not on the tile -- the cube runs all S
+// rows regardless -- so a short span in a top-level tile wastes most of it.
+// A compile-time choice, not a chain: exactly one tile runs. 16 is the floor,
+// below which TMOV's TExtract rejects the tile.
 template <uint32_t N, uint32_t S>
 AICORE void runShortSpan(__gm__ half *x, __gm__ half *h, __gm__ half *y,
                          uint32_t sample, uint32_t span) {
@@ -546,28 +438,10 @@ AICORE void runShortSpan(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   oneTile<N, S>(x, h, y, sample, span);
 }
 
-// Consume [sample, end) as exactly one unit of work, ascending: either a ring
-// of S-sample tiles whose last one is masked, or -- for a span too short to
-// fill half a tile -- a single smaller tile. Either way the samples are
-// touched once, in increasing address order, so each core's GM reads and
-// writes are one forward sequential stream.
-//
-// This replaced a recursive power-of-two HALVING chain that ran whole tiles at
-// S, then recursed on S/2 down to 16, and finally masked 1..15 rows. That chain
-// cost nothing in bulk -- work is split by TILES, so only the truncated, under-
-// loaded last core ever descended, and its serialization hid in that core's own
-// slack (N=64 batch 65535 vs 65536: 5.46 vs 5.48 us). It cost up to 1.56x where
-// the slack is gone, at one or two tiles per core, because each level was a
-// separate prime/ring/drain with nothing to overlap.
-//
-// Keeping the remainder INSIDE the ring is what the measurements settled on.
-// Splitting it off to run at its own smaller size wastes 7 cube rows instead
-// of 135, and is 1.14x - 1.22x SLOWER at N=64: the remainder stops overlapping,
-// and because the ring no longer drains itself it needs a three-edge handoff
-// before the tail may touch L0C, L0A and L1 -- a pipe flush in front of a tile
-// that then overlaps nothing. The wasted rows are hidden, the flush is not.
-// Covering the remainder with extra 16-row tiles instead is 0.78x - 0.91x.
-// The README carries the grid.
+// Consume [sample, end) ascending, as one unit of work: a ring of S-sample
+// tiles, or a single smaller tile when the span cannot fill half of one. The
+// remainder stays INSIDE the ring, where it overlaps its predecessor; split
+// off it would need the handoff above and overlap nothing.
 template <uint32_t N, uint32_t S>
 AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
                      uint32_t &sample, uint32_t end) {
@@ -575,8 +449,7 @@ AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   if (span == 0) {
     return;
   }
-  // A span past half a tile is worth a ring tile of its own; anything shorter
-  // goes to the next size down. At S == 16 there is no next size down.
+
   if constexpr (S > 16) {
     if (span <= S / 2) {
       runShortSpan<N, S / 2>(x, h, y, sample, span);
@@ -597,10 +470,8 @@ AICORE void runOnesided(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   const uint32_t num_cores = block_num;
   const uint32_t core_id = get_block_idx();
 
-  // Split by TILES, not samples. An even sample split gives most cores a span
-  // that is not a whole number of tiles, so most of them end on a masked tile
-  // and, below half a tile, drop a size as well -- paying a short tile's worth
-  // of wasted rows on every core instead of on the one truncated core.
+  // Split by TILES, so every core but the last gets a whole number of them
+  // and only the truncated core ends on a short tile.
   const uint32_t tiles_per_core = DIV_ROUNDUP(DIV_ROUNDUP(batch, S), num_cores);
   const uint32_t begin = tiles_per_core * S * core_id;
   if (begin >= batch) {
@@ -624,20 +495,22 @@ AICORE void runOnesided(__gm__ half *x, __gm__ half *h, __gm__ half *y,
 
 AICORE void dispatchOnesided(__gm__ half *x, __gm__ half *h, __gm__ half *y,
                              uint32_t batch, uint32_t n) {
-  // Every transfer below needs a row count > 0, and an empty batch has no work.
+
   if (batch == 0) {
     return;
   }
   switch (n) {
     FAST_HADAMARD_ONESIDED_CASES(FAST_HADAMARD_ONESIDED_DISPATCH_CASE)
+    // Unsupported n: the host wrapper validates, so reaching here is a bug
+    // upstream rather than something to handle.
     default:
       return;
   }
 }
 
-}  // namespace
+}
 
-#endif  // cube core
+#endif
 
 __global__ AICORE void fast_hadamard_onesided_fp16(__gm__ void *x,
                                                    __gm__ void *y,
@@ -654,6 +527,6 @@ __global__ AICORE void fast_hadamard_onesided_fp16(__gm__ void *x,
 extern "C" void call_kernel(uint32_t blockDim, void *stream, uint8_t *x,
                             uint8_t *y, uint8_t *h, uint32_t batch,
                             uint32_t n) {
-  // blockDim counts cube cores, so there is no doubling here.
+
   fast_hadamard_onesided_fp16<<<blockDim, nullptr, stream>>>(x, y, h, batch, n);
 }
