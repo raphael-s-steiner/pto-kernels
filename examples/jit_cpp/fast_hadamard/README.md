@@ -1255,6 +1255,51 @@ spreading those 255 rows over the 3 cores the schedule launches could save at
 most ~0.20 us, and only if bandwidth scaled with cores, which **Why N=256 is the
 weak case** shows it does not in the shallow regime. Worth 1.1x at best.
 
+#### Credits are primed lazily, not up front (1.02x - 1.13x)
+
+The ring used to open by asserting that all four X slots, both accumulators and
+both L0A slots were free, and to close by draining whatever nobody consumed --
+**16 flag ops a core pays whether it runs 1 tile or 200**. A credit means "this
+resource is free again", which is only worth saying when someone had it.
+
+So nothing is primed. Each tile waits for a slot only if an earlier tile used
+it, and signals it free only if a later tile will reuse it:
+
+```
+tile j's load waits   iff  j >= 4          (it reuses tile j-4's slot)
+tile i's body signals iff  i + 4 <= last   (tile i+4 exists to reuse it)
+```
+
+The pairing is exact -- tile `j`'s wait matches tile `j-4`'s set, one for one --
+and tile `j`'s load is issued one iteration *after* tile `j-4` was consumed, so
+the credit is always produced before it is awaited. The same argument covers the
+accumulator at depth `kAccSlots` and resident L0A at depth 2. The blocked body
+is the exception and keeps its primed pair: its L0A credits rotate between the
+`B` blocks *within* a tile, so the run's first two blocks have no predecessor.
+
+The saving is a constant, so the win is set by how little work it is spread
+over -- which is what the measurement shows, and the monotone decay with tiles
+per core is the evidence that the mechanism is the one claimed:
+
+| tiles per core | shapes | speedup |
+|---|---|---|
+| 1 | N=64 b256, N=128 b128, N=256 b32, N=512 b16, ... | **1.06x - 1.13x** |
+| 2 - 3 | N=128 b2048, N=256 b1024, N=512 b1024 | 1.05x - 1.10x |
+| 7 - 22 | N=256 b5000, N=512 b5000, N=64 b65536 | 1.02x - 1.04x |
+| 86 - 171 | N=256 / N=512 b65536 | 1.00x |
+
+18 of 21 shapes beyond 2%, none slower; `.so` 38120 -> 39272 bytes. Because this
+is a sync-protocol change -- the class of defect recorded under *one event id
+must not carry two channels out of one pipe*, which was intermittent and
+shape-dependent -- it was gated on **0 failures in 15 full correctness sweeps**
+(84 shapes x 4 `block_dim` each, bit-exactness plus fp64 residual), not on one
+green run.
+
+Note the generalisation, because it is not specific to this ring: a double
+buffer's prime/drain is a *fixed* cost, so it is invisible in the bulk A/B that
+usually justifies the buffering and it dominates exactly where runs are short.
+The same reasoning is why a lone tile does not go through the ring at all.
+
 #### Three gotchas worth recording
 
 **The straight pipe needs WAR flags the turnaround body got for free** -- the
