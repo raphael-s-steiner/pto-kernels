@@ -399,74 +399,6 @@ AICORE void onesidedTile(__gm__ half *h, __gm__ half *y, uint32_t sample,
   if (freeAcc) set_flag(PIPE_FIX, PIPE_M, EV_ACC);
 }
 
-// The rows a core is left with when its span is shorter than one tile, 1..S-1.
-// The tile geometry is the compile-time S, but the TRANSFERS are not: an
-// ND->NZ load moves the GM source's row count (A2/A3) and TSTORE moves
-// `src.GetValidRow()`, so MTE2 reads exactly `rows` rows and FIX writes exactly
-// `rows` rows. The cube still runs a full S-row tile over whatever else L1
-// holds -- the transform is per-sample, so those rows only reach output rows
-// that are never stored.
-//
-// The blocked body is the ring's own `blockStep`, so the B blocks of one tile
-// double-buffer L0A against each other exactly as they do in the ring. It is
-// NOT enough to sync M->MTE1 once per block instead: a single tile is the whole
-// of a short-span core's work, so serializing its B blocks is the critical
-// path, and doing that cost 1.35x at N=512 and 1.14x at N=256. That is a cost
-// of this body alone and has nothing to do with how the span was divided.
-template <uint32_t N, uint32_t S>
-AICORE void partialTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
-                        uint32_t sample, uint32_t rows) {
-  using L = Layout<N, S>;
-
-  {
-    MatTileV<S, N, DYNAMIC> x_l1;
-    TASSIGN(x_l1, L::xSlot(0));
-    x_l1.SetValidRow(rows);
-    __gm__ half *x_tile = x + sample * N;
-    GmTileDyn<S, N> x_gm(x_tile);
-    TASSIGN(x_gm, x_tile);
-    x_gm.template SetShape<GlobalTensorDim::DIM_3>(rows);
-    TLOAD(x_l1, x_gm);
-  }
-  Sync<PIPE_MTE2, PIPE_MTE1>(7);
-
-  TileAcc<float, S, N> acc;
-  TASSIGN(acc, L::l0cAcc(false));
-  if constexpr (L::kResident) {
-    MatTile<S, N> x_l1;
-    TileLeft<half, S, N> x_l0a;
-    TASSIGN(x_l1, L::xSlot(0));
-    TASSIGN(x_l0a, L::l0aX(0));
-    TMOV(x_l0a, x_l1);
-    TileRight<half, N, N> h_l0b;
-    TASSIGN(h_l0b, L::kL0bH);
-    Sync<PIPE_MTE1, PIPE_M>(7);
-    TMATMUL(acc, x_l0a, h_l0b);
-  } else {
-    set_flag(PIPE_M, PIPE_MTE1, EV_A0);
-    set_flag(PIPE_M, PIPE_MTE1, EV_A1);
-    for (uint32_t i = 0; i < L::kBlk; ++i) {
-      if (i & 1u) {
-        blockStep<N, S, 0, true, EV_A1>(0, i);
-      } else {
-        blockStep<N, S, 0, false, EV_A0>(0, i);
-      }
-    }
-    wait_flag(PIPE_M, PIPE_MTE1, EV_A0);
-    wait_flag(PIPE_M, PIPE_MTE1, EV_A1);
-  }
-  Sync<PIPE_M, PIPE_FIX>();
-
-  TileAcc<float, S, N, DYNAMIC> acc_out;
-  TASSIGN(acc_out, L::l0cAcc(false));
-  acc_out.SetValidRow(rows);
-  __gm__ half *y_tile = y + sample * N;
-  GmTileDyn<S, N> y_gm(y_tile);
-  TASSIGN(y_gm, y_tile);
-  y_gm.template SetShape<GlobalTensorDim::DIM_3>(rows);
-  TSTORE(y_gm, acc_out);
-  Sync<PIPE_FIX, PIPE_M>(7);
-}
 
 // A core's span as ONE ring of `m` tiles, every one at its natural position
 // and every one MASKED to `rowsAt` rows.
@@ -572,87 +504,81 @@ AICORE void runRing(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   }
 }
 
-// One masked tile at the SMALLEST instantiated tile size that covers `rows`.
-//
-// Masking is free on the TRANSFERS but not on the tile: the cube still runs all
-// S rows whatever the row count says, so a 1..15 row span in an S = 256 tile
-// wastes 240 rows of TMOV and MACs -- 0.19 us at N=64 and 0.32 us at N=128,
-// which is 15-20% of a short-span core, enough to lose to the chain this
-// replaced. Choosing the level by `rows` bounds the waste at under half a tile
-// and costs a scalar compare chain plus one partialTile instantiation per
-// level.
-//
-// The recursion is a compile-time CHOICE, not a chain: every level below the
-// chosen one returns before doing any work, so exactly one tile ever runs.
+// One tile, standalone: the ring's own load and body on slot 0. It has no
+// neighbour to wait for or signal to, so every credit is skipped -- six flag
+// ops. Not runRing: that would instantiate the loop and all four slot/parity
+// combinations at every size tailTile can reach.
 template <uint32_t N, uint32_t S>
-AICORE void maskedTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
-                       uint32_t sample, uint32_t rows) {
-  if constexpr (S > 16) {
-    if (rows <= S / 2) {
-      maskedTile<N, S / 2>(x, h, y, sample, rows);
-      return;
-    }
+AICORE void oneTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
+                    uint32_t sample, uint32_t rows) {
+  using L = Layout<N, S>;
+  if constexpr (!L::kResident) {  // blocked L0A credits rotate between blocks
+    set_flag(PIPE_M, PIPE_MTE1, EV_A0);
+    set_flag(PIPE_M, PIPE_MTE1, EV_A1);
   }
-  partialTile<N, S>(x, h, y, sample, rows);
+  issueTileLoad<N, S, 0, EV_X0>(x, sample, rows, false);
+  onesidedTile<N, S, 0, false, EV_X0, EV_A0>(h, y, sample, rows, false, false,
+                                             false, false, false);
+  if constexpr (!L::kResident) {
+    wait_flag(PIPE_M, PIPE_MTE1, EV_A0);
+    wait_flag(PIPE_M, PIPE_MTE1, EV_A1);
+  }
 }
 
-// Consume [sample, end) as exactly ONE unit of work: a ring whose every tile
-// carries its own row count, or -- when the span is shorter than a single tile
-// -- one standalone masked tile. Either way nothing is left over, so there is
-// no second unit and no chain of them.
+// Consume [sample, end) as ONE ring, at the largest tile size whose last tile
+// would not be more than half empty. The only decision here is that size: the
+// ring itself handles any span >= 1, because its last tile is masked.
 //
-// The two arms exist because a LONE tile has nothing to overlap. Inside the
-// ring the short tile is free, since it pipelines against its predecessor; on
-// its own it would pay the ring's prime and drain for no overlap at all, which
-// measured 1.05-1.11x. Hence: ring when there is something to overlap with,
-// standalone when there is not.
+// This replaced a recursive power-of-two HALVING chain that ran whole tiles at
+// S, then recursed on S/2 down to 16, and finally masked 1..15 rows. That chain
+// cost nothing in bulk -- work is split by TILES, so only the truncated, under-
+// loaded last core ever descended, and its serialization hid in that core's own
+// slack (N=64 batch 65535 vs 65536: 5.46 vs 5.48 us). It cost up to 1.56x where
+// the slack is gone, at one or two tiles per core, because each level was a
+// separate prime/ring/drain with nothing to overlap.
 //
-// This replaced a recursive power-of-two HALVING chain: run span/S whole tiles,
-// then tail-recurse on S/2, down to 16, and mask the last 1..15 rows. That was
-// correct and it cost nothing in bulk -- work is split by TILES, so every core
-// but the last-with-work has a span that is a whole multiple of S and never
-// descends at all, and the one core that does descend is the truncated, UNDER-
-// loaded one, whose serialization hides in its slack (N=64 batch 65535 against
-// 65536: 5.46 vs 5.48 us, no difference).
+// Three shapes of this function were measured against each other. Dropping the
+// size pick entirely -- one ring at the top-level S for every span -- is the
+// smallest code (-16%) and is 1.09x - 1.22x SLOWER below ~100 samples: masking
+// is free on the transfers but NOT on the tile, so a 1-row span at N=128 still
+// pushes 128 rows through MTE1 and the cube. Keeping the pick in a separate
+// maskedTile/oneTile pair is the smallest fast version, at the cost of two more
+// helpers. Folding it in here, as below, measures identical to that pair
+// everywhere and costs 29% more code, since runRing is then instantiated at
+// every level. The README carries the grid.
 //
-// What it cost was the regime where that slack is gone -- tiles_per_core of 1
-// or 2, where the descending core IS the critical path. There each level is a
-// full prime/ring/drain for one tile, with no predecessor to overlap, and a
-// 255-sample span at N=64 walked five of them back to back. Collapsing that to
-// one unit is 1.28-1.56x over the four sizes at short and unaligned spans, and
-// parity everywhere else, including every aligned shape and the whole bulk
-// range. Note that N=512 (S=16) never had a chain to walk and still gains: two
-// thirds of the win is the ring fold and the blocked partialTile body, not the
-// chain. The README has the full grid.
-//
-// Halving back down was NOT the cheap alternative it looks like: a 16-row ring
-// tile costs ~0.11 us at the margin, so the 15 small tiles that cover a
-// 255-sample span lose to four serialized big ones, and a two-level form (S
-// then 16) measured 0.78-0.86x -- slower than the chain it was meant to fix.
-// The short span wants ONE big masked tile, which is what maskedTile gives it.
-//
-// Two further shapes were built and measured before this one was settled on,
-// and both are worse. Running the ring over WHOLE tiles only and leaving the
-// remainder to a standalone maskedTile is simpler still, but the remainder
-// then overlaps nothing: 1.045x and 1.071x at N=64, where S = 256 makes it a
-// large un-overlapped tile. Putting EVERY span through the ring, the short
-// ones included, fixes that but loses the other end, 1.05-1.11x on spans below
-// one tile. The split above takes the better arm of each.
-template <uint32_t N, uint32_t S>
+// Covering a remainder with extra 16-row tiles instead is 0.78x - 0.91x: a
+// 16-row ring tile costs ~0.11 us at the margin, so many small tiles lose to
+// one big masked one.
+template <uint32_t N, uint32_t S, bool Top = true>
 AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
                      uint32_t &sample, uint32_t end) {
   const uint32_t base = sample;
   const uint32_t span = end - base;
-  if (span >= S) {
-    // The mask rides the RING: every tile is full-size S and carries its own
-    // row count, so the remainder is an ordinary ring tile rather than a
-    // separate drained unit -- and nothing is recomputed.
+  if (span == 0) {
+    return;
+  }
+  // A span under half a tile drops a size, so the one masked tile a short span
+  // ends on is never more than half empty. A compile-time CHOICE, not a chain:
+  // every level below the chosen one returns without doing work.
+  if constexpr (S > 16) {
+    if (span <= S / 2) {
+      runTiles<N, S / 2, false>(x, h, y, sample, end);
+      return;
+    }
+  }
+  if constexpr (Top) {
+    // Any number of tiles, the last of them masked and overlapped like the
+    // rest. Splitting that last one off into a right-sized standalone tile
+    // saves wasted cube rows but costs the overlap AND a full pipe flush to
+    // hand the buffers over: 1.14x - 1.22x at N=64. The wasted rows are
+    // hidden, the flush is not.
     runRing<N, S>(x, h, y, base, end);
-  } else if (span > 0) {
-    // A span shorter than one tile is a single tile either way, and a lone
-    // tile has nothing to overlap, so it skips the ring's prime/drain and runs
-    // standalone. Putting it through the ring instead measured 1.05-1.11x.
-    maskedTile<N, S>(x, h, y, base, span);
+  } else {
+    // Recursing got here, so S / 2 < span <= S: exactly one tile. Calling the
+    // ring for it would instantiate its loop and all four slot/parity
+    // combinations at every size (+29% .so) to run a single iteration.
+    oneTile<N, S>(x, h, y, base, span);
   }
   sample = end;
 }
@@ -666,9 +592,10 @@ AICORE void runOnesided(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   const uint32_t num_cores = block_num;
   const uint32_t core_id = get_block_idx();
 
-  // Split by TILES, not samples: an even sample split leaves most cores walking
-  // the power-of-two fallback down to its smallest tile, which costs a full
-  // tile's handshakes for a fraction of the work.
+  // Split by TILES, not samples. An even sample split gives most cores a span
+  // that is not a whole number of tiles, so most of them end on a masked tile
+  // and, below half a tile, drop a size as well -- paying a short tile's worth
+  // of wasted rows on every core instead of on the one truncated core.
   const uint32_t tiles_per_core = DIV_ROUNDUP(DIV_ROUNDUP(batch, S), num_cores);
   const uint32_t begin = tiles_per_core * S * core_id;
   if (begin >= batch) {

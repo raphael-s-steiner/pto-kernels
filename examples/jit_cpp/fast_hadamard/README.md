@@ -1182,10 +1182,52 @@ The replacement makes a core's span exactly **one** unit of work:
 - `span < S`: **one** standalone masked tile, at the smallest instantiated tile
   size that covers the span.
 
-The two arms exist because a **lone** tile has nothing to overlap. Inside the
-ring a short tile is free; on its own it would pay the ring's prime and drain
-for no overlap at all. Both ends were measured, and each loses at the other's
-end of the range:
+There is now only **one** body. `runRing` handles any span >= 1, because its
+last tile is masked, so `runTiles` decides nothing but the tile SIZE and the
+hand-written `partialTile` that used to duplicate the transfers is gone.
+
+That merge depended on the lazy priming below, and the order is the lesson: it
+measured **1.05x - 1.16x slower** while the ring still primed its credits, and
+became free the moment they went away. A sharing refactor that benchmarks badly
+may only be blocked by a fixed cost somewhere else — fix that, then re-measure
+rather than recording the refactor as rejected.
+
+Four shapes of `runTiles` were measured against each other. All are parity in
+bulk; they differ only on short and unaligned spans:
+
+| `runTiles` | `.so` | where it loses |
+|---|---:|---|
+| no size pick: one ring at the top-level S for every span | 32936 | **1.09x - 1.22x** below ~100 samples |
+| full tiles in the ring, remainder split off at its own size | 39208 | **1.14x - 1.22x** on mixed spans at N=64 |
+| size pick folded in, every level entering `runRing` | 50440 | nothing, but +38% code |
+| **size pick folded in, recursed levels run one tile** | **36520** | **nothing** |
+
+Two of those are instructive.
+
+**Dropping the size pick** is the smallest and simplest code and it loses,
+because **masking is free on the transfers but not on the tile**: the cube runs
+all `S` rows whatever the row count says, so a 1-row span at N=128 still pushes
+128 rows through MTE1 and the cube.
+
+**Splitting the remainder off** so it runs at its own smaller size — 7 wasted
+rows instead of 135 — also loses, and badly. The remainder stops overlapping,
+and since the ring no longer drains itself it needs an explicit three-edge
+handoff (`FIX->M`, `M->MTE1`, `MTE1->MTE2`) before the tail tile may touch L0C,
+L0A and L1. That is a full pipeline flush in front of a tile that then overlaps
+nothing. The wasted rows are hidden — the kernel is movement-bound at that size
+— and the flush is not. Skipping the handoff is not an option: it faults the
+cube outright with *multi-bit ECC error when FIXP read L0C*, M overwriting the
+accumulator FIX is still storing from.
+
+The shipped form keeps the remainder in the ring and exploits one fact to stay
+small: a **recursed** level was entered because `span <= S`, and stayed because
+`span > S/2`, so it is always **exactly one tile**. It calls a one-tile body
+instead of the ring, and `runRing` — its loop and all four slot/parity
+combinations — is instantiated only once, at the top. That is where the 38%
+goes.
+
+Both ends of the earlier *arm* split were measured too, and each loses at the
+other's end of the range:
 
 | shape of `runTiles` | mixed span (whole tiles + remainder) | span < one tile |
 |---|---|---|
