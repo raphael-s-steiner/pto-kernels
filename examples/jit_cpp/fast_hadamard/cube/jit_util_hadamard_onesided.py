@@ -1,4 +1,5 @@
 import ctypes
+import functools
 import math
 import os
 
@@ -74,6 +75,12 @@ _TILE_RUN_K_SHALLOW = {64: 5.52, 128: 7.51, 256: 15.02, 512: 23.02}
 _DEFAULT_TILE_RUN_K = 8.0
 
 
+# Memoised: it is a pure function of the three arguments and sits on the
+# per-launch path, where the host is the bottleneck for every shape whose
+# device time is under ~46 us -- which is most of them. The cache is keyed on
+# the arguments only, so the tile tables and _TILE_RUN_K must stay constants:
+# make either of them settable at run time and this needs a cache_clear.
+@functools.lru_cache(maxsize=4096)
 def onesided_block_dim_schedule(batch: int, n: int, max_block_dim: int) -> int:
     """Pick block_dim for one launch: enough cores to use the part, but not so
     many that each core's tile run is too short to fill its pipes.

@@ -1259,6 +1259,70 @@ reproducible. N=64 batch 16 read 0.953x at 40 reps and 0.984x at 120.
 **Three passes is enough to rank a 1.1x difference and not enough to sign a
 0.02 us one.**
 
+#### The launch floor is the host, and it is 46 us against 1-8 us of kernel
+
+Priced by `METH-360`'s protocol (host clock, synchronise *outside* the window,
+`b = (t1-t0)/I` at `I = 400`), with device events for the wall column so a
+captured graph is charged for its execution and not just its submission:
+
+| N | batch | wrapper (host) | hoisted args (host) | wrapper (wall) | hoisted (wall) | captured graph (wall) |
+|---:|------:|---------------:|--------------------:|---------------:|---------------:|----------------------:|
+| 64 | 256 | 45.63 | 3.60 | 45.02 | 3.75 | **1.13** |
+| 64 | 4096 | 45.58 | 3.61 | 45.51 | 3.77 | **1.80** |
+| 512 | 1024 | 46.11 | 3.61 | 46.34 | 3.89 | **3.81** |
+| 512 | 65536 | 46.21 | 3.57 | 99.67 | 99.54 | 99.53 |
+
+Read the last row first: once the kernel costs ~100 us the three rungs are
+indistinguishable, because the launch is hidden behind the device. Everywhere
+else the wrapper's host cost **is** the runtime -- at N=64 batch 4096 the device
+does 2.25 us of work behind 45.6 us of host, so the device-time wins recorded
+above are worth ~0.15x of their size to a caller going through Python.
+**Device time is still the right metric for judging the kernel** -- it is the
+only one that can see a tile change at all -- but it is not the runtime, and
+the gap is 20x.
+
+Where the 46 us goes, same protocol, one component per row:
+
+| step | us/call |
+|---|---:|
+| **full wrapper** | **47.26** |
+| `resolve_stream_ptr` (task-queue drain) | **18.76** |
+| `validate_onesided_hadamard_args` | 2.76 |
+| `onesided_block_dim_schedule` | 2.00 |
+| `torch_to_ctypes` x3 | 1.50 |
+| `hadamard_full` (cache hit) | 0.51 |
+| the launch itself, args hoisted | 3.77 |
+
+The single largest item is the stream-pointer resolution, and it is **not**
+removable as the wrapper is written: it is what drains torch_npu's task queue
+so a raw ctypes launch is ordered behind the tensor setup. Dropping it
+reintroduces the launch race.
+
+**What was taken:** `onesided_block_dim_schedule` is now `lru_cache`d -- it is a
+pure function of `(batch, n, max_block_dim)` sitting on the per-launch path.
+Worth **1.104x / 1.106x** on the whole host path (46.34 -> 41.97 us,
+46.49 -> 42.02), measured as a within-process paired A/B over six interleaved
+alternations against the undecorated function. More than the 1.8 us the
+component row suggests, because the memoised path also skips
+`onesided_samples_per_tile`, the table lookups and the call frames.
+
+**What was not taken, and what it is worth.** Both change the wrapper's
+contract, so they are recorded rather than applied:
+
+- **Hoist the arguments** (`METH-007` rung 1): 46 -> 3.6 us, **12.7x**. Needs a
+  caller that reuses one tensor set, and a stream whose ordering is guaranteed
+  some other way than a per-call drain.
+- **Capture and replay** (`METH-007` rung 3): 1.13 - 3.81 us wall, i.e. close to
+  device-bound. Needs a fixed launch sequence.
+
+A note on the kernel side: this build is already `AI_CORE`, not `MIX_AIC` --
+`--cce-aicore-arch=dav-c220-cube` is named in `compile_cpp`, and msprof confirms
+`Task Type AI_CORE` with `Mix Block Num 0`. `STRUCT-001` records that an
+unmarked cube-only kernel built with the *generic* arch pays +2.7 us at block
+dim 1 rising to +4.4 us at 24; that cost is not being paid here, and marking the
+`__global__` `__cube__` would be free insurance against the flag ever changing
+rather than a saving available now.
+
 #### A capacity cliff that does not announce itself: `kL0aSlots == 1`
 
 The tile-size search ran into a configuration that compiles, runs, and then
