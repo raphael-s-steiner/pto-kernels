@@ -26,6 +26,25 @@ using namespace pto;
 #define PTO_OS_S512 16
 #endif
 
+// A batch too small to give every core a deep run of tiles is not short of
+// pipeline depth, it is short of TILES: the tile height caps usable cores at
+// ceil(batch / S), and below the threshold the measured optimum sits exactly
+// on that cap. So the resident sizes carry a second, shorter tile and pick it
+// when the tall one would yield fewer than PTO_OS_TILES_TO_PIPELINE tiles.
+// Above the threshold the tall tile wins instead, on depth. The blocked sizes
+// have no crossover -- their short tile wins at every batch -- so they repeat
+// one value and the pick compiles away.
+#ifndef PTO_OS_S64_SHALLOW
+#define PTO_OS_S64_SHALLOW 128
+#endif
+#ifndef PTO_OS_S128_SHALLOW
+#define PTO_OS_S128_SHALLOW 64
+#endif
+#ifndef PTO_OS_TILES_TO_PIPELINE
+// Enough tall tiles that 24 cores each get one and most get two.
+#define PTO_OS_TILES_TO_PIPELINE 32
+#endif
+
 #ifndef PTO_OS_BLOCK
 // M of the blocked form, H_N = H_B (x) H_M. MUST equal _BLOCK in the host
 // wrapper, which builds the +-H_M operand: a mismatch hands the kernel a
@@ -33,11 +52,12 @@ using namespace pto;
 #define PTO_OS_BLOCK 64
 #endif
 
-#define FAST_HADAMARD_ONESIDED_CASES(X) \
-  X(64, PTO_OS_S64)                     \
-  X(128, PTO_OS_S128)                   \
-  X(256, PTO_OS_S256)                   \
-  X(512, PTO_OS_S512)
+// N, tall tile, short tile. Equal entries have no crossover.
+#define FAST_HADAMARD_ONESIDED_CASES(X)      \
+  X(64, PTO_OS_S64, PTO_OS_S64_SHALLOW)      \
+  X(128, PTO_OS_S128, PTO_OS_S128_SHALLOW)   \
+  X(256, PTO_OS_S256, PTO_OS_S256)           \
+  X(512, PTO_OS_S512, PTO_OS_S512)
 
 #if defined(__CHECK_FEATURE_AT_PRECOMPILE) || \
     (__CCE_AICORE__ == 220 && defined(__DAV_C220_CUBE__))
@@ -129,6 +149,11 @@ struct Layout {
   static constexpr unsigned kAccSlots = (2 * kAccBytes <= L0C_BYTES) ? 2u : 1u;
   static constexpr unsigned kL0aSlots = (2 * kL0aSlot <= L0AB_BYTES) ? 2u : 1u;
   static_assert(kL0aSlot <= L0AB_BYTES, "L0A overflow");
+  // The ring's write-after-read edges alternate EV_A0/EV_A1 by tile parity, so
+  // the two parities must land on two different slots. A single slot makes
+  // both ids guard one buffer and the next tile's TMOV overruns the TMATMUL
+  // still reading it. Halve S rather than relax this.
+  static_assert(kL0aSlots == 2u, "S too tall to double-buffer L0A");
   static constexpr unsigned l0aX(uint32_t i) {
     return kL0aX + (kL0aSlots == 2u ? (i & 1u) : 0u) * kL0aSlot;
   }
@@ -488,9 +513,15 @@ AICORE void runOnesided(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   runTiles<N, S>(x, h, y, sample, end);
 }
 
-#define FAST_HADAMARD_ONESIDED_DISPATCH_CASE(NVal, SVal) \
-  case NVal:                                             \
-    runOnesided<NVal, SVal>(x, h, y, batch);             \
+#define FAST_HADAMARD_ONESIDED_DISPATCH_CASE(NVal, STall, SShort)        \
+  case NVal:                                                             \
+    if constexpr ((STall) == (SShort)) {                                 \
+      runOnesided<NVal, STall>(x, h, y, batch);                          \
+    } else if (batch >= (uint32_t)(PTO_OS_TILES_TO_PIPELINE) * (STall)) { \
+      runOnesided<NVal, STall>(x, h, y, batch);                          \
+    } else {                                                             \
+      runOnesided<NVal, SShort>(x, h, y, batch);                         \
+    }                                                                    \
     return;
 
 AICORE void dispatchOnesided(__gm__ half *x, __gm__ half *h, __gm__ half *y,

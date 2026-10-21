@@ -27,10 +27,9 @@ MAX_ONESIDED_N = 512
 # A tile's Rows is S here, and PTO requires 16-aligned rows (TMOV's TExtract
 # rejects even Rows == 1), so the kernel's smallest tile is 16 samples. The TILE
 # is 16 rows; the TRANSFERS around it need not be, so no batch is ever padded:
-# the kernel runs whole tiles and hands the last 1..15 rows to partialTile,
-# which sets the GM row count on the load and the valid row count on the store.
-# Nothing here depends on this value any more -- it is kept because the tests
-# place batches either side of it.
+# a short span runs in one masked tile, which sets the GM row count on the load
+# and the valid row count on the store. Nothing here depends on this value any
+# more -- it is kept because the tests place batches either side of it.
 MIN_ONESIDED_BATCH = 16
 
 _H_CACHE: dict = {}
@@ -42,13 +41,34 @@ _H_CACHE: dict = {}
 _TILE_ELEMS = 16384
 _SAMPLES_PER_TILE = {64: 256, 128: 128, 256: 32, 512: 16}
 
+# The kernel carries a second, shorter tile for the resident sizes and picks it
+# when the tall one would not yield PTO_OS_TILES_TO_PIPELINE tiles -- below
+# that the tile height, not the pipeline, is what caps the core count. These
+# three MUST mirror PTO_OS_S64_SHALLOW, PTO_OS_S128_SHALLOW and
+# PTO_OS_TILES_TO_PIPELINE, or the schedule sizes a tile the kernel is not
+# running and picks the wrong block_dim.
+_SAMPLES_PER_TILE_SHALLOW = {64: 128, 128: 64, 256: 32, 512: 16}
+_TILES_TO_PIPELINE = 32
+
+
+def onesided_samples_per_tile(n: int, batch: int) -> int:
+    """S the kernel will run for this shape, mirroring its dispatch."""
+    tall = _SAMPLES_PER_TILE.get(int(n), 1)
+    if int(batch) >= _TILES_TO_PIPELINE * tall:
+        return tall
+    return _SAMPLES_PER_TILE_SHALLOW.get(int(n), tall)
+
+
 # Same shape of schedule as the two-sided kernel: bd = sqrt(k * tiles) trades
-# core count against keeping each core's pipes full. Fitted per N over every
-# integer block_dim in [1, 24] x batch in {64, 256, 1024, 8192, 65536} against
-# msprof device time, minimising worst-case regret (<= 1.041x, where a constant
-# 24 costs up to 1.21x). It is calibration, not a rule -- resweep it whenever
-# the tile geometry or PTO_OS_BLOCK changes.
-_TILE_RUN_K = {64: 7.51, 128: 7.23, 256: 7.51, 512: 22.57}
+# core count against keeping each core's pipes full. Fitted per (N, tile) over
+# every reachable core count against msprof device time, minimising worst-case
+# regret, and scored on the clamped count the launch really uses. It is
+# calibration, not a rule -- resweep it whenever the tile geometry, the
+# crossover or PTO_OS_BLOCK changes.
+_TILE_RUN_K = {64: 7.51, 128: 7.51, 256: 15.02, 512: 23.02}
+# Same fit for the shorter tile, scored only over the batches it serves. The
+# blocked sizes have one tile, so both tables agree for them.
+_TILE_RUN_K_SHALLOW = {64: 5.52, 128: 7.51, 256: 15.02, 512: 23.02}
 # Only reached if the case table grows a size this table has not been fitted
 # for. Then it is an extrapolation -- sweep block_dim and add the entry.
 _DEFAULT_TILE_RUN_K = 8.0
@@ -61,9 +81,19 @@ def onesided_block_dim_schedule(batch: int, n: int, max_block_dim: int) -> int:
     block_dim cannot change results, so an explicit block_dim always overrides
     this; test_block_dim_does_not_change_result is the gate on that.
     """
-    tiles = -(-int(batch) // _SAMPLES_PER_TILE.get(int(n), 1))
-    k = _TILE_RUN_K.get(int(n), _DEFAULT_TILE_RUN_K)
-    return max(1, min(int(max_block_dim), round(math.sqrt(k * tiles))))
+    samples = onesided_samples_per_tile(n, batch)
+    tiles = -(-int(batch) // samples)
+    table = (_TILE_RUN_K if samples == _SAMPLES_PER_TILE.get(int(n), 1)
+             else _TILE_RUN_K_SHALLOW)
+    k = table.get(int(n), _DEFAULT_TILE_RUN_K)
+    cores = max(1, min(int(max_block_dim), round(math.sqrt(k * tiles))))
+    # Drop the cores that would be launched with nothing to do. The kernel
+    # splits the batch as tiles_per_core = ceil(tiles / block_num), so every
+    # core from ceil(tiles / tiles_per_core) on finds begin >= batch and
+    # returns. Re-deriving block_num from that count leaves tiles_per_core --
+    # and so every core's range -- bit-identical, and stops paying dispatch
+    # for the empty ones.
+    return -(-tiles // -(-tiles // cores))
 
 
 def hadamard_matrix(size: int, device, dtype=torch.float16):

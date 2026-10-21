@@ -16,7 +16,8 @@ from cube.jit_util_hadamard_onesided import (
 # formula gives, because the blocked form prefers depth to height), and a test
 # that recomputed it would silently start probing the wrong boundaries the next
 # time that override moves.
-from cube.jit_util_hadamard_onesided import _SAMPLES_PER_TILE
+from cube.jit_util_hadamard_onesided import (_SAMPLES_PER_TILE,
+                                             _SAMPLES_PER_TILE_SHALLOW)
 
 # The one-sided product costs n*n MACs per sample however H is factored, so its
 # case table stops at 512 on compute grounds; larger belongs to cube/.
@@ -75,8 +76,12 @@ def fwht_f64(x):
     return a
 
 
-def samples_per_tile(n: int) -> int:
-    """S for this N, as the wrapper mirrors FAST_HADAMARD_ONESIDED_CASES.
+def tile_sizes(n: int) -> tuple[int, ...]:
+    """Every S this N can run, as the wrapper mirrors the kernel's dispatch.
+
+    Two for the resident sizes (the pick depends on batch), one otherwise. The
+    boundary tests straddle all of them, so they stay aimed at a real tile edge
+    whichever side of the crossover the batch falls.
 
     Not `.get(n, 1)` like the schedule's own lookup: a size missing from the
     table would quietly turn every boundary below into batch=1, so fail loudly
@@ -86,7 +91,7 @@ def samples_per_tile(n: int) -> int:
         f"N={n} is in the test grid but not in the kernel's tile table "
         f"{sorted(_SAMPLES_PER_TILE)}"
     )
-    return _SAMPLES_PER_TILE[n]
+    return tuple(sorted({_SAMPLES_PER_TILE[n], _SAMPLES_PER_TILE_SHALLOW[n]}))
 
 
 def relative_errors(actual, exact):
@@ -143,10 +148,10 @@ def test_onesided_hadamard_correctness(
 def test_sample_tile_boundaries(onesided_hadamard_kernel, npu_device, n):
     """The kernel halves its sample tile on the way down to 16, so straddle
     every level it can stop at for this N."""
-    s = samples_per_tile(n)
     batches = sorted(
         {
             b
+            for s in tile_sizes(n)
             for step in (s, s // 2, s // 4, 16)
             for b in (step - 1, step, step + 1, 2 * step, 2 * step + 1)
             if b >= 1
@@ -166,10 +171,10 @@ def test_unaligned_tail(onesided_hadamard_kernel, npu_device, n):
     The batches below straddle a tile boundary rather than merely a 16-row one,
     so the short tile really is the last of several and has a predecessor to
     overlap; a span shorter than one tile takes the standalone path instead."""
-    s = samples_per_tile(n)
     batches = sorted(
         {
             b
+            for s in tile_sizes(n)
             for b in (17, 23, 31, 33, 47, s - 1, s + 1, s + 15, 2 * s + 3, 999)
             if b >= MIN_ONESIDED_BATCH and b % 16 != 0
         }
@@ -183,10 +188,15 @@ def test_unaligned_tail(onesided_hadamard_kernel, npu_device, n):
 def test_batch_partition_boundaries(onesided_hadamard_kernel, npu_device, n):
     """The launch splits whole tiles over the cores, so cross the point where
     cores start running out of work (and the point where there is none)."""
-    s = samples_per_tile(n)
     cores = onesided_hadamard_kernel.block_dim
     batches = sorted(
-        {0, 1, s, s * (cores - 1), s * cores, s * cores + 1, s * cores + 17}
+        {0, 1}
+        | {
+            b
+            for s in tile_sizes(n)
+            for b in (s, s * (cores - 1), s * cores, s * cores + 1,
+                      s * cores + 17)
+        }
     )
     for batch in batches:
         check_shape(onesided_hadamard_kernel, npu_device, batch, n)
@@ -195,8 +205,8 @@ def test_batch_partition_boundaries(onesided_hadamard_kernel, npu_device, n):
 @pytest.mark.parametrize("n", TEST_HIDDEN_DIMS)
 def test_short_batch(onesided_hadamard_kernel, npu_device, n):
     """batch 1..15 leaves the tile loop with no whole tile to run, so the rows
-    go straight to partialTile -- the same masked path any batch's last 1..15
-    rows take. The result must be right, and the rows past `batch` in the
+    go straight to the smallest masked tile -- the same path any batch's last
+    1..15 rows take. The result must be right, and the rows past `batch` in the
     caller's buffer must be left alone: that containment is the whole reason
     the store is narrowed rather than the input padded."""
     rows = MIN_ONESIDED_BATCH + 4
@@ -221,7 +231,7 @@ def test_short_batch(onesided_hadamard_kernel, npu_device, n):
 
 @pytest.mark.parametrize("n", [64, 512])
 def test_short_batch_stale_l1_tail(onesided_hadamard_kernel, npu_device, n):
-    """partialTile loads only `rows` rows into the L1 X slot, so the rest of
+    """A masked tile loads only `rows` rows into the L1 X slot, so the rest of
     the slot still holds whatever the previous call left there and the cube
     folds it into output rows that are never stored. Dropping the host scratch
     did not remove that hazard, it moved it from GM into L1. Walk the batch
@@ -441,7 +451,7 @@ def test_block_dim_does_not_change_result(onesided_hadamard_kernel, npu_device, 
     """
     torch.manual_seed(7)
     batch = 300  # 300 % 16 == 12, so no tile size divides it on any core
-    assert batch % 16 != 0 and batch % samples_per_tile(n) != 0
+    assert batch % 16 != 0 and all(batch % s != 0 for s in tile_sizes(n))
     x = torch.randn(batch, n, device=npu_device, dtype=DTYPE)
 
     reference = torch.empty_like(x)

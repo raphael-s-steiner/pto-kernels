@@ -1137,13 +1137,145 @@ the wrong objective; what matters is that the `S x M` L0A slice stays small
 enough to double-buffer deeply.
 
 The `block_dim` schedule was refitted for the same reason -- `k` went
-(8, 16, 16, 16) to (7.51, 7.23, 7.51, 22.57). **Sweep every integer `block_dim`,
+(8, 16, 16, 16) to (7.51, 7.23, 7.51, 22.57), and has since been refitted again
+per tile tier (see the resweep below). **Sweep every integer `block_dim`,
 not a subset.** A first fit over `{1,2,3,4,6,8,12,16,20,24}` picked constants
 that emit `bd = 15` and `23`, values it had never measured, and scored them
 against their nearest neighbour. It reported 1.013x - 1.031x worst regret; the
 real cost at N=64 batch 8192 was 1.12x, because 32 tiles divide evenly over 16
 cores and badly over 15. Refitted over all 24 values: worst regret 1.000x -
 1.041x, against 1.18x - 1.21x for a constant 24.
+
+#### The tile size and the core count are one knob, not two (1.033x overall)
+
+A full resweep of the tile table after the geometry changed -- every power of
+two from 16 up to the L1/L0A/L0C ceiling, crossed with `PTO_OS_BLOCK` in
+{32, 64, 128}, each measured at **every reachable core count**. 32 variant
+builds, ~2000 device-time points.
+
+The resweep confirmed three of the four sizes unchanged (`S128 = 128`,
+`S256 = 32`, `S512 = 16`, all at `M = 64`) and reproduced the numbers recorded
+above to within 0.4% -- 40.65 us against 40.8 for `S256 = 16` at batch 65536,
+26.93 against 27.1 for `S256 = 32`, 99.75 against ~99.9 for `S512 = 16`. A
+resweep that cannot reproduce the fit it is replacing is measuring something
+else.
+
+**Sweep the tile size and the core count together, because at small batch they
+are the same variable.** The tile height caps usable cores at
+`ceil(batch / S)`, and below the crossover the measured optimum sits exactly on
+that cap:
+
+| N | batch | S | max cores | best cores | us |
+|---:|------:|--:|----------:|-----------:|---:|
+| 512 | 64 | 16 | 4 | 4 | **2.20** |
+| 512 | 64 | 32 | 2 | 2 | 2.82 |
+| 512 | 64 | 64 | 1 | 1 | 4.24 |
+
+1.93x across that column, and none of it is tile efficiency -- it is three
+quarters of the part sitting idle because the tile was too tall to divide. At
+bulk the cap is slack, all 24 cores run whatever `S` is, and the ranking
+inverts onto pipeline depth. Sweeping `block_dim` at a fixed `S`, or `S` at a
+fixed `block_dim`, sees one regime and misses the other.
+
+The clean way to sweep it is to parameterise by `(S, tiles_per_core)` rather
+than `(S, block_dim)`: two `block_dim` values that produce the same split are
+the same measurement, so they collapse, and every point is already an
+active-core count.
+
+**So the resident sizes carry two tiles and pick between them.** The optimum
+crosses over sharply and monotonically, at both N:
+
+| batch | N=64 S=128 | N=64 S=256 | | batch | N=128 S=64 | N=128 S=128 |
+|------:|-----------:|-----------:|-|------:|-----------:|------------:|
+|   192 |  **1.430** |      1.680 | |   128 |  **1.790** |       2.060 |
+|   256 |  **1.500** |      1.720 | |   256 |  **1.880** |       2.060 |
+|  1024 |  **1.720** |      1.840 | |  1024 |  **2.230** |       2.400 |
+|  4096 |  **2.220** |      2.280 | |  4096 |      3.000 |       3.020 |
+| 16384 |      3.180 |  **3.120** | | 16384 |      4.840 |   **4.610** |
+| 65536 |      5.980 |  **5.320** | | 65536 |     11.800 |  **10.020** |
+|262144 |     17.431 | **14.180** | |262144 |     39.511 |  **31.601** |
+
+Either size alone loses at one end: 1.175x / 1.151x below the crossover for the
+tall tile, 1.229x / 1.250x above it for the short one. The threshold is stated
+in tiles, not samples -- take the tall tile once the batch yields
+`PTO_OS_TILES_TO_PIPELINE = 32` of them, enough that 24 cores each get one and
+most get two. That lands on both measured crossovers (32 x 256 = 8192,
+32 x 128 = 4096) without a per-N magic number. The blocked sizes have no
+crossover at all -- their short tile wins at every batch -- so they repeat one
+value and `if constexpr` compiles the pick away, costing them no instantiation
+and no branch. Cost of the two extra rings: `.so` 36488 -> 42760 bytes.
+
+`k` was refitted per (N, tile), each tier scored only over the batches it
+serves and against the clamped core count the launch really uses:
+`_TILE_RUN_K` (8, 16, 16, 16) -> (7.51, 7.23, 7.51, 22.57) ->
+**(7.51, 7.51, 15.02, 23.02)**, plus `_TILE_RUN_K_SHALLOW`
+(5.52, 7.51, 15.02, 23.02). Worst-case regret 1.000x - 1.024x.
+
+#### Launch only the cores that have work (1.0055x, +0.32% per idle core)
+
+`tiles_per_core = ceil(tiles / block_num)`, so every core from
+`ceil(tiles / tiles_per_core)` on finds `begin >= batch` and returns. The
+schedule's `round(sqrt(k * tiles))` lands on such a value often -- at
+`block_dim = 24` with 20 tiles, four cores are launched to do nothing.
+
+Re-deriving `block_dim` from the active count is **exactly** split-preserving:
+over all (tiles <= 5000) x (block_dim <= 24), `ceil(tiles / ceil(tiles / bd))`
+leaves `tiles_per_core` unchanged in every case, so it cannot move a byte of
+output -- it only stops paying for the empty blocks. One expression in the
+host, and the three schedule tests (range, monotonicity, cap) still hold.
+
+Measured on 64 pairs that differ **only** in the launched block count -- same
+`.so`, same tile, same split -- it is worth **1.0055x geomean, +0.32% per idle
+core, worst 0.991x** (one profiler quantum).
+
+**The saving is on-device, not on the host.** `rtKernelLaunch` costs the host
+the same whatever `blockDim` is; what the idle cores cost is block dispatch,
+which is why msprof device time can see it. Worth taking, but it is not a
+remedy for the ~46-59 us host launch.
+
+It also composes with the tile size rather than adding to it: a taller tile
+means fewer tiles, so more cores would have idled, so the clamp is worth more
+exactly where the two-tier pick chooses the tall tile.
+
+#### What the two changes are worth together (1.0328x over 100 shapes)
+
+Old table and schedule against new, each at the `block_dim` its own host
+picks -- the only honest comparison, since the tile size sets the tile count,
+which sets what the schedule asks for, which the clamp then reduces.
+
+| N | geomean | best | worst |
+|---:|--------:|-----:|------:|
+| 64 | 1.0444x | 1.135x | 0.953x |
+| 128 | 1.0520x | 1.126x | 0.974x |
+| 256 | 1.0109x | 1.071x | 0.994x |
+| 512 | 1.0243x | 1.190x | 0.997x |
+| **all** | **1.0328x** | **1.190x** | **0.953x** |
+
+The gain sits where the shipped tile was too coarse to spread over cores --
+batch 160 to 4096, 1.08x to 1.15x. The apparent sub-tile regressions do not
+survive more reps: at 120 reps x 4 passes the whole band below 256 is
+**1.0546x** geomean with a worst of 0.984x -- one 0.02 us quantum, not
+reproducible. N=64 batch 16 read 0.953x at 40 reps and 0.984x at 120.
+**Three passes is enough to rank a 1.1x difference and not enough to sign a
+0.02 us one.**
+
+#### A capacity cliff that does not announce itself: `kL0aSlots == 1`
+
+The tile-size search ran into a configuration that compiles, runs, and then
+hangs the device hard enough to kill the msprof session around it. When `S` is
+tall enough that one L0A slice exceeds half the buffer, `kL0aSlots` quietly
+falls to 1 and `l0aX(Par)` returns the **same** address for both parities --
+while the ring's write-after-read edges still alternate `EV_A0` / `EV_A1` by
+tile parity. Two event ids then guard one buffer, and the next tile's `TMOV`
+overruns the `TMATMUL` still reading it.
+
+Exactly two reachable configurations hit it, `N=64, S=512` and `N=128, S=256`,
+both at the capacity ceiling and neither a contender. A
+`static_assert(kL0aSlots == 2u)` turns a silent race into a compile error;
+byte-identical `.so`, so it costs nothing. This is the mirror of the event-id
+defect recorded below -- there one id carried two channels, here two ids
+carried one buffer. Both are the same question asked backwards: **does every
+(id, buffer) pair correspond one-to-one?**
 
 #### The per-core remainder: one unit of work, not a chain of them (1.28x - 1.56x)
 
