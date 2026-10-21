@@ -1202,6 +1202,11 @@ bulk; they differ only on short and unaligned spans:
 | size pick folded in, every level entering `runRing` | 50440 | nothing, but +38% code |
 | **size pick folded in, recursed levels run one tile** | **36520** | **nothing** |
 
+The shipped form is two functions: `runTiles` chooses between a ring and a
+short span, and `runShortSpan` picks the tile size for the latter. An earlier
+revision folded both into one function behind a `bool Top` template parameter;
+splitting them is **byte-identical codegen**.
+
 Two of those are instructive.
 
 **Dropping the size pick** is the smallest and simplest code and it loses,
@@ -1210,7 +1215,22 @@ all `S` rows whatever the row count says, so a 1-row span at N=128 still pushes
 128 rows through MTE1 and the cube.
 
 **Splitting the remainder off** so it runs at its own smaller size — 7 wasted
-rows instead of 135 — also loses, and badly. The remainder stops overlapping,
+rows instead of 135 — also loses, and badly. The reason is that there was
+nothing to win in the first place. Forcing one core to take a whole batch
+(`block_dim = 1`) at N=64 prices the near-empty last tile directly:
+
+| batch | tiles | device us |
+|------:|-------|----------:|
+| 256 | 1 | 1.580 |
+| 257 | 2, the second holding **one row** | **1.580** |
+| 272 | 2, the second holding 16 rows | 1.580 |
+| 320 | 2 | 1.640 |
+| 511 | 2 | 1.821 |
+
+A second 256-row tile carrying a single row is **free**: its 255 wasted cube
+rows hide entirely behind the first tile's movement, and cost only appears once
+the tile carries real rows. At N=128 the step is not zero (+0.140 us for the
+second tile at one row), but the handoff below cancels it. The remainder stops overlapping,
 and since the ring no longer drains itself it needs an explicit three-edge
 handoff (`FIX->M`, `M->MTE1`, `MTE1->MTE2`) before the tail tile may touch L0C,
 L0A and L1. That is a full pipeline flush in front of a tile that then overlaps

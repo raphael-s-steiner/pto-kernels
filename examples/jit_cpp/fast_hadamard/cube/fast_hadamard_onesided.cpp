@@ -525,9 +525,32 @@ AICORE void oneTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
   }
 }
 
-// Consume [sample, end) as ONE ring, at the largest tile size whose last tile
-// would not be more than half empty. The only decision here is that size: the
-// ring itself handles any span >= 1, because its last tile is masked.
+// A span of 1..S samples, as ONE tile of the smallest size that covers it.
+//
+// Masking is free on the TRANSFERS but not on the tile -- the cube runs all S
+// rows whatever the row count says -- so serving every short span from a
+// top-level tile is 1.09x - 1.22x slower below ~100 samples. Recursing while
+// the span fits in half the tile picks the smallest size that covers it, which
+// caps the waste below half a tile. A compile-time CHOICE, not a chain: every
+// size below the chosen one returns without doing work, so exactly one tile
+// runs, and 16 is the floor because TMOV's TExtract rejects fewer rows.
+template <uint32_t N, uint32_t S>
+AICORE void runShortSpan(__gm__ half *x, __gm__ half *h, __gm__ half *y,
+                         uint32_t sample, uint32_t span) {
+  if constexpr (S > 16) {
+    if (span <= S / 2) {
+      runShortSpan<N, S / 2>(x, h, y, sample, span);
+      return;
+    }
+  }
+  oneTile<N, S>(x, h, y, sample, span);
+}
+
+// Consume [sample, end) as exactly one unit of work, ascending: either a ring
+// of S-sample tiles whose last one is masked, or -- for a span too short to
+// fill half a tile -- a single smaller tile. Either way the samples are
+// touched once, in increasing address order, so each core's GM reads and
+// writes are one forward sequential stream.
 //
 // This replaced a recursive power-of-two HALVING chain that ran whole tiles at
 // S, then recursed on S/2 down to 16, and finally masked 1..15 rows. That chain
@@ -537,49 +560,31 @@ AICORE void oneTile(__gm__ half *x, __gm__ half *h, __gm__ half *y,
 // the slack is gone, at one or two tiles per core, because each level was a
 // separate prime/ring/drain with nothing to overlap.
 //
-// Three shapes of this function were measured against each other. Dropping the
-// size pick entirely -- one ring at the top-level S for every span -- is the
-// smallest code (-16%) and is 1.09x - 1.22x SLOWER below ~100 samples: masking
-// is free on the transfers but NOT on the tile, so a 1-row span at N=128 still
-// pushes 128 rows through MTE1 and the cube. Keeping the pick in a separate
-// maskedTile/oneTile pair is the smallest fast version, at the cost of two more
-// helpers. Folding it in here, as below, measures identical to that pair
-// everywhere and costs 29% more code, since runRing is then instantiated at
-// every level. The README carries the grid.
-//
-// Covering a remainder with extra 16-row tiles instead is 0.78x - 0.91x: a
-// 16-row ring tile costs ~0.11 us at the margin, so many small tiles lose to
-// one big masked one.
-template <uint32_t N, uint32_t S, bool Top = true>
+// Keeping the remainder INSIDE the ring is what the measurements settled on.
+// Splitting it off to run at its own smaller size wastes 7 cube rows instead
+// of 135, and is 1.14x - 1.22x SLOWER at N=64: the remainder stops overlapping,
+// and because the ring no longer drains itself it needs a three-edge handoff
+// before the tail may touch L0C, L0A and L1 -- a pipe flush in front of a tile
+// that then overlaps nothing. The wasted rows are hidden, the flush is not.
+// Covering the remainder with extra 16-row tiles instead is 0.78x - 0.91x.
+// The README carries the grid.
+template <uint32_t N, uint32_t S>
 AICORE void runTiles(__gm__ half *x, __gm__ half *h, __gm__ half *y,
                      uint32_t &sample, uint32_t end) {
-  const uint32_t base = sample;
-  const uint32_t span = end - base;
+  const uint32_t span = end - sample;
   if (span == 0) {
     return;
   }
-  // A span under half a tile drops a size, so the one masked tile a short span
-  // ends on is never more than half empty. A compile-time CHOICE, not a chain:
-  // every level below the chosen one returns without doing work.
+  // A span past half a tile is worth a ring tile of its own; anything shorter
+  // goes to the next size down. At S == 16 there is no next size down.
   if constexpr (S > 16) {
     if (span <= S / 2) {
-      runTiles<N, S / 2, false>(x, h, y, sample, end);
+      runShortSpan<N, S / 2>(x, h, y, sample, span);
+      sample = end;
       return;
     }
   }
-  if constexpr (Top) {
-    // Any number of tiles, the last of them masked and overlapped like the
-    // rest. Splitting that last one off into a right-sized standalone tile
-    // saves wasted cube rows but costs the overlap AND a full pipe flush to
-    // hand the buffers over: 1.14x - 1.22x at N=64. The wasted rows are
-    // hidden, the flush is not.
-    runRing<N, S>(x, h, y, base, end);
-  } else {
-    // Recursing got here, so S / 2 < span <= S: exactly one tile. Calling the
-    // ring for it would instantiate its loop and all four slot/parity
-    // combinations at every size (+29% .so) to run a single iteration.
-    oneTile<N, S>(x, h, y, base, span);
-  }
+  runRing<N, S>(x, h, y, sample, end);
   sample = end;
 }
 
