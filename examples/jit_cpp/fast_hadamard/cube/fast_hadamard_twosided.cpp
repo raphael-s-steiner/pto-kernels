@@ -243,15 +243,19 @@ struct Layout {
   // Unblocked only: a blocked side reads +-H_M from its own offset instead.
   static constexpr bool kShareHf = (R == C) && !kBlkA && !kBlkB;
 
-  // The C == 16 tile bodies reinterpret the loaded (S*R x 16) tile as
-  // (R x S*R) -- "read wide" -- which is byte-compatible only when
-  // S*R*16 == S*R*R, i.e. R == 16. They were written for N=256, the only
-  // C == 16 row at the time, and nothing caught the assumption: a split like
-  // X(1024, 64, 16, 8) compiled and faulted the aicore with an MTE range
-  // error. The bodies gate on R == C == 16 now; everything else takes the
-  // general body, which handles any (R, C).
-  static_assert(C != 16 || R == 16 || R % 16 == 0,
-                "a C == 16 split needs a 16-aligned R for the general body");
+  // The C == 16 bodies read the loaded (S*R x C) tile "wide", as
+  // (R x S*C): with C == 16 each sample's (R x 16) block is ONE NZ
+  // block-column of R/16 fractals, so the vertical stack of S samples IS
+  // their horizontal concatenation, for ANY R. The width was written S*R,
+  // which equals S*C only at R == C -- true of N=256, the only C == 16 row at
+  // the time -- so the bodies silently required R == 16 and a split like
+  // X(1024, 64, 16, 8) faulted the aicore with an MTE range error. S*C is the
+  // general form and it costs nothing: it keeps H_R as the FIRST factor
+  // applied, which measured 1.08x geomean and 1.27x at batch 32768 over the
+  // general body's opposite order, because the general body has to turn the
+  // vertical stack into a concatenation with S separate TEXTRACTs -- S FIX
+  // descriptors per tile against one TMOV, on the pipe that is the bottleneck.
+  static_assert(C != 16 || R % 16 == 0, "C == 16 needs a 16-aligned R");
 
   // Only where blocking is active: without it the slots, not the accumulators,
   // are what overflow, and leaving it off keeps every unblocked size's offsets.
@@ -534,7 +538,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample, bool freeSlot,
     // as the horizontal concatenation for free. Apply H_R first on that view,
     // then H_C on the vertical one: 7 descriptors per tile whatever S is.
     static_assert(R == 16, "the free reinterpret needs square 16x16 fractals");
-    constexpr uint32_t kCat = S * R;
+    constexpr uint32_t kCat = S * C;
 
     MatTile<R, kCat> x_cat;
     TileRight<half, R, kCat> x_l0b;
@@ -806,7 +810,7 @@ template <uint32_t R, uint32_t C, uint32_t S, uint32_t Slot, bool Par,
 AICORE void tilePhaseA(bool freeSlot) {
   using L = Layout<R, C, S>;
 
-  if constexpr (!(C == 16 && R == 16)) {
+  if constexpr (C != 16) {
     // General body, same cut: right multiply, then park T in L1. X is the LEFT
     // operand here (and T the right one in phase B), the mirror of the C == 16
     // case, so the two share Layout's slot helpers and capacity asserts.
@@ -841,7 +845,7 @@ AICORE void tilePhaseA(bool freeSlot) {
     return;
   }
 
-  constexpr uint32_t kCat = S * R;
+  constexpr uint32_t kCat = S * C;
 
   MatTile<R, kCat> x_cat;
   TileRight<half, R, kCat> x_l0b;
@@ -877,7 +881,7 @@ template <uint32_t R, uint32_t C, uint32_t S, bool Par, event_t EvPA,
 AICORE void tilePhaseB(__gm__ half *y, uint32_t sample, uint32_t rows) {
   using L = Layout<R, C, S>;
 
-  if constexpr (!(C == 16 && R == 16)) {
+  if constexpr (C != 16) {
     // General body: left multiply on the concatenated view, then store each
     // sample separately. The fixpipe L0C->GM path is 2D-to-2D only, so these
     // cannot be folded into one strided descriptor -- a 5D scatter faults.

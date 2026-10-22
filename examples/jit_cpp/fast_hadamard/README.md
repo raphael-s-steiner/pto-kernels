@@ -2254,9 +2254,33 @@ are not. Measured (balanced / C==16, 5 rotated passes x 60 reps, null band
 | 1024 | 0.9772 | 1.0137 | 1.0595 | 1.0446 | 1.0031 | 1.0868 | 1.1400 | **1.1734** |
 
 The win **grows with batch**, which is the signature of a per-byte transfer
-saving rather than a fixed cost, and it is paid for at batch 1 at N=1024
-(0.956x in the final sweep, +0.06 us) where there is no volume to amortise the
-extra MACs. N=2048 is left balanced: +50% MACs for the same class of win.
+saving rather than a fixed cost, and it is paid for at batch 1-2 at N=1024
+(0.972x - 0.975x, +0.04 us) where there is no volume to amortise the extra MACs.
+
+**N=2048 was argued down and then measured, and the measurement agreed -- but
+only just.** +50% MACs was *not* obviously too much, since +25% had just proved
+free, so both orientations were built and validated (108/108 each):
+
+| batch | 32x64 balanced | 128x16 | 16x128 |
+|---|---:|---:|---:|
+|     1 | **1.46** | 1.56 | 1.64 |
+|   128 | **2.56** | 2.78 | 2.78 |
+|  2048 | **9.28** | 9.54 | 9.53 |
+|  8192 | **29.26** | 29.31 | 29.67 |
+| 32768 | 189.64 | **189.64** | 192.19 |
+
+Balanced wins: 128x16 reads 0.9588 geomean (worst 0.9211) and 16x128 0.9370.
+Note the trend is still there -- 128x16 climbs monotonically to break-even by
+batch 32768 -- so the MAC penalty did not stop the transfer saving, it outran
+it. The crossover is therefore **sharp, between N=1024 (+25%, 1.05x) and
+N=2048 (+50%, 0.96x)**, and it is a ratio of two growth rates, not a threshold
+anyone could have named. N=4096 is worse still: `16x256` needs S=1, which
+collapses the tile height, and measured **0.52 geomean** (worst 0.27);
+`256x16` will not compile, since R=256 forces blocking.
+
+Both orientations cost the same MACs -- `R + C` is symmetric under the swap --
+so at equal MACs the `C == 16` orientation is the only one that also gets the
+layout, which is why `128x16` beats `16x128` everywhere.
 
 **A latent fault this uncovered.** `X(1024, 64, 16, 8)` compiled and **faulted
 the aicore** with an MTE range error. The `C == 16` tile bodies reinterpret the
@@ -2300,6 +2324,87 @@ coverage** -- batches 22 and 65 used to exercise it and now take the classic
 path -- so `test_bitplan_floor_boundaries` straddles the floor and crosses a
 whole-tile boundary to keep both the bulk launch and the bulk-plus-remainder
 split exercised.
+
+#### Which factor is applied FIRST is worth 1.28x, and one wrong symbol had hidden it
+
+With the `(N/16, 16)` split, which of `H_16` and `H_{N/16}` goes first? It
+depends on the body, and **the two bodies disagree**:
+
+| body | phase A | phase B | applied first |
+|---|---|---|---|
+| general | `X . H_C` | `H_R . T` | **H_C** (the 16-wide one) |
+| `C == 16` ("cat") | `H_R . X` | `T . H_C` | **H_R** |
+
+So the order is a free variable too, and N=256 isolates it exactly: at
+`R == C == 16` both bodies are valid with the same split, the same MACs and the
+same layout, so forcing N=256 through the general body changes **nothing but
+the order**. Measured:
+
+| batch | cat (H_R first) | general (H_C first) | ratio |
+|---|---:|---:|---:|
+|     1 | 1.28 | 1.28 | 1.0000 |
+|   128 | 1.63 | 1.72 | 0.9477 |
+|  2048 | 3.02 | 3.34 | 0.9039 |
+|  8192 | 5.48 | 6.48 | 0.8457 |
+| 32768 | **15.10** | 19.16 | **0.7881** |
+
+**H_R-first is 1.083x geomean and 1.269x at batch 32768**, and the gap grows
+with batch. The reason is FIX descriptors: the general body has to turn the
+vertical stack of S samples into a horizontal concatenation with **S separate
+`TEXTRACT`s** -- S FIX ops per tile against the cat body's one `TMOV` -- on the
+pipe that is already the bottleneck. This is the same accounting as the
+turnaround section above, and here it is measured rather than forecast.
+
+**The better order was unreachable because of one symbol.** The cat body set
+`kCat = S * R` and viewed the loaded tile as `MatTile<R, kCat>`. The tile holds
+`S*R*C` elements, so that view only matches when `R == C` -- true of N=256, the
+only `C == 16` row at the time. The intended width is `S * C`:
+
+> With `C == 16` each sample's `(R x 16)` block is ONE NZ block-column of
+> `R/16` fractals, so the vertical stack of S samples **is** their horizontal
+> concatenation, for **any** R. The read-wide reinterpret was never specific to
+> `R == 16`; only the arithmetic expressing it was.
+
+`kCat = S * C` and the gate opened from `R == C == 16` back to `C != 16`.
+**The `S*C` rewrite is byte-identical with the gate still closed** -- N=256 is
+its only user and `S*C == S*R` there -- so the rewrite is provably neutral and
+only the gate is a behaviour change. Measured, same split, H_R-first vs
+H_C-first:
+
+|    N | b8 | b128 | b2048 | b8192 | b32768 | geomean |
+|---|---:|---:|---:|---:|---:|---:|
+|  256 | 1.0148 | 1.0000 | 1.0035 | 1.0000 | 1.0013 | 1.0022 |
+|  512 | 1.0362 | 1.0335 | 1.0505 | 1.0853 | **1.1060** | 1.0425 |
+| 1024 | 0.9733 | 1.0091 | 1.0460 | 1.0541 | 1.0637 | 1.0130 |
+
+N=256 holding at 1.0022 is the consistency check the byte-identity predicts.
+N=1024 pays 0.958x - 0.977x at batch 2-32, the same small-batch corner the
+split itself pays, and the two do not compound: the final sweep reads 0.972x
+there, not 0.93x.
+
+**Net, commit e5e0386 -> here, 70 cells, 4 rotated passes x 50 reps:**
+
+|       N | geomean | best | worst |
+|---|---:|---:|---:|
+|     256 | 1.0047 | 1.0159 | 0.9963 |
+|     512 | **1.0959** | **1.2830** | 0.9923 |
+|    1024 | **1.0722** | 1.2450 | 0.9722 |
+|    2048 | 1.0005 | 1.0066 | 0.9898 |
+|    4096 | 1.0113 | 1.0277 | 1.0001 |
+|    8192 | 1.0026 | 1.0071 | 0.9991 |
+|   16384 | 1.0211 | 1.0475 | 0.9998 |
+|   32768 | 0.9986 | 1.0022 | 0.9955 |
+| **ALL** | **1.0257** | **1.2830** | 0.9722 |
+
+null geomean 1.0007, band 0.9926 - 1.0183; 12 cells >= 1.05x, 2 below 0.98x
+(N=1024 batch 1-2). 864/864 fp64 cases pass; 271 tests pass.
+
+**The lesson worth keeping:** three of this kernel's free variables -- the
+split, the body, and the order of application -- were all pinned by a single
+historical fact, that N=256 was once the only `C == 16` size. A constant fitted
+for one case (`_TILE_RUN_K`), an operand layout (`GmTile`), a specialised body
+(`kCat = S * R`) and a path threshold (`_BITPLAN_TILE`) each encoded that
+assumption, and each read as deliberate.
 
 #### Why the L0C turnaround cannot absorb a layout change (it already absorbs the free one)
 
