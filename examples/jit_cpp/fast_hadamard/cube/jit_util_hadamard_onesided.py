@@ -25,12 +25,10 @@ from jit_util_common import (
 MIN_ONESIDED_N = 64
 MAX_ONESIDED_N = 512
 
-# A tile's Rows is S here, and PTO requires 16-aligned rows (TMOV's TExtract
-# rejects even Rows == 1), so the kernel's smallest tile is 16 samples. The TILE
-# is 16 rows; the TRANSFERS around it need not be, so no batch is ever padded:
-# a short span runs in one masked tile, which sets the GM row count on the load
-# and the valid row count on the store. Nothing here depends on this value any
-# more -- it is kept because the tests place batches either side of it.
+# PTO requires 16-aligned tile rows (TMOV's TExtract rejects even Rows == 1),
+# so the kernel's smallest tile is 16 samples. The TRANSFERS around a tile need
+# not be, so no batch is padded: a short span runs in one masked tile. Nothing
+# here depends on this value; the tests place batches either side of it.
 MIN_ONESIDED_BATCH = 16
 
 _H_CACHE: dict = {}
@@ -60,26 +58,22 @@ def onesided_samples_per_tile(n: int, batch: int) -> int:
     return _SAMPLES_PER_TILE_SHALLOW.get(int(n), tall)
 
 
-# Same shape of schedule as the two-sided kernel: bd = sqrt(k * tiles) trades
-# core count against keeping each core's pipes full. Fitted per (N, tile) over
-# every reachable core count against msprof device time, minimising worst-case
-# regret, and scored on the clamped count the launch really uses. It is
-# calibration, not a rule -- resweep it whenever the tile geometry, the
-# crossover or PTO_OS_BLOCK changes.
+# bd = sqrt(k * tiles) trades core count against keeping each core's pipes
+# full, with k fitted per (N, tile). Calibration, not a rule -- resweep it
+# whenever the tile geometry, the crossover or PTO_OS_BLOCK changes.
 _TILE_RUN_K = {64: 7.51, 128: 7.51, 256: 15.02, 512: 23.02}
-# Same fit for the shorter tile, scored only over the batches it serves. The
-# blocked sizes have one tile, so both tables agree for them.
+# Same fit for the shorter tile. The blocked sizes have one tile, so both
+# tables agree for them.
 _TILE_RUN_K_SHALLOW = {64: 5.52, 128: 7.51, 256: 15.02, 512: 23.02}
-# Only reached if the case table grows a size this table has not been fitted
-# for. Then it is an extrapolation -- sweep block_dim and add the entry.
+# Only reached if the case table grows a size this has not been fitted for --
+# sweep block_dim and add the entry.
 _DEFAULT_TILE_RUN_K = 8.0
 
 
-# Memoised: it is a pure function of the three arguments and sits on the
-# per-launch path, where the host is the bottleneck for every shape whose
-# device time is under ~46 us -- which is most of them. The cache is keyed on
-# the arguments only, so the tile tables and _TILE_RUN_K must stay constants:
-# make either of them settable at run time and this needs a cache_clear.
+# Memoised: a pure function of its arguments, on the per-launch path where the
+# host is the bottleneck for most shapes. The cache is keyed on the arguments
+# only, so the tile tables and _TILE_RUN_K must stay constants -- make either
+# settable at run time and this needs a cache_clear.
 @functools.lru_cache(maxsize=4096)
 def onesided_block_dim_schedule(batch: int, n: int, max_block_dim: int) -> int:
     """Pick block_dim for one launch: enough cores to use the part, but not so
@@ -96,12 +90,11 @@ def onesided_block_dim_schedule(batch: int, n: int, max_block_dim: int) -> int:
              else _TILE_RUN_K_SHALLOW)
     k = table.get(int(n), _DEFAULT_TILE_RUN_K)
     cores = max(1, min(int(max_block_dim), round(math.sqrt(k * tiles))))
-    # Drop the cores that would be launched with nothing to do. The kernel
+    # Drop the cores that would be launched with nothing to do: the kernel
     # splits the batch as tiles_per_core = ceil(tiles / block_num), so every
     # core from ceil(tiles / tiles_per_core) on finds begin >= batch and
     # returns. Re-deriving block_num from that count leaves tiles_per_core --
-    # and so every core's range -- bit-identical, and stops paying dispatch
-    # for the empty ones.
+    # and so every core's range -- bit-identical.
     return -(-tiles // -(-tiles // cores))
 
 
@@ -128,16 +121,11 @@ def hadamard_operands(n: int, block: int | None = None) -> tuple[int, int]:
 def hadamard_full(n: int, device, block: int | None = None):
     """Cached device operand buffer: H_n, then H_M, then -H_M, flat.
 
-    H_n is symmetric, so the kernel can use it as the right operand with no
-    transpose, and row-major order makes each contraction chunk H[kc:kc+Kc, :]
-    one contiguous descriptor whatever Kc the kernel picks.
-
-    The +-H_M pair at offset n*n is what the blocked form multiplies by: with
-    H_n = H_B (x) H_M those two are the only right operands it ever needs, since
-    H_B's entries are +-1 (see the kernel header). They are APPENDED rather than
-    substituted so a single host buffer feeds either form of the kernel, which
-    keeps the A/B between them a compile-time switch and nothing else. The tail
-    is 2*M*M <= 32768 halves whatever n is.
+    H_n is symmetric, so the kernel uses it as the right operand with no
+    transpose. The +-H_M pair at offset n*n is what the blocked form multiplies
+    by -- with H_n = H_B (x) H_M and H_B's entries +-1, those two are the only
+    right operands it needs -- and is APPENDED rather than substituted so one
+    buffer feeds either form. The tail is 2*M*M <= 32768 halves whatever n is.
 
     Keyed on the torch device object directly: this sits on the per-call path,
     and stringifying the device costs more than the lookup it feeds.
@@ -223,11 +211,10 @@ def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE):
             else resolve_launch_block_dim(block_dim, resolved_block_dim)
         )
 
-        # Build H BEFORE resolving the stream pointer, on its own line. On a
+        # Build H BEFORE resolving the stream pointer, on its own line: on a
         # cache miss this enqueues torch ops, and resolve_stream_ptr is what
         # drains torch_npu's task queue so the raw ctypes launch is ordered
-        # behind them; inlining it after the stream pointer would enqueue them
-        # after the drain and the kernel could read H before it is written.
+        # behind them. Inlined after it, the kernel could read H unwritten.
         h = hadamard_full(resolved_n, x.device)
         kernel(
             launch_block_dim,

@@ -11,11 +11,9 @@ from cube.jit_util_hadamard_onesided import (
     onesided_block_dim_schedule,
     validate_onesided_hadamard_args,
 )
-# Deliberately the wrapper's own table rather than TILE_ELEMS // N: S is a
-# per-N override in the kernel (256 and 512 run SMALLER tiles than the capacity
-# formula gives, because the blocked form prefers depth to height), and a test
-# that recomputed it would silently start probing the wrong boundaries the next
-# time that override moves.
+# The wrapper's own table rather than TILE_ELEMS // N: S is a per-N override in
+# the kernel (256 and 512 run SMALLER tiles than the capacity formula gives), so
+# a test that recomputed it would probe the wrong boundaries once that moves.
 from cube.jit_util_hadamard_onesided import (_SAMPLES_PER_TILE,
                                              _SAMPLES_PER_TILE_SHALLOW)
 
@@ -23,9 +21,8 @@ from cube.jit_util_hadamard_onesided import (_SAMPLES_PER_TILE,
 # case table stops at 512 on compute grounds; larger belongs to cube/.
 TEST_HIDDEN_DIMS = [64, 128, 256, 512]
 # Straddles both boundaries that matter: the S-sample tile (256/128/64/64
-# across the grid) and the 16-sample tail the kernel mops up by backing one more
-# tile up to the end of the range. Everything below MIN_ONESIDED_BATCH goes
-# through the host's padded scratch instead.
+# across the grid) and the 16-sample tail the kernel mops up with a masked
+# tile.
 TEST_BATCHES = [1, 3, 15, 16, 17, 31, 32, 33, 48, 63, 64, 65, 127, 128, 255,
                 300, 1000]
 TEST_SEEDS = [0, 1]
@@ -37,18 +34,12 @@ DTYPE = torch.float16
 # kernel or the padding path must not touch is recognisable byte for byte.
 SENTINEL = -7.0
 
-# The one-sided kernel is a single dense matmul: it accumulates in fp32 and
-# rounds to fp16 exactly ONCE, against twice for the two-sided split in cube/
-# and log2(N) times for the vector butterfly. It therefore does not reproduce
-# any staged fp16 reference bit for bit and is compared against an exact float64
-# transform instead. Measured worst case over the grid below is 2.43e-4 relative
+# The one-sided kernel accumulates in fp32 and rounds to fp16 exactly ONCE, so
+# it reproduces no staged fp16 reference bit for bit and is compared against an
+# exact float64 transform. Worst case over the grid below is 2.43e-4 relative
 # RMS (at batch=1, N=64, where a single sample makes the RMS noisy) and 1.88e-3
-# for the worst element, both relative to the output RMS; the tolerances below
-# keep 4-5x of margin and match the two-sided suite's.
-#
-# Head to head at batch=128 the one-sided error is 0.71x the two-sided kernel's
-# (2.10e-4 against 2.96e-4 at N=256, 2.07e-4 against 2.93e-4 at N=512), so
-# test_more_accurate_than_two_sided passes with room, not marginally.
+# for the worst element, both relative to the output RMS; these tolerances keep
+# 4-5x of margin and match the two-sided suite's.
 REL_RMS_TOL = 1e-3
 MAX_ELEMENT_TOL = 1e-2
 
@@ -233,9 +224,8 @@ def test_short_batch(onesided_hadamard_kernel, npu_device, n):
 def test_short_batch_stale_l1_tail(onesided_hadamard_kernel, npu_device, n):
     """A masked tile loads only `rows` rows into the L1 X slot, so the rest of
     the slot still holds whatever the previous call left there and the cube
-    folds it into output rows that are never stored. Dropping the host scratch
-    did not remove that hazard, it moved it from GM into L1. Walk the batch
-    down so every call inherits a longer stale tail than it writes."""
+    folds it into output rows that are never stored. Walk the batch down so
+    every call inherits a longer stale tail than it writes."""
     for batch in (15, 1, 9, 2, 14, 3):
         check_shape(onesided_hadamard_kernel, npu_device, batch, n, seed=batch)
 
@@ -304,9 +294,8 @@ def test_operand_buffer_layout(npu_device, n):
     """The kernel reads H_n at offset 0 and +-H_M at offset n*n.
 
     Those offsets are hard-coded in loadHadamard, so this is the host half of
-    that contract. A silent change here does not fail loudly -- it feeds the
-    matmul a wrong-sized operand, which is how the first M=64 experiment
-    produced garbage.
+    that contract. A change here does not fail loudly, it feeds the matmul a
+    wrong-sized operand.
     """
     m, b = hadamard_operands(n)
     assert m * b == n and m == min(64, n), f"unexpected split M={m} B={b}"
@@ -332,8 +321,7 @@ def test_kronecker_block_identity(n):
         Y[:, jM:(j+1)M] = sum_i X[:, iM:(i+1)M] @ (H_B[i,j] * H_M)
 
     and H_B[i,j] == (-1)**popcount(i & j), which is why the kernel never builds
-    or reads H_B at all. If this ever fails the kernel is computing a different
-    transform than its header claims, whatever the end-to-end tests say.
+    or reads H_B at all.
     """
     m, b = hadamard_operands(n)
     h_m = hadamard_matrix(m, "cpu", dtype=torch.float64)
@@ -411,11 +399,8 @@ def test_shape_mismatch_rejected(npu_device):
 # --- block_dim schedule ---------------------------------------------------
 #
 # block_dim is a per-launch argument and the best value moves with the shape:
-# too many cores leaves each one a tile run too short to fill its pipes. The
-# regret for a constant 24 is smaller here than for the two-sided kernel (1.28x
-# worst against 1.91x) because this tile body touches each pipe once and so
-# reaches steady state after very few tiles -- but it must not change the
-# result, which is what these pin down.
+# too many cores leaves each one a tile run too short to fill its pipes. It must
+# not change the result, which is what these pin down.
 
 
 def test_block_dim_schedule_in_range():
@@ -473,8 +458,8 @@ def test_first_call_for_a_size_is_ordered_after_h_is_built(
 
     hadamard_full enqueues torch ops on a cache miss, and the raw ctypes launch
     is only ordered after them because resolve_stream_ptr drains torch_npu's
-    task queue first. Evaluating the two in the wrong order let the kernel read
-    H as zeros and return Y = X * 0 = 0, on the first call for each n only.
+    task queue first. Evaluated in the wrong order, the kernel reads H as zeros
+    and returns Y = X * 0, on the first call for each n only.
 
     Clearing the cache is what makes this a regression test rather than a
     repeat of the correctness sweep: without it every n is already warm.

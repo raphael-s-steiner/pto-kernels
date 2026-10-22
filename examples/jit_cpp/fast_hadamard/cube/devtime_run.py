@@ -1,7 +1,7 @@
 """Inner driver for devtime_bench.py: run each config as one contiguous block.
 
-Device time is read back from msprof's op_summary, so this process only has to
-enqueue work; host cost does not matter as long as every launch is identical.
+Device time is read back from msprof's op_summary, so host cost does not matter
+as long as every launch is identical.
 """
 import ctypes
 import json
@@ -9,6 +9,8 @@ import math
 import pathlib
 import sys
 
+# msprof launches this with its own cwd, so the example root goes on the path
+# explicitly -- bench_common and jit_util_common live there, not in cube/.
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import torch
@@ -21,6 +23,9 @@ from jit_util_common import get_current_stream_ptr, load_cdll, load_required_sym
 
 BASE = pathlib.Path(__file__).resolve().parents[1]
 
+# One list per kernel's call_kernel, each of which MUST mirror the C++
+# signature: ctypes does not check, so a stale list passes the wrong arguments
+# and the kernel reads whatever is in the register.
 TWOSIDED_ARGS = [
     ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
     ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
@@ -64,20 +69,18 @@ def main():
         so = str(BASE / cfg.get("so", DEFAULT_SO.get(kind, DEFAULT_SO["std"])))
 
         # The vector kernel is IN PLACE, so relaunching it on one buffer makes
-        # the values diverge (H*H = n*I, so magnitude grows by n every two
-        # launches and fp16 saturates to inf within a few reps). Cycle a pool
-        # of pre-filled buffers instead -- allocated OUTSIDE the timed loop, so
-        # no torch op lands between launches. The established benchmark in
-        # bench_common does the same thing for the same reason.
+        # the values diverge (H*H = n*I, so fp16 saturates to inf within a few
+        # reps). Cycle a pool of pre-filled buffers, allocated OUTSIDE the timed
+        # loop so no torch op lands between launches.
         pool = int(cfg.get("pool", 1))
         xs = [torch.randn(batch, n, device=device, dtype=torch.float16)
               for _ in range(max(1, pool))]
         x = xs[0]
         y = torch.empty_like(x)
 
-        # Drains torch_npu's async task queue so the raw ctypes launches below
-        # are ordered after the tensor setup. Must be re-resolved here for each
-        # config -- but never inside the timed loop, which has no torch ops.
+        # Drains torch_npu's async task queue, so the raw ctypes launches below
+        # are ordered after the tensor setup. Re-resolved per config, never
+        # inside the timed loop.
         stream_ptr = get_current_stream_ptr()
 
         if kind == "onesided":
@@ -95,9 +98,8 @@ def main():
                     ctypes.c_void_p(h_right.data_ptr()), batch, n)
         elif kind == "bitplan":
             # The conversion-free single-view tile: `batch` samples of width n
-            # are driven as batch/samples_per_tile rows of T = A*B elements,
-            # against the tensor-product operands. Same .so and same entry
-            # point as `cube` -- only the operands and the declared shape move.
+            # driven as batch/samples_per_tile rows of T = A*B elements against
+            # the tensor-product operands. Same .so and entry point.
             fn = kernel_for(so, TWOSIDED_ARGS)
             op_a, op_b, spt = bitplan_operands(n, x.device)
             tiles, tile_n = batch // spt, spt * n
@@ -111,8 +113,7 @@ def main():
             args = (block_dim, stream_ptr, ctypes.c_void_p(x.data_ptr()),
                     batch, n, int(math.log2(n)))
 
-        # Pre-build one argument tuple per pool slot so the loop stays free of
-        # any work beyond the launch itself.
+        # One argument tuple per pool slot, so the loop does nothing but launch.
         if len(xs) > 1:
             arg_sets = [tuple(ctypes.c_void_p(xs[k].data_ptr()) if j == 2 else a
                               for j, a in enumerate(args))

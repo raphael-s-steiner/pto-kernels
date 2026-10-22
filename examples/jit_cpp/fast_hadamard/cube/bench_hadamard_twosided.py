@@ -27,12 +27,11 @@ from standard.jit_util_hadamard import jit_compile as jit_compile_vector
 DEFAULT_WARMUP = 10
 DEFAULT_REPEATS = 100
 
-# The two-sided path needs N = R * C with both factors 16-aligned, so its grid starts
-# at 256 rather than the 128 the vector kernel supports.
+# The two-sided path needs N = R * C with both factors 16-aligned, so its grid
+# starts at 256 rather than the 128 the vector kernel supports.
 BENCH_CUBE_HIDDEN_DIMS = [256, 512, 1024, 2048, 4096, 8192, 16384]
 
-# The two-sided kernel is out of place and needs an output pool of its own; the
-# vector kernel transforms its input buffer in place.
+# The two-sided kernel is out of place; the vector kernel is in place.
 CUBE_COMPARE_POOL_KINDS = {
     "twosided_x": POOL_RANDN_FP16,
     "twosided_y": POOL_EMPTY_FP16,
@@ -163,8 +162,8 @@ def measure_twosided_hadamard_shape(
     result = {
         "batch": batch,
         "n": n,
-        # What this shape actually launched with: twosided_block_dim is None when the
-        # wrapper's per-shape schedule is in charge, so resolve it for the record.
+        # What this shape actually launched with: None means the wrapper's
+        # per-shape schedule is in charge, so resolve it for the record.
         "twosided_block_dim": (
             twosided_block_dim
             if twosided_block_dim is not None
@@ -229,23 +228,19 @@ def benchmark(
 ):
     ensure_output_dir(output_dir)
     # None lets the wrapper apply its per-shape block_dim schedule, which is
-    # what ships; pinning a constant here would benchmark a configuration nobody
-    # runs. The vector kernel has no schedule, so it keeps its resolved default.
+    # what ships; a constant here would benchmark a configuration nobody runs.
     twosided_block_dim = None
     vector_block_dim = vector_func.block_dim
 
     # Both arms leave stream_ptr at None so that each call resolves it through
-    # torch.npu.current_stream(). That is not a cacheable lookup: torch_npu
-    # enqueues its ops on an async task queue, a raw ctypes launch goes straight
-    # to the ACL stream, and resolving the stream drains the queue. Hoisting the
-    # pointer out of the loop drops the drain and the kernel can then run before
-    # the torch ops that fill its inputs -- and before the start/end events that
-    # are supposed to bracket it, which invalidates the timing as well.
+    # torch.npu.current_stream(). That is not a cacheable lookup: resolving the
+    # stream drains torch_npu's async task queue, and a raw ctypes launch goes
+    # straight to the ACL stream -- so hoisting the pointer out of the loop lets
+    # the kernel run before the torch ops that fill its inputs and before the
+    # events meant to bracket it. The pointer value is identical either way.
     #
-    # The drain costs ~27 us per call, so shapes whose device time is below that
-    # report launch cost rather than kernel cost. Both arms pay it equally, so
-    # the comparison stays fair, but separating the kernels on device time needs
-    # a profiler (msprof op_summary), not this harness.
+    # Both arms also pay that drain, which is more than the device time of the
+    # smaller shapes: separating the kernels there needs cube/devtime_bench.py.
 
     print(f"\n{'=' * 96}")
     print(
@@ -283,8 +278,9 @@ def benchmark(
             print_twosided_hadamard_shape_summary(result)
             records.append(format_twosided_hadamard_csv_record(result))
 
-    # Keyed on the cap, not the value used: the schedule picks per shape, and
-    # the twosided_block_dim column records what each row actually ran at.
+    # Keyed on the cap, not the value used: the schedule picks per shape and the
+    # twosided_block_dim column records what each row ran at. The stem has to
+    # stay prefix + an int for plot_common.block_dim_from_path.
     csv_path = output_dir / f"fht_twosided_compare_bd{twosided_func.block_dim}.csv"
     write_csv_records(csv_path, CSV_HEADER, records)
     print(f"\nSaved to {csv_path}")

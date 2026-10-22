@@ -17,34 +17,31 @@ from jit_util_common import (
     torch_to_ctypes,
 )
 
-# The cube path needs N = R * C with both factors 16-aligned, so N >= 256.
+# The cube path needs N = R * C with both factors 16-aligned, so N >= 256; the
+# top is the last row of FAST_HADAMARD_TWOSIDED_CASES.
 MIN_TWOSIDED_N = 256
 MAX_TWOSIDED_N = 32768
 
 _FACTOR_CACHE: dict = {}
 
-# Samples per tile, mirroring FAST_HADAMARD_TWOSIDED_CASES in the kernel. A tile is
-# S consecutive samples, so a launch has ceil(batch / S) tiles to spread over
-# the cores. Keep in step with the kernel if that table changes.
+# Samples per tile, mirroring FAST_HADAMARD_TWOSIDED_CASES in the kernel, so a
+# launch has ceil(batch / S) tiles to spread over the cores. The tests import it
+# to place their tile-boundary batches.
 _SAMPLES_PER_TILE = {256: 32, 512: 16, 1024: 8, 2048: 4, 4096: 2, 8192: 1,
                      16384: 1, 32768: 1}
 
-# The kernel carries three tile heights per size -- S, S/2 and S/4 -- and picks
-# between them on the tile count, because below ceil(batch / S) >= cores the
-# tile height IS the core count. These two MUST mirror PTO_TS_TILES_TALL and
-# PTO_TS_TILES_MID in the kernel: the schedule sizing a tile the kernel is not
-# running picks the wrong block_dim (silently -- block_dim cannot change the
-# answer, only the time).
+# The kernel picks between S, S/2 and S/4 on the tile count. These two MUST
+# mirror PTO_TS_TILES_TALL and PTO_TS_TILES_MID in the kernel: sizing the
+# schedule for a tile the kernel is not running picks the wrong block_dim,
+# silently, since block_dim can change only the time and not the answer.
 _TILES_TALL = 16
 _TILES_MID = 6
 
 
 def twosided_samples_per_tile(batch: int, n: int) -> int:
-    """S the kernel will run for this shape, mirroring its dispatch exactly.
-
-    The kernel takes the mid tile without a test when S/2 == S/4, so this does
-    too -- otherwise the two disagree at S == 2, where the mid tile is 1.
-    """
+    """S the kernel will run for this shape, mirroring its dispatch exactly,
+    including taking the mid tile untested when S/2 == S/4 (at S == 2 the two
+    would otherwise disagree)."""
     tall = _SAMPLES_PER_TILE.get(int(n), 1)
     if tall == 1 or int(batch) >= _TILES_TALL * tall:
         return tall
@@ -53,72 +50,27 @@ def twosided_samples_per_tile(batch: int, n: int) -> int:
         return mid
     return max(1, mid // 2)
 
-# Cores are only worth adding while each still gets a tile run long enough to
-# keep its pipes full, and the quantity that says so is TILES PER CORE, not the
-# core count: the kernel splits by tiles, so the only schedules a launch can
-# reach are ceil(tiles / j) for integer j, and the measurement picks j. It
-# picks j = 1 while the tiles are few and j = 2 after that, nothing else, and
-# the 24-core cap raises j from there on its own.
-#
-# This replaces a bd = sqrt(k * tiles) fit with a per-N k. That form was the
-# wrong one: cores ~ sqrt(tiles) means tiles per core GROWS with the batch,
-# while the measured optimum holds it at 2. Swept at every integer block_dim in
-# [1, 24] over 139 shapes -- 91 across the three tiers of N=256..4096 plus 48
-# at N=8192..32768 -- and scored on the CLAMPED count the launch really uses,
-# against the best REACHABLE split (a block_dim of any other shape is one the
-# clamp can never produce, so scoring against it invents regret):
-#
-#   law                             worst   geomean
-#   this one                       1.0139    1.0005
-#   two per core always            1.0680    1.0015
-#   one per core always            1.6895    1.1197
-#   sqrt(k * tiles), best k/tier   1.4879    1.0251
-#
-# The only free value is where j turns from 1 into 2, and it is a tile count:
-#
-#   N <= 4096   1    they carry three tile HEIGHTS instead (see above), so a
-#                    small batch arrives as many short tiles, never as a few
-#                    tall ones, and pairing them always wins
-#   N = 8192    6    one tile height and it is the full 8192 elements: up to
-#                    six of them, a core wants its own
-#   N >= 16384  24   dense-shallow and blocked-shallow, no deep ring, so
-#                    pairing a core's tiles buys no overlap at all and they
-#                    want every core they can get. Their old k cost them
-#                    1.21x and 1.49x at batch 12-24 -- the largest single
-#                    loss this sweep found.
-#
-# This table is downstream of the OPERAND LAYOUT. While loadHadamardFactors
-# read its (W x W) factors as ND, every core repaid a narrow-tile gather before
-# it could touch a tile, N=256 and N=512 stopped scaling past ~6 cores, and the
-# k fitted for them came out two orders below every other size -- a defect
-# reading as a property. If that layout moves again, resweep those two first.
+# TILES PER CORE, not the core count, is what says whether another core is
+# worth adding: the kernel splits by tiles, so the reachable schedules are
+# ceil(tiles / j), and this takes j = 1 while there are at most _SOLO_TILES[n]
+# tiles and j = 2 after that. The sizes with no deep ring (N >= 16384) gain no
+# overlap from pairing a core's tiles, so they want every core they can get.
 _SOLO_TILES = {256: 1, 512: 1, 1024: 1, 2048: 1, 4096: 1, 8192: 6,
                16384: 24, 32768: 24}
 # Only reached if FAST_HADAMARD_TWOSIDED_CASES grows a size this table has not
-# been fitted for. 1 is the tiered sizes' value, which a new size would most
-# likely share -- but sweep block_dim and add the entry.
+# been fitted for -- sweep block_dim and add the entry.
 _DEFAULT_SOLO_TILES = 1
 
 
-# Memoised: it is a pure function of the three arguments and sits on the
-# per-launch path, where the host is the bottleneck for every shape whose
-# device time is under ~46 us. The wrapper calls it TWICE on a launch that
-# splits into a bit-plan bulk plus a remainder, and that is the shape that
-# gains most (1.117x against 1.071x - 1.085x elsewhere). The cache is keyed on
-# the arguments only, so _SAMPLES_PER_TILE, the tier thresholds and
-# _SOLO_TILES must stay constants: make any of them settable at run time
-# and this needs a cache_clear.
+# Memoised: a pure function of its arguments, on the per-launch path where the
+# host is the bottleneck for most shapes. The cache is keyed on the arguments
+# only, so _SAMPLES_PER_TILE, the tier thresholds and _SOLO_TILES must stay
+# constants -- make any of them settable at run time and this needs a
+# cache_clear.
 @functools.lru_cache(maxsize=4096)
 def twosided_block_dim_schedule(batch: int, n: int, max_block_dim: int) -> int:
     """Pick block_dim for one launch: enough cores to use the part, but not so
     many that each core's tile run is too short to fill its pipes.
-
-    One tile per core while there are at most `_SOLO_TILES[n]` of them, two
-    each after that, and the 24-core cap lengthens the run from there -- which
-    is what the measured optimum does. Fitted over every integer block_dim in
-    [1, 24] (not a subset) against msprof device time at 139 shapes, scored on
-    the clamped count: worst 1.0139x of the best reachable split, geomean
-    1.0005x.
 
     The tile tier moves with the batch, so `tiles` has to be computed from the
     tile the kernel will actually run, not from the tall one.
@@ -133,27 +85,16 @@ def twosided_block_dim_schedule(batch: int, n: int, max_block_dim: int) -> int:
     solo = _SOLO_TILES.get(int(n), _DEFAULT_SOLO_TILES)
     wanted = tiles if tiles <= solo else -(-tiles // 2)
     cores = max(1, min(int(max_block_dim), wanted))
-    # Drop the cores that would be launched with nothing to do. The kernel
+    # Drop the cores that would be launched with nothing to do: the kernel
     # splits the batch as tiles_per_core = ceil(tiles / block_num), so every
     # core from ceil(tiles / tiles_per_core) on finds begin >= batch and
-    # returns -- at N=32768 batch 22 the schedule asks for 19 cores and 8 of
-    # them do nothing. Re-deriving block_num from that count leaves
-    # tiles_per_core, and so every core's range, bit-identical: verified over
-    # all (tiles <= 6000) x (block_dim <= 24). Worth 1.016x geomean,
-    # +0.50% per idle core, on 50 pairs that differ only in the launched count.
+    # returns. Re-deriving block_num from that count leaves tiles_per_core --
+    # and so every core's range -- bit-identical.
     return -(-tiles // -(-tiles // cores))
 
 
-# Per-N override of the Kronecker split, same env-switch idiom as _BLOCK.
-# The balanced split minimises MACs -- the two-sided cost is N * (R + C) per
-# sample, minimal at R == C == sqrt(N) -- but C == 16 is what makes BOTH GM
-# legs conversion-free at any S (Layout::kNzGm), because a 16-column tile is a
-# single NZ block-column and its NZ image IS the row-major bytes. So the two
-# objectives compete, and which wins is a measurement. MUST agree with
-# FAST_HADAMARD_TWOSIDED_CASES: a disagreement sizes the operand buffers for a
-# split the kernel is not running and it computes garbage.
-#   PTO_TS_SPLIT="1024:64x16,2048:128x16"
 def _parse_split_env(raw: str) -> dict:
+    """Parse PTO_TS_SPLIT, e.g. "1024:64x16,2048:128x16", into {n: (R, C)}."""
     out = {}
     for item in raw.split(","):
         if not item.strip():
@@ -164,11 +105,14 @@ def _parse_split_env(raw: str) -> dict:
     return out
 
 
+# Per-N override of the Kronecker split. The balanced split minimises MACs --
+# the cost is N * (R + C) per sample -- but C == 16 is what makes BOTH GM legs
+# conversion-free at any S (Layout::kNzGm), so the two objectives compete and
+# which wins is a measurement.
+#
 # MUST mirror FAST_HADAMARD_TWOSIDED_CASES (test_tile_table_mirrors_the_kernel
-# is the gate). C == 16 at N=512 is MAC-neutral -- the cost is N * (R + C) and
-# 16 + 32 == 32 + 16 -- and at N=1024 it costs 25% more MACs, which measured
-# free because the cube is 1-7% of device time at these sizes while the
-# transfers are not.
+# is the gate): a disagreement sizes the operand buffers for a split the kernel
+# is not running and it computes garbage.
 _SPLIT_DEFAULT = {512: (32, 16), 1024: (64, 16)}
 _SPLIT = _parse_split_env(os.environ.get("PTO_TS_SPLIT", "")) or dict(
     _SPLIT_DEFAULT)
@@ -192,9 +136,8 @@ def hadamard_matrix(size: int, device, dtype=torch.float16):
 
 
 # Mat-factor of each stage, mirroring PTO_TS_BLOCK in the kernel: H_f is applied
-# as H_acc (x) H_mat with H_mat of size min(_BLOCK, f), so the matmul and its
-# data slice are M-sized while the sum over blocks runs in L0C. The two MUST
-# agree or the kernel multiplies by a wrong-sized operand and computes garbage.
+# as H_acc (x) H_mat with H_mat of size min(_BLOCK, f). The two MUST agree or
+# the kernel multiplies by a wrong-sized operand and computes garbage.
 _BLOCK = int(os.environ.get("PTO_TS_BLOCK", 64))
 
 
@@ -206,13 +149,11 @@ def hadamard_mat_factor(f: int, block: int | None = None) -> int:
 
 def _to_nz(m):
     """Row-major (W x W) -> its NZ image: block-column major over 16x16
-    row-major fractals, which is what a `Layout::NZ` GlobalTensor reads as one
-    contiguous burst. `loadHadamardFactors` reads every operand that way, so
-    every operand has to be stored that way.
+    row-major fractals. `loadHadamardFactors` reads every operand through a
+    `Layout::NZ` view, so every operand must be stored this way.
 
-    At W == 16 this is the identity (one block-column IS the row-major bytes),
-    which is why N=256 validated before the host side existed -- a trap worth
-    naming, since the first size to break is N=512 and only on its H_C.
+    At W == 16 this is the identity, so N=256 cannot catch a mistake here; the
+    first size that can is N=512, and only on its H_C.
     """
     w = m.shape[0]
     if w % 16 or m.shape[1] != w:
@@ -223,9 +164,8 @@ def _to_nz(m):
 def _factor_buffer(f: int, device, block: int | None = None):
     """H_f, then +H_M and -H_M, flat -- the layout loadHadamardFactors reads.
 
-    Appended rather than substituted so one buffer feeds either form and the
-    A/B between them stays a compile-time switch. The tail is 2*M*M <= 32768
-    halves whatever f is, and is unused when M == f.
+    Appended rather than substituted, so one buffer feeds either form. The tail
+    is 2*M*M <= 32768 halves whatever f is, and is unused when M == f.
     """
     m = hadamard_mat_factor(f, block)
     h_m = hadamard_matrix(m, device)
@@ -239,8 +179,7 @@ def hadamard_factors(n: int, device, block: int | None = None):
 
     `block` MUST match whatever the kernel was compiled with (PTO_TS_BLOCK):
     the buffers carry +-H_M, so a disagreement hands the kernel the wrong-sized
-    operand and it computes garbage -- a broken switch, not a bad block size.
-    The env default exists so one setting drives both sides.
+    operand. The env default exists so one setting drives both sides.
 
     Keyed on the torch device object directly: this sits on the per-call path,
     and stringifying the device costs more than the lookup it feeds.
@@ -256,13 +195,13 @@ def hadamard_factors(n: int, device, block: int | None = None):
     return cached
 
 
-# --- the bit-plan tile -------------------------------------------------------
+# --- the bit-plan tile ----------------------------------------------------
 #
 # Conversion-free GM transfers (Layout::NZ on both legs) need the kernel's view
 # of the tile to be the NZ regrouping of the GM byte index, which for S > 1
 # samples lifts the high column bits above the SAMPLE index -- an ordinary
 # H_R / H_C pair cannot undo that. But the operands are compile-time constants
-# and need not be Hadamard matrices. H_N is a tensor power of H_2, so the
+# and need not be Hadamard matrices: H_N is a tensor power of H_2, so the
 # transform applies H_2 to each index bit independently, and a matmul applies
 # whatever we choose to one FIELD of the byte index. For an (A x B) NZ view,
 #
@@ -275,23 +214,15 @@ def hadamard_factors(n: int, device, block: int | None = None):
 #     every transform bit gets H_2 exactly once; every sample bit gets I_2.
 #
 # Each operand is the tensor product over its field, in bit order, of H_2 for a
-# transform bit and I_2 for a sample bit -- at N=512 with T=8192, I_2 (x) H_32
-# and I_8 (x) H_16 over a (64 x 128) view, which is byte for byte what the
-# kernel already runs at N=8192. So there is no new kernel code: it is the
+# transform bit and I_2 for a sample bit. There is no new kernel code: it is the
 # existing S == 1 body driven with T-sized "samples".
 #
 # The price is MACs -- A + B = 2*sqrt(T) per value instead of 2*sqrt(N) -- so it
-# only pays where per-tile descriptor count dominates. That is N=512 (2.19-2.42x)
-# and nowhere else: swept over every tile size, N=1024 through 4096 peak at
-# 0.98-1.12x. See the README.
+# only pays where the per-tile descriptor count dominates, which is N=512 alone.
 _BITPLAN_TILE = {512: 8192}
-# Minimum batch at which the bit-plan path is actually worth taking. It buys
-# conversion-free transfers with MACs, and it was fitted when the classic path
-# at N=512 still did a 32-byte-per-row operand gather. Since that fix (1.84x)
-# and the C == 16 split (which gets conversion-free legs structurally, for no
-# MACs), bit-plan only wins at very large batch -- measured against the split
-# it is 1.07x - 1.40x SLOWER from batch 16 to 2048 and 1.02x - 1.08x faster
-# from 8192 up. Below this it is a pessimisation, so the classic path takes it.
+# Minimum batch at which the bit-plan path is worth taking: it pays MACs for
+# conversion-free transfers, which the classic path's C == 16 split already gets
+# structurally, so below this it is a pessimisation and the classic path runs.
 _BITPLAN_MIN_BATCH = {512: 8192}
 _BITPLAN_CACHE: dict = {}
 
@@ -320,8 +251,8 @@ def _bit_operand(bits, n_log2: int, device):
     h2 = torch.tensor([[1.0, 1.0], [1.0, -1.0]])
     for b in bits:
         m = torch.kron(m, h2 if b < n_log2 else torch.eye(2))
-    # Same NZ store as the ordinary factors: these are read by the very same
-    # loads, so a row-major bit-plan operand would be silently permuted.
+    # Read by the very same loads as the ordinary factors, so a row-major
+    # bit-plan operand would be silently permuted.
     return _to_nz(m.to(device=device, dtype=torch.float16).contiguous())
 
 
@@ -399,8 +330,7 @@ def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE):
             raise ValueError("n must match the input tensor shape.")
 
         # block_dim is a per-launch argument, not a property of the compiled
-        # kernel: the best value moves with the shape, and a constant costs up
-        # to 1.83x at the small end of this kernel's own benchmark range.
+        # kernel: the best value moves with the shape.
         launch_block_dim = (
             twosided_block_dim_schedule(resolved_batch, resolved_n, resolved_block_dim)
             if block_dim is None
@@ -408,10 +338,9 @@ def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE):
         )
 
         # Build every device buffer BEFORE resolving a stream pointer, and
-        # resolve one per launch. A raw ctypes launch can jump ahead of torch
-        # ops issued after the pointer was read, so a hoisted pointer races the
-        # operand tensors into existence -- which shows up only on the FIRST
-        # call at each N, as a moving set of wrong answers.
+        # resolve one per launch: resolving drains torch_npu's task queue, so a
+        # hoisted pointer lets the raw ctypes launch jump ahead of the torch ops
+        # that build the operands -- wrong answers on the first call at each N.
         plan = (bitplan_operands(resolved_n, x.device)
                 if resolved_batch >= _BITPLAN_MIN_BATCH.get(resolved_n, 0)
                 else None)
@@ -421,8 +350,7 @@ def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE):
             op_a, op_b, samples_per_tile = plan
             # Whole bit-plan tiles only; a ragged remainder goes to the classic
             # path below. The tile is `samples_per_tile` samples seen as ONE
-            # T-element row, which is exactly what the kernel's S == 1 body
-            # wants -- so this is a plain reinterpret of the same buffers.
+            # T-element row, which is a plain reinterpret of the same buffers.
             tiles = resolved_batch // samples_per_tile
             if tiles:
                 bulk = tiles * samples_per_tile

@@ -38,13 +38,13 @@ DEFAULT_REPEATS = 100
 # exactly these four sizes -- see MIN/MAX_ONESIDED_N and the kernel header.
 BENCH_ONESIDED_HIDDEN_DIMS = [64, 128, 256, 512]
 
-# The two-sided kernel needs N = R * C with both factors 16-aligned, so it has
-# no arm at the bottom two sizes and those rows report blanks for it.
 ONESIDED_POOL_KINDS = {
     "onesided_x": POOL_RANDN_FP16,
     "onesided_y": POOL_EMPTY_FP16,
     "vector_x": POOL_RANDN_FP16,
 }
+# The two-sided kernel needs N = R * C with both factors 16-aligned, so it has
+# no arm at the bottom two sizes and those rows report blanks for it.
 TWOSIDED_POOL_KINDS = {
     "twosided_x": POOL_RANDN_FP16,
     "twosided_y": POOL_EMPTY_FP16,
@@ -210,12 +210,9 @@ def measure_onesided_hadamard_shape(
     result = {
         "batch": batch,
         "n": n,
-        # What this shape actually launched with: onesided_block_dim is None when
-        # the wrapper's per-shape schedule is in charge, so resolve it for the
-        # record. Below MIN_ONESIDED_BATCH the wrapper launches the padded
-        # scratch instead, so the schedule sees 16 rather than batch -- which
-        # happens to land on the same value for every N in the table, because
-        # the smallest tile there is 32 samples, but do not rely on that.
+        # What this shape actually launched with: None means the wrapper's
+        # per-shape schedule is in charge, so resolve it for the record. Below
+        # MIN_ONESIDED_BATCH the schedule sees 16 rather than batch.
         "onesided_block_dim": (
             onesided_block_dim
             if onesided_block_dim is not None
@@ -309,27 +306,23 @@ def benchmark(
     hidden_dims,
 ):
     ensure_output_dir(output_dir)
-    # None lets each wrapper apply its own per-shape block_dim
-    # schedule, which is what ships; pinning a constant here would benchmark a
-    # configuration nobody runs. The vector kernel has no schedule, so it keeps
-    # its resolved default.
+    # None lets each wrapper apply its own per-shape block_dim schedule, which
+    # is what ships; a constant here would benchmark a configuration nobody
+    # runs. The vector kernel has no schedule, so it keeps its default.
     onesided_block_dim = None
     twosided_block_dim = None
     vector_block_dim = vector_func.block_dim
 
     # Every arm leaves stream_ptr at None so that each call resolves it through
-    # torch.npu.current_stream(). That is not a cacheable lookup: torch_npu
-    # enqueues its ops on an async task queue, a raw ctypes launch goes straight
-    # to the ACL stream, and resolving the stream drains the queue. Hoisting the
-    # pointer out of the loop drops the drain and the kernel can then run before
-    # the torch ops that fill its inputs -- and before the start/end events that
-    # are supposed to bracket it, which invalidates the timing as well. The
-    # pointer value is identical either way, so this looks free and is not.
+    # torch.npu.current_stream(). That is not a cacheable lookup: resolving the
+    # stream drains torch_npu's async task queue, and a raw ctypes launch goes
+    # straight to the ACL stream -- so hoisting the pointer out of the loop lets
+    # the kernel run before the torch ops that fill its inputs and before the
+    # events meant to bracket it. The pointer value is identical either way.
     #
-    # The drain costs ~27 us per call, so shapes whose device time is below that
-    # report launch cost rather than kernel cost. All three arms pay it equally,
-    # so the comparison stays fair, but separating the kernels on device time
-    # needs a profiler (msprof op_summary), not this harness.
+    # All three arms also pay that drain, which is more than the device time of
+    # the smaller shapes: separating the kernels there needs a profiler
+    # (msprof op_summary), not this harness.
 
     unsupported = [n for n in hidden_dims if not supports_onesided(n)]
     if unsupported:

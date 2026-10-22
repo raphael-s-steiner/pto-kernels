@@ -1,10 +1,9 @@
 """Device-time benchmark: run configs under msprof, report per-launch device us.
 
 The event-timed harness in bench_hadamard_twosided.py cannot see this kernel: a
-launch costs ~46-59 us on the host (most of it torch_npu's task-queue drain)
-while the kernel itself is 3-95 us on device, so the reported duration is flat
-across a 64x range of work. msprof reads the duration off the device task
-record instead, which is the only way to compare kernels here.
+launch costs more on the host than the kernel costs on device, so its reported
+duration is flat across a 64x range of work. msprof reads the duration off the
+device task record instead.
 
 Usage (cwd = this example's root, needs msprof on PATH):
     python3 cube/devtime_bench.py <configs.json> [out.json]
@@ -14,11 +13,9 @@ where configs.json is a list of
      "batch": N, "n": N, "bd": 24, "reps": 30, "warmup": 5}
 
 `kind` picks the .so each config launches; add "so": "<path>" to point one at a
-variant build instead.
-
-Each config runs `warmup` + `reps` launches back to back. The AI_CORE tasks in
-msprof's op_summary come out in launch order, so the blocks are chunked in the
-same order the configs were run and the warmup launches are dropped.
+variant build instead. Each config runs `warmup` + `reps` launches back to back,
+and the AI_CORE tasks in msprof's op_summary come out in launch order, so the
+blocks are chunked in that order and the warmups dropped.
 """
 import csv
 import glob
@@ -30,8 +27,12 @@ import subprocess
 import sys
 
 BASE = pathlib.Path(__file__).resolve().parent
+# msprof owns its output tree and names each run PROF_*, so it gets a directory
+# of its own, wiped per run: the glob below is only unambiguous with one run.
 PROF_DIR = BASE / "outputs" / "prof"
 
+# op_summary carries every AI_CORE task the process issued, so filter by
+# symbol -- one marker per .so DEFAULT_SO can point at.
 KERNEL_MARKERS = ("fast_hadamard_twosided", "fast_hadamard_onesided",
                   "fast_hadamard_fp16")
 
@@ -68,6 +69,8 @@ def kernel_tasks(summary: pathlib.Path):
                     (float(row["Task Start Time(us)"].strip()),
                      float(row["Task Duration(us)"]), name)
                 )
+    # By start time: the chunking below is positional, and DictReader
+    # preserves file order, not time.
     rows.sort(key=lambda r: r[0])
     return rows
 
@@ -77,6 +80,8 @@ def main():
     configs = json.loads(cfg_path.read_text())
     tasks = kernel_tasks(run_msprof(cfg_path))
 
+    # Exact, not >=: the chunking is positional, so one task missing or extra
+    # shifts every config's block and the numbers come out plausible and wrong.
     expected = sum(int(c.get("warmup", 5)) + int(c.get("reps", 30)) for c in configs)
     if len(tasks) != expected:
         raise RuntimeError(f"expected {expected} kernel tasks, msprof reported {len(tasks)}")
@@ -86,6 +91,8 @@ def main():
         warmup, reps = int(cfg.get("warmup", 5)), int(cfg.get("reps", 30))
         block = tasks[cursor + warmup: cursor + warmup + reps]
         cursor += warmup + reps
+        # Median as the headline, spread beside it: a stray slow rep moves a
+        # mean and leaves no trace.
         durations = sorted(d for _, d, _ in block)
         batch, n = int(cfg["batch"]), int(cfg["n"])
         median = statistics.median(durations)

@@ -5,6 +5,9 @@ import re
 import pytest
 import torch
 
+# The wrapper's own tables rather than anything recomputed here: a test that
+# re-derived S would silently start probing the wrong boundaries the next time
+# the kernel's case table moves.
 from cube.jit_util_hadamard_twosided import (
     MAX_TWOSIDED_N,
     MIN_TWOSIDED_N,
@@ -19,18 +22,27 @@ from cube.jit_util_hadamard_twosided import (
     validate_twosided_args,
 )
 
+# A small spread, run against every N below; the two tests after it straddle
+# the tile and tier boundaries, derived from the tables.
 TEST_BATCHES = [1, 7, 22, 65]
+# Every size in FAST_HADAMARD_TWOSIDED_CASES.
 TEST_HIDDEN_DIMS = [256, 512, 1024, 2048, 4096, 8192, 16384, 32768]
 TEST_SEEDS = [0, 1]
+# Three sizes rather than all eight, because every boundary batch below is a
+# device launch: 256 and 1024 carry C == 16 and so the whole-tile reinterpret,
+# 4096 the general turnaround. Their tall tiles are 32, 8 and 2 samples, so the
+# sweep also crosses the S == 2 edge where the third tier collapses.
 TILE_BOUNDARY_HIDDEN_DIMS = [256, 1024, 4096]
+# 31/32/33 and 64/65 straddle N=256's tall tile and twice it, 47 leaves the
+# last tile masked, and 1-3 are below its shortest tier, where the standalone
+# short-span path runs instead of the ring.
 TILE_BOUNDARY_BATCHES = [1, 2, 3, 31, 32, 33, 47, 64, 65]
 DTYPE = torch.float16
 
-# The cube kernel accumulates in fp32 and rounds to fp16 only twice (once per
-# TMATMUL), so it does not reproduce the staged-fp16 reference bit for bit and
-# is compared against an exact float64 transform instead. Measured worst case
-# over the grid below is 3.0e-4 relative RMS and 2.4e-3 for the worst element,
-# both relative to the output RMS; the tolerances keep 3-4x of margin.
+# The kernel rounds to fp16 only twice, so it is compared against an exact
+# float64 transform rather than the staged reference. Worst case over the grid
+# below is 3.0e-4 relative RMS and 2.4e-3 for the worst element, both relative
+# to the output RMS, so these tolerances keep 3-4x of margin.
 REL_RMS_TOL = 1e-3
 MAX_ELEMENT_TOL = 1e-2
 
@@ -125,9 +137,8 @@ def test_sample_tile_boundaries(twosided_hadamard_kernel, npu_device, n):
 
 @pytest.mark.parametrize("n", TILE_BOUNDARY_HIDDEN_DIMS)
 def test_tile_tier_boundaries(twosided_hadamard_kernel, npu_device, n):
-    """The kernel picks between three tile heights on the tile count, so cross
-    both thresholds at every size that has them -- including the batch one
-    below each, where the shorter tile has to carry a masked remainder."""
+    """Cross both tile-height thresholds at every size that has them, including
+    the batch below each, where the shorter tile carries a masked remainder."""
     tall = _SAMPLES_PER_TILE[n]
     mid = max(1, tall // 2)
     edges = {_TILES_TALL * tall, _TILES_MID * mid}
@@ -138,9 +149,8 @@ def test_tile_tier_boundaries(twosided_hadamard_kernel, npu_device, n):
 
 
 def test_tile_table_mirrors_the_kernel():
-    """The host sizes block_dim for the tile the kernel will run. If the two
-    tables disagree the answers stay correct and the schedule silently sizes a
-    tile nobody runs, so compare them against the kernel source directly."""
+    """The host sizes block_dim for the tile the kernel will run, and a
+    disagreement is silent, so compare against the kernel source directly."""
     src = (pathlib.Path(__file__).resolve().parent
            / "fast_hadamard_twosided.cpp").read_text()
 
@@ -159,9 +169,9 @@ def test_tile_table_mirrors_the_kernel():
         n = int(n)
         s = int(samples) if samples.isdigit() else define(samples)
         assert int(rows_) * int(cols) == n, f"R * C != N for N={n}"
-        # The host sizes the OPERAND BUFFERS from hadamard_split. A split the
-        # kernel is not running hands it a wrong-shaped H and it computes
-        # garbage, so this one is a correctness gate, not a schedule gate.
+        # The host sizes the OPERAND BUFFERS from hadamard_split, so a split
+        # the kernel is not running hands it a wrong-shaped H: a correctness
+        # gate, not a schedule gate.
         assert hadamard_split(n) == (int(rows_), int(cols)), (
             f"N={n}: kernel splits as {(int(rows_), int(cols))}, host "
             f"hadamard_split says {hadamard_split(n)}")
@@ -174,21 +184,19 @@ def test_tile_table_mirrors_the_kernel():
 
 @pytest.mark.parametrize("n", sorted(_BITPLAN_MIN_BATCH))
 def test_bitplan_floor_boundaries(twosided_hadamard_kernel, npu_device, n):
-    """The bit-plan path only runs at or above `_BITPLAN_MIN_BATCH` now, which
-    moved it out of the batch range the other correctness tests cover. Straddle
-    the floor and cross a whole-tile boundary, so both the bulk launch and the
-    bulk-plus-ragged-remainder split are exercised."""
+    """The bit-plan path runs only at or above `_BITPLAN_MIN_BATCH`, outside
+    the range the other correctness tests cover. Straddle the floor and cross a
+    whole-tile boundary, so both the bulk launch and the bulk-plus-remainder
+    split run."""
     floor = _BITPLAN_MIN_BATCH[n]
     samples = _BITPLAN_TILE[n] // n
     for batch in (floor - 1, floor, floor + 1, floor + samples):
         check_shape(twosided_hadamard_kernel, npu_device, batch, n)
 
 def test_shared_factor_sizes_have_identical_operand_buffers(npu_device):
-    """When R == C the two Hadamard factors are the same matrix, and
-    `Layout::kShareHf` has the kernel read ONE GM buffer into one L1 copy and
-    feed both L0A and L0B from it -- worth 32 KB per core of MTE2 at N=16384.
-    That makes the kernel depend on the two buffers holding identical bytes,
-    and nothing in `_factor_buffer` enforces it: give either side its own
+    """When R == C, `Layout::kShareHf` has the kernel read ONE GM buffer and
+    feed both L0A and L0B from it, so the two host buffers must hold identical
+    bytes. Nothing in `_factor_buffer` enforces that: give either side its own
     convention (a transpose, a different NZ image, a sign) and the kernel
     silently multiplies by the wrong matrix on the side it no longer reads.
     """
@@ -210,6 +218,8 @@ def test_shared_factor_sizes_have_identical_operand_buffers(npu_device):
             "the two operand buffers do not match")
 
 def test_batch_partition_boundaries(twosided_hadamard_kernel, npu_device):
+    """The launch splits whole tiles over the cores, so cross the point where
+    cores start running out of work (and the point where there is none)."""
     n = 1024
     cores = twosided_hadamard_kernel.block_dim
     batches = sorted({0, 1, cores - 1, cores, cores + 1, 2 * cores, 2 * cores + 1})
@@ -220,6 +230,7 @@ def test_batch_partition_boundaries(twosided_hadamard_kernel, npu_device):
 
 @pytest.mark.parametrize("n", [256, 4096])
 def test_input_is_not_modified(twosided_hadamard_kernel, npu_device, n):
+    # 9 is a whole tile plus a masked remainder at 256, nine whole tiles at 4096.
     torch.manual_seed(0)
     x_cpu = torch.randn(9, n, dtype=DTYPE)
     x = x_cpu.to(npu_device)
@@ -244,6 +255,9 @@ def test_more_accurate_than_staged_fp16(twosided_hadamard_kernel, npu_device, n)
         f"cube relative RMS {twosided_rel_rms:.3e} is worse than the staged fp16 "
         f"reference {staged_rel_rms:.3e} for N={n}"
     )
+
+
+# --- argument rejection ---------------------------------------------------
 
 
 @pytest.mark.parametrize("n", [MIN_TWOSIDED_N // 2, MAX_TWOSIDED_N * 2])
@@ -292,9 +306,8 @@ def test_shape_mismatch_rejected(npu_device):
 # --- block_dim schedule ---------------------------------------------------
 #
 # block_dim is a per-launch argument and the best value moves with the shape:
-# too many cores leaves each one a tile run too short to fill its pipes, and a
-# constant 24 costs up to 1.83x at the small end of this kernel's own benchmark
-# range. It must not change the result, which is what these pin down.
+# too many cores leaves each one a tile run too short to fill its pipes. It must
+# not change the result, which is what these pin down.
 
 
 def test_block_dim_schedule_in_range():
@@ -320,9 +333,14 @@ def test_block_dim_schedule_respects_cap():
 @pytest.mark.parametrize("n", [256, 1024, 4096])
 def test_block_dim_does_not_change_result(twosided_hadamard_kernel, npu_device, n):
     """The gate that makes the schedule free of correctness risk: every
-    block_dim, including the scheduled one, must give bit-identical output."""
+    block_dim, including the scheduled one, must give bit-identical output.
+
+    It moves the per-core range boundaries, and a range shorter than one tile
+    drops that core into runShortSpan with a smaller tile -- so this also tests
+    that a sample gets the same answer whatever tile covers it.
+    """
     torch.manual_seed(7)
-    batch = 300  # not a multiple of any tile size, so the tails differ per core
+    batch = 300  # 300 % 16 == 12, so the per-core tails differ at 256 and 1024
     x = torch.randn(batch, n, device=npu_device, dtype=DTYPE)
 
     reference = torch.empty_like(x)

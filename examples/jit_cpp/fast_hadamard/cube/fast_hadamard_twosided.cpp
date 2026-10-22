@@ -2,29 +2,29 @@
 
 using namespace pto;
 
-#define DIV_ROUNDUP(x, y) (((x) + (y) - 1) / (y))
-
 // Radix-sqrt(N) Hadamard transform on the cube unit, as two matrix products.
 //
-// H_N is separable: with N = R * C and the Sylvester (natural) ordering,
-// H_N = H_R (x) H_C, so for a sample viewed as an R x C row-major matrix X,
+// H_N = H_R (x) H_C for N = R * C in Sylvester (natural) ordering, so for a
+// sample read as an R x C row-major matrix X, Y = H_R * X * H_C read back
+// row-major is the length-N transform in natural order.
 //
-//     Y = H_R * X * H_C
+// A tile is S consecutive samples, in GM one contiguous (S*R x C) matrix.
+// Neither multiply mixes the other's axis, so two TMATMULs transform the tile
+// whatever S is. Between them the per-sample blocks move from a vertical stack
+// to a horizontal one: free at C == 16 (one NZ block-column, the same bytes),
+// else S TEXTRACTs into one (R x S*C) L1 tile plus S per-sample stores.
 //
-// and reading Y back row-major gives the length-N transform in natural order.
-// R and C are the balanced split of log2(N), so both are about sqrt(N) on a
-// side. Accumulation is fp32 with two roundings, against log2(N) for the vector
-// butterfly in standard/.
-//
-// A tile is S consecutive samples, in GM one contiguous (S*R x C) matrix. Both
-// multiplies are whole-tile -- a right multiply does not mix rows, a left
-// multiply does not mix columns -- so two TMATMULs transform the tile whatever
-// S is. Between them the per-sample blocks move from a vertical stack to a
-// horizontal one: free at C == 16 (one NZ block-column, the same bytes), else
-// S TEXTRACTs into one (R x S*C) L1 tile plus S per-sample stores, which
-// TStoreAccNz2nd cannot fold into one strided descriptor.
+// Both GM legs may read through a Layout::NZ view (Layout::kNzGm), one
+// contiguous burst instead of the ND2NZ gather. That is correct at C == 16,
+// where the NZ image IS the row-major bytes, and at S == 1, where ND and NZ
+// differ by a permutation of the BIT FIELDS of the byte index, under which
+// H[i][j] = (-1)^popcount(i & j) is invariant, so an NZ load and an NZ store
+// cancel. S > 1 at C > 16 buys the same descriptor through the OPERANDS
+// instead -- bitplan_operands in jit_util_hadamard_twosided.py.
 //
 // See the README for the measurements behind every constant here.
+
+#define DIV_ROUNDUP(x, y) (((x) + (y) - 1) / (y))
 
 // Samples per tile at N=256. S*N <= 16384 keeps both L0C accumulators inside
 // 128 KB; the rest of the table is fixed by the same bound.
@@ -32,56 +32,26 @@ using namespace pto;
 #define PTO_TS_S256 32
 #endif
 
-// The table above is the TALL tile, and it is only the right tile once the
-// batch yields enough of them to spread over the part: a tile is S samples, so
-// the tile height caps usable cores at ceil(batch / S), and below that cap the
-// measured optimum sits exactly on it. Every size therefore carries S, S/2 and
-// S/4 and picks between them on the tile count -- two constants for the whole
-// table, because the measured crossovers land on one value of each:
-//
-//   S    once the batch yields PTO_TS_TILES_TALL tall tiles
-//   S/2  else, once it yields PTO_TS_TILES_MID tiles of S/2
-//   S/4  else
-//
-// Sizes whose S/2 or S/4 would repeat a value compile the pick away with
-// `if constexpr`, so they cost no instantiation and no branch (S == 1 costs
-// nothing at all). The halving is not a free parameter: the per-batch optimum
-// over every S from the table down to 1, each at its own best core count, IS
-// S, S/2, S/4 over the whole range these two thresholds select them in.
-//
-// Three is also where the depth stops paying. A FIFTH height is worse than a
-// fourth (regret 1.0052 against 1.0031), and the fourth's whole gain lands on
-// batch <= 8 -- 0.04-0.09 us on a 1.3-1.5 us kernel, inside the widest part of
-// the null band -- while being slightly worse at N=256 batch 24-32 and costing
-// another ~17 KB of instantiation. See the README.
+// The S each size carries below is its TALL tile. A tile is S samples, so the
+// tile height caps usable cores at ceil(batch / S), and below that cap the tall
+// tile is the wrong one. Every size therefore carries S, S/2 and S/4 and picks between them
+// on the tile count the batch yields: S above PTO_TS_TILES_TALL tall tiles,
+// else S/2 above PTO_TS_TILES_MID mid tiles, else S/4. Sizes where a level
+// repeats a value compile the pick away with `if constexpr`.
 #ifndef PTO_TS_TILES_TALL
-// 16 tall tiles: enough that 8 cores get two each, and it sits inside the
-// measured S-vs-S/2 crossover interval at every N (N=256 [8,32] tiles,
-// N=512 [16,64], N=1024 [16,24], N=2048 [12,16], N=4096 [8,12]).
 #define PTO_TS_TILES_TALL 16
 #endif
 #ifndef PTO_TS_TILES_MID
-// 6 mid tiles. The lower crossover is NOT at the same count as the upper one
-// (it is ~5-7 tiles of the mid tile at every N), which is why one constant
-// cannot serve both levels.
+// Not the same count as the upper crossover, which is why one constant cannot
+// serve both levels.
 #define PTO_TS_TILES_MID 6
 #endif
-// Both GM legs of a tile go through a Layout::NZ view wherever that is correct
-// (Layout::kNzGm), making each one a contiguous burst instead of the default
-// ND2NZ path, which writes L1 in 32-byte pieces however wide the tile is. It is
-// correct when C == 16 (one block-column: the NZ image IS the row-major bytes),
-// or when S == 1, where ND and NZ differ by a permutation of the BIT FIELDS of
-// the byte index and H[i][j] = (-1)^popcount(i & j) is invariant under any such
-// permutation, so an NZ load and an NZ store cancel. S > 1 at C > 16 reaches
-// the same descriptor by choosing the OPERANDS instead -- see bitplan_operands
-// in jit_util_hadamard_twosided.py, which is what N=512 ships.
 
 // Apply a stage's factor as H_f = H_acc (x) H_mat with H_mat of size M, so the
-// matmul is M-sized and the sum over blocks runs in the L0C accumulator -- the
-// same identity the one-sided kernel beside it uses. Same MAC count; what
-// shrinks is the per-matmul SLOT. Blocking costs 1.5-1.9x, so it is used only
-// where there is no dense form at all: N=32768, whose H_C alone fills L0B. M
-// must divide its factor and be a multiple of 16, the cube's fractal size.
+// matmul is M-sized and the sum over blocks runs in the L0C accumulator. Same
+// MAC count, smaller per-matmul slot, and slower -- used only where there is no
+// dense form at all: N=32768, whose H_C alone fills L0B. M must divide its
+// factor and be a multiple of 16, the cube's fractal size.
 #ifndef PTO_TS_BLOCK
 #define PTO_TS_BLOCK 64
 #endif
@@ -107,38 +77,53 @@ constexpr uint32_t L0C_BYTES = 128 * 1024;
 
 // Distinct ids for the cross-tile edges; the intra-tile Sync pairs use id 0.
 // Macros, not constexpr: bisheng accepts only a literal EVENT_ID* token or a
-// template non-type argument as the third set_flag / wait_flag argument.
+// template non-type argument as the third set_flag / wait_flag argument, which
+// is also why Slot and parity are template arguments throughout.
 //
-// Two rules: one id must never carry two set_flag channels out of the same
-// source pipe (the wrong waiter takes a mid-loop credit), and the shallow ids
-// must not be renumbered -- doing so measured a reproducible 0.92x.
-#define EV_X0 EVENT_ID1   // shallow: L1 X slot 0
-#define EV_X1 EVENT_ID2   // shallow: L1 X slot 1
-#define EV_ACC EVENT_ID3  // shallow: output accumulator
-// Shallow blocked bodies; distinct WITHIN each source pipe, which is the
-// invariant that matters. EV_SWB shares id 3 with EV_ACC, but EV_ACC's source
-// is FIX and this one's is M, so they are different channels regardless.
-#define EV_SWB  EVENT_ID3  // (M  -> MTE1) left multiply, slice free
-#define EV_SWA0 EVENT_ID4  // (M  -> MTE1) right multiply, slot 0 free
-#define EV_SWA1 EVENT_ID5  // (M  -> MTE1) right multiply, slot 1 free
-#define EV_SRA0 EVENT_ID6  // (MTE1 -> M)  right multiply, slot 0 staged
-#define EV_SRA1 EVENT_ID7  // (MTE1 -> M)  right multiply, slot 1 staged
+// A credit on (src pipe, dst pipe, id) says either that data has landed or that
+// a resource is free again. One id must never carry two set_flag channels out
+// of the same SOURCE pipe, or the wrong waiter takes a mid-loop credit. The
+// shallow path, one id per channel:
+//
+//   EV_X0/X1   MTE2->MTE1  an L1 X slot is filled
+//              MTE1->MTE2  that same slot is free again
+//   EV_ACC     FIX->M      the output accumulator is free, the stores read it
+//   EV_SWB     M->MTE1     the left multiply's L1 T slice is free
+//   EV_SWA0/1  M->MTE1     the right multiply's L0A slot is free
+//   EV_SRA0/1  MTE1->M     that same L0A slot is staged
+#define EV_X0 EVENT_ID1
+#define EV_X1 EVENT_ID2
+#define EV_ACC EVENT_ID3
+// Shallow blocked bodies. EV_SWB shares id 3 with EV_ACC, but leaves M rather
+// than FIX, so they are different channels.
+#define EV_SWB  EVENT_ID3
+#define EV_SWA0 EVENT_ID4
+#define EV_SWA1 EVENT_ID5
+#define EV_SRA0 EVENT_ID6
+#define EV_SRA1 EVENT_ID7
 
-#define EV_D0 EVENT_ID0   // deep: L1 X ring slot 0
-#define EV_D1 EVENT_ID1   // deep: L1 X ring slot 1
-#define EV_D2 EVENT_ID2   // deep: L1 X ring slot 2
-#define EV_D3 EVENT_ID3   // deep: L1 X ring slot 3
-#define EV_PA0 EVENT_ID4  // deep: phase A, even tile
-#define EV_PA1 EVENT_ID5  // deep: phase A, odd tile
-#define EV_PB0 EVENT_ID6  // deep: phase B, even tile
-#define EV_PB1 EVENT_ID7  // deep: phase B, odd tile
+// The deep ring, read the same way. Phase A's id carries three channels and
+// phase B's two, each out of a different source pipe, so the rule holds. The
+// suffix is the tile parity -- two tiles are in flight.
+//
+//   EV_D0..3   MTE2->MTE1  a ring slot is filled
+//              MTE1->MTE2  that same slot is free again
+//   EV_PA0/1   MTE1->M     the X tile is staged in L0A
+//              M->FIX      the accumulator holds X * H_C
+//              FIX->MTE1   T is parked in L1
+//   EV_PB0/1   MTE1->M     T is staged in L0B
+//              M->FIX      the accumulator holds H_R * T
+#define EV_D0 EVENT_ID0
+#define EV_D1 EVENT_ID1
+#define EV_D2 EVENT_ID2
+#define EV_D3 EVENT_ID3
+#define EV_PA0 EVENT_ID4
+#define EV_PA1 EVENT_ID5
+#define EV_PB0 EVENT_ID6
+#define EV_PB1 EVENT_ID7
 
-// Intra-tile sequencing. A credit is keyed on the SOURCE pipe and the id, not
-// on the destination, so an id is safe only if no other channel out of the
-// same source pipe carries it on the same path. Every Sync below is in a
-// shallow body or in loadHadamardFactors, and the shallow path spends ids 1-7
-// out of MTE2/MTE1/M/FIX (EV_X*, EV_ACC, EV_SW*, EV_SRA*) and never 0 -- which
-// is what makes 0 correct here, and why it is written rather than defaulted.
+// Intra-tile sequencing. Id 0 is correct because every Sync below sits in a
+// shallow body or in loadHadamardFactors, and those spend ids 1-7 only.
 #define EV_SEQ EVENT_ID0
 
 template <pipe_t SrcPipe, pipe_t DstPipe>
@@ -152,8 +137,7 @@ template <uint32_t Rows, uint32_t Cols>
 using MatTile = Tile<TileType::Mat, half, Rows, Cols, BLayout::ColMajor, Rows,
                      Cols, SLayout::RowMajor, 512>;
 
-// NZ view of a tile: block-column major over 16x16 row-major fractals. One
-// contiguous descriptor over the whole tile either way.
+// NZ view of a tile: block-column major over 16x16 row-major fractals.
 template <uint32_t Rows, uint32_t Cols>
 using GmNz = GlobalTensor<half, TileShape2D<half, Rows, Cols, Layout::NZ>,
                           BaseShape2D<half, Rows, Cols, Layout::NZ>,
@@ -165,11 +149,9 @@ using GmTile =
                  BaseShape2D<half, Rows, Cols, Layout::ND>, Layout::ND>;
 
 // A tile's Rows is a template parameter but the TRANSFERS around it are not,
-// so a full-size tile can load and store fewer rows than it computes. That is
-// what lets one masked ring tile carry a core's 1..S-1 sample remainder and
-// deletes the power-of-two halving chain below. A two-sided tile is S samples
-// of R matrix rows each, so a row count is always a multiple of R and stays
-// 16-aligned whatever the sample count is.
+// so a full-size tile can load and store fewer rows than it computes -- which
+// is how one masked ring tile carries a core's 1..S-1 sample remainder. A row
+// count is S' * R, so it stays 16-aligned whatever the sample count is.
 template <uint32_t Rows, uint32_t Cols, int RowValid>
 using MatTileV = Tile<TileType::Mat, half, Rows, Cols, BLayout::ColMajor,
                       RowValid, Cols, SLayout::RowMajor, 512>;
@@ -179,20 +161,17 @@ using GmTileDyn =
     GlobalTensor<half, TileShape2D<half, DYNAMIC, Cols, Layout::ND>,
                  BaseShape2D<half, Rows, Cols, Layout::ND>, Layout::ND>;
 
-// The NZ view has to stay NZ when the tile is masked. A C == 16 tile is a
-// SINGLE block-column, so an ND transfer of it is a 32-byte-per-row gather
-// rather than one burst -- dropping to GmTileDyn for the short tile measured
-// 0.49x - 0.78x at N=256 and nothing anywhere else, because N=256 is the only
-// size with C == 16. The two layouts index their shape differently:
-// ND is Shape<1,1,1,rows,cols> so the row count is DIM_3, while NZ is
-// Shape<1,cols/C0,rows/16,16,C0> so it is DIM_2 and counts FRACTALS.
+// Masked NZ view, so a short tile keeps the burst. The two layouts index their
+// shape differently: ND is Shape<1,1,1,rows,cols> so the row count is DIM_3,
+// while NZ is Shape<1,cols/C0,rows/16,16,C0> so it is DIM_2 and counts
+// FRACTALS.
 template <uint32_t Rows, uint32_t Cols>
 using GmNzDyn = GlobalTensor<half, TileShape2D<half, DYNAMIC, Cols, Layout::NZ>,
                              BaseShape2D<half, Rows, Cols, Layout::NZ>,
                              Layout::NZ>;
 
-// Buffer map. Addresses that hold the two Hadamard factors must not depend on
-// S: they are loaded once and reused by every tile size the driver picks.
+// Buffer map. The factor addresses must not depend on S: the factors are
+// loaded once and reused by every tile size the dispatch picks.
 template <uint32_t R, uint32_t C, uint32_t S>
 struct Layout {
   static constexpr uint32_t kN = R * C;
@@ -203,21 +182,16 @@ struct Layout {
 
   // Does the DENSE SHALLOW path fit? That is the fallback every size has, so
   // it -- not the deep path -- decides whether blocking is needed at all.
-  // L0A carries H_R plus one X slice, L0B carries H_C plus one T slice, L0C the
-  // two accumulators. Blocking to reach the deep path instead is a measured
-  // 1.28x regression at N=16384.
   static constexpr bool kDenseShallowFits =
       R * R * sizeof(half) + kTileBytes <= L0AB_BYTES &&
       C * C * sizeof(half) + kTileBytes <= L0AB_BYTES &&
       2 * kAccBytes <= L0C_BYTES;
   static constexpr bool kBlockIt = !kDenseShallowFits;
 
-  // Both GM legs use the NZ view, or neither -- ONE predicate read by every
-  // load and store site, because at C > 16 the two only cancel as a pair; a
-  // store that forgot it would emit a permuted result, rel_rms sqrt(2). Never
-  // on the blocked path: its stores are row SUB-BLOCKS, and TStoreAccNz2nz
-  // takes the block-column stride from the shape, not gStride1, so it can only
-  // write a whole NZ tile.
+  // Both GM legs use the NZ view or neither -- ONE predicate read by every load
+  // and store site, because at C > 16 the two only cancel as a pair. Never on
+  // the blocked path, whose stores are row SUB-BLOCKS: TStoreAccNz2nz takes the
+  // block-column stride from the shape, so it can only write a whole NZ tile.
   static constexpr bool kNzGm = (C == 16) || (S == 1 && !kBlockIt);
 
   static constexpr uint32_t kMa =
@@ -228,37 +202,28 @@ struct Layout {
       (!kBlockIt || PTO_TS_BLOCK == 0 || PTO_TS_BLOCK >= C)
           ? C
           : (uint32_t)PTO_TS_BLOCK;
-  static constexpr uint32_t kR1 = R / kMa;   // blocks of H_R
-  static constexpr uint32_t kC1 = C / kMb;   // blocks of H_C
+  // Blocks of each factor, and whether that makes a stage blocked: phase A is
+  // the right multiply by H_C, phase B the left multiply by H_R.
+  static constexpr uint32_t kR1 = R / kMa;
+  static constexpr uint32_t kC1 = C / kMb;
   static_assert(kR1 * kMa == R && kC1 * kMb == C, "M must divide its factor");
   static_assert(kMa % 16 == 0 && kMb % 16 == 0, "M must be 16-aligned");
-  static constexpr bool kBlkA = (kC1 > 1);   // phase A (right multiply) blocked
-  static constexpr bool kBlkB = (kR1 > 1);   // phase B (left multiply) blocked
+  static constexpr bool kBlkA = (kC1 > 1);
+  static constexpr bool kBlkB = (kR1 > 1);
 
-  // R == C makes H_R and H_C the SAME matrix -- both are the Sylvester H of
-  // that size -- so ONE L1 copy feeds both L0A and L0B and the second GM read
-  // goes away. That read is 32 KB per core at N=16384, which is where the
-  // operand prologue still cost 1.14x at batch 1. H is symmetric, so the left
-  // operand needs no transpose and the two TMOVs read the same NZ bytes.
-  // Unblocked only: a blocked side reads +-H_M from its own offset instead.
+  // R == C makes H_R and H_C the SAME Sylvester matrix, so ONE L1 copy feeds
+  // both L0A and L0B and the second GM read goes away. H is symmetric, so the
+  // left operand needs no transpose. Unblocked only: a blocked side reads
+  // +-H_M from its own offset instead.
   static constexpr bool kShareHf = (R == C) && !kBlkA && !kBlkB;
 
-  // The C == 16 bodies read the loaded (S*R x C) tile "wide", as
-  // (R x S*C): with C == 16 each sample's (R x 16) block is ONE NZ
-  // block-column of R/16 fractals, so the vertical stack of S samples IS
-  // their horizontal concatenation, for ANY R. The width was written S*R,
-  // which equals S*C only at R == C -- true of N=256, the only C == 16 row at
-  // the time -- so the bodies silently required R == 16 and a split like
-  // X(1024, 64, 16, 8) faulted the aicore with an MTE range error. S*C is the
-  // general form and it costs nothing: it keeps H_R as the FIRST factor
-  // applied, which measured 1.08x geomean and 1.27x at batch 32768 over the
-  // general body's opposite order, because the general body has to turn the
-  // vertical stack into a concatenation with S separate TEXTRACTs -- S FIX
-  // descriptors per tile against one TMOV, on the pipe that is the bottleneck.
+  // At C == 16 each sample's (R x 16) block is ONE NZ block-column of R/16
+  // fractals, so the vertical stack of S samples IS their horizontal
+  // concatenation, for ANY R. That is what lets phase B read the turnaround
+  // "wide" as (R x S*C) and store the tile whole.
   static_assert(C != 16 || R % 16 == 0, "C == 16 needs a 16-aligned R");
 
-  // Only where blocking is active: without it the slots, not the accumulators,
-  // are what overflow, and leaving it off keeps every unblocked size's offsets.
+  // Only where blocking is active, so every unblocked size keeps its offsets.
   static constexpr bool kAlias = (kC1 > 1 || kR1 > 1);
 
   // Operands, resident for the whole kernel: +-H_M when blocked, else H itself.
@@ -266,20 +231,17 @@ struct Layout {
                                               : R * R * sizeof(half);
   static constexpr unsigned kOpBBytes = kBlkA ? 2 * kMb * kMb * sizeof(half)
                                               : C * C * sizeof(half);
-  // Per-matmul data slices.
-  static constexpr unsigned kSliceA = S * R * kMb * sizeof(half);  // L0A, phase A
-  static constexpr unsigned kSliceB = kMa * S * C * sizeof(half);  // L0B, phase B
+  // Per-matmul data slices: phase A's lives in L0A, phase B's in L0B.
+  static constexpr unsigned kSliceA = S * R * kMb * sizeof(half);
+  static constexpr unsigned kSliceB = kMa * S * C * sizeof(half);
 
-  // Block-level double buffering for the blocked SHALLOW right multiply: two
-  // L0A slices let MTE1 stage block i+1 under M's block i, recovering the
-  // overlap blocking gives up. Phase A only -- phase B's slice is twice as
-  // wide, and two of those plus the operand overflow L0B.
+  // Two L0A slices let MTE1 stage block i+1 under M's block i. Phase A only:
+  // two of phase B's wider slices plus the operand overflow L0B.
   static constexpr uint32_t kSlotsA =
       (kBlkA && kOpABytes + 2 * kSliceA <= L0AB_BYTES) ? 2u : 1u;
 
   // Two of every intermediate plus a 4-deep X ring. `!kBlockIt` is
-  // load-bearing: a blocked size always takes the shallow path, so the deep
-  // path is dense and its operands and slices are the dense ones.
+  // load-bearing: the deep path is dense, so the sizes measured here are too.
   static constexpr bool kDbuf =
       !kBlockIt &&
       R * R * sizeof(half) + 2 * kTileBytes <= L0AB_BYTES &&
@@ -290,9 +252,8 @@ struct Layout {
   static constexpr unsigned kXSlots = kDbuf ? 4 : 2;
   static constexpr unsigned kBuf = kDbuf ? 2 : 1;
 
-  // The C == 16 bodies are the only dense-only ones; M is clamped to the factor
-  // there, so this cannot fire today and is here to catch a future case-table
-  // entry that breaks it. The L0C assert below enforces the other half.
+  // Cannot fire today -- M is clamped to the factor at C == 16 -- and is here
+  // to catch a future case-table entry that breaks it.
   static_assert(!(kC1 > 1 || kR1 > 1) || C != 16,
                 "the C == 16 bodies are dense and would read +-H_M as H");
 
@@ -337,8 +298,8 @@ struct Layout {
     return kL0bHc + (kBlkA ? neg * kMb * kMb * sizeof(half) : 0u);
   }
 
-  // L0C: the stacked accumulator, then the concatenated one -- as a pair, so
-  // the deep path's two tiles in flight get [stack|cat][stack|cat].
+  // L0C: the stacked accumulator then the concatenated one, as a pair, so the
+  // deep path's two tiles in flight get [stack|cat][stack|cat].
   static constexpr unsigned kL0cStack = 0;
   static constexpr unsigned kL0cCat = kL0cStack + kAccBytes;
   // With kAlias the cat accumulator shares the stack one's space, halving L0C.
@@ -350,13 +311,13 @@ struct Layout {
   static constexpr unsigned l0cCat(bool par) {
     return (par ? kAccPair : 0) + (kAlias ? 0u : kAccBytes);
   }
-  // Output block a of the blocked phase B, as kR1 separate contiguous
-  // (Ma x S*C) accumulators: an L0C tile is block-COLUMN-major, so a row slice
-  // of one tall tile would be strided while kR1 short ones are not.
+  // Output block a of the blocked phase B: an L0C tile is block-COLUMN-major,
+  // so kR1 separate (Ma x S*C) accumulators are contiguous where a row slice of
+  // one tall tile would be strided.
   static constexpr unsigned l0cCatBlock(bool par, uint32_t a) {
     return l0cCat(par) + a * kMa * S * C * sizeof(float);
   }
-  // Column block j of phase A's accumulator: whole 16-column groups, which ARE
+  // Column block j of phase A's accumulator: whole 16-column groups, which are
   // contiguous in an L0C tile.
   static constexpr unsigned l0cStackBlock(bool par, uint32_t j) {
     return l0cStack(par) + j * kMb * kStackRows * sizeof(float);
@@ -364,18 +325,13 @@ struct Layout {
 };
 
 // GM -> L1 -> L0A/L0B for the two Hadamard factors, once per core; both stay
-// resident.
+// resident. Both legs read through Layout::NZ and the HOST stores the operands
+// pre-fractalised to match (see _to_nz); an ND read of a (W x W) factor is a
+// 2W-byte-per-row gather that every core pays before its first tile.
 //
-// Both legs read through Layout::NZ, and the HOST stores the operands
-// pre-fractalised to match (see _to_nz). A factor is only (W x W), so an ND
-// read of it is a W-row, 2W-byte-per-row ND2NZ gather -- at N=256 that is 16
-// separate 32-byte reads, and EVERY core pays it before MTE1 may touch its
-// first tile, so the cost scales with block_dim. It is the narrow-tile defect
-// the X tile at C == 16 already avoids, applied to the operand instead of the
-// data: worth 1.34x - 1.65x at N=256 on its own, and it is what made that size
-// stop scaling past ~6 cores. S is a template parameter although no address here depends on it:
-// the blocking decision does, and loading the factors under a different
-// decision from the tile bodies' would stage dense H where they expect +-H_M.
+// S is a template parameter although no address here depends on it: the
+// blocking decision does, and loading the factors under a different decision
+// from the tile bodies' would stage dense H where they expect +-H_M.
 template <uint32_t R, uint32_t C, uint32_t S>
 AICORE void loadHadamardFactors(__gm__ half *h_left, __gm__ half *h_right) {
   using L = Layout<R, C, S>;
@@ -449,16 +405,14 @@ AICORE void loadHadamardFactors(__gm__ half *h_left, __gm__ half *h_right) {
   Sync<PIPE_MTE1, PIPE_M>(EV_SEQ);
 }
 
-// One column block of the blocked shallow right multiply. Slot and flag ids
-// are template arguments because bisheng requires a literal EVENT_ID*, so the
-// caller branches on i & 1 rather than indexing.
+// One column block of the blocked shallow right multiply.
 template <uint32_t R, uint32_t C, uint32_t S, uint32_t Slot, uint32_t P,
           event_t EvRdy, event_t EvWar>
 AICORE void shallowBlockA(uint32_t i);
 
-// H_f[i,j] = (-1)^popcount(i & j) for the Sylvester matrix, so the sign of
-// block (i,j) is a parity and H_acc itself is never built or read. Returns 1
-// for -H_M and 0 for +H_M, which are also their operand slot indices.
+// H_f[i,j] = (-1)^popcount(i & j) for the Sylvester matrix, so a block's sign
+// is a parity and H_acc itself is never built or read. Returns 1 for -H_M and
+// 0 for +H_M, which are also their operand slot indices.
 AICORE inline uint32_t blockSign(uint32_t i, uint32_t j) {
   uint32_t v = i & j;
   v ^= v >> 4;
@@ -467,23 +421,21 @@ AICORE inline uint32_t blockSign(uint32_t i, uint32_t j) {
   return v & 1u;
 }
 
-// Issue the GM->L1 load for one tile into slot `pong` and signal MTE2->MTE1.
-// The caller must already hold the slot (MTE1->MTE2 on the same event).
+// GM -> L1 for one tile, signalled MTE2->MTE1 on EvX; `waitSlot` takes the
+// slot's free-again credit first.
 template <uint32_t R, uint32_t C, uint32_t S, uint32_t Slot, event_t EvX>
 AICORE void issueTileLoad(__gm__ half *x, uint32_t sample, uint32_t rows,
                           bool waitSlot) {
   using L = Layout<R, C, S>;
 
-  if (waitSlot) wait_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // slot free
+  if (waitSlot) wait_flag(PIPE_MTE1, PIPE_MTE2, EvX);
 
   __gm__ half *x_tile = x + sample * L::kN;
 
-  // At most ONE tile per core is ever short, so this branch is taken once a
-  // launch and never at S == 1, where a tile is a single sample.
+  // At most ONE tile per core is ever short, so this runs once a launch.
   if constexpr (S > 1) {
     if (rows != S) {
-      // Masked, but on the SAME layout the full tile uses -- a short tile is
-      // not a reason to give up the burst.
+      // Masked, but on the SAME layout the full tile uses.
       MatTileV<L::kStackRows, C, DYNAMIC> x_l1;
       TASSIGN(x_l1, L::xSlot(Slot));
       x_l1.SetValidRow(rows * R);
@@ -507,9 +459,6 @@ AICORE void issueTileLoad(__gm__ half *x, uint32_t sample, uint32_t rows,
   TASSIGN(x_l1, L::xSlot(Slot));
 
   if constexpr (L::kNzGm) {
-    // One contiguous burst instead of the default ND2NZ gather. At C == 16 a
-    // pure reinterpret; above it the permutation is undone by the matching NZ
-    // store, which L::kNzGm guarantees is in use.
     GmNz<L::kStackRows, C> x_gm(x_tile);
     TASSIGN(x_gm, x_tile);
     TLOAD(x_l1, x_gm);
@@ -521,8 +470,8 @@ AICORE void issueTileLoad(__gm__ half *x, uint32_t sample, uint32_t rows,
   set_flag(PIPE_MTE2, PIPE_MTE1, EvX);
 }
 
-// Y[sample .. sample+S) = H_R * X * H_C, for a tile whose load has already
-// been issued into slot Pong.
+// Y[sample .. sample+S) = H_R * X * H_C, for a tile already loaded into slot
+// Pong.
 template <uint32_t R, uint32_t C, uint32_t S, bool Pong, event_t EvX>
 AICORE void hadamardTile(__gm__ half *y, uint32_t sample, bool freeSlot,
                          bool waitAcc, bool freeAcc) {
@@ -531,25 +480,19 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample, bool freeSlot,
 
   MatTile<kStackRows, C> x_l1;
   TASSIGN(x_l1, L::xSlot(Pong ? 1u : 0u));
-  wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);  // this tile's load has landed
+  wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);
 
-  // No shipped size reaches this path with C == 16: the shallow path needs
-  // S == 1 (asserted at the call site) while every C == 16 row has kDbuf and
-  // takes the deep two-phase ring, so the C == 16 tile body lives only in
-  // tilePhaseA/tilePhaseB. This assert is what makes adding such a size a
-  // build error instead of a silently slower path.
+  // Every C == 16 row has kDbuf and takes the deep ring, so the cat body lives
+  // only in tilePhaseA/tilePhaseB and adding such a size must not compile.
   static_assert(C != 16, "a shallow C == 16 size would need the cat body here");
   if constexpr (L::kBlkA || L::kBlkB) {
     // Blocked shallow body: the same two multiplies as below, applied as blocks
     // against a resident +-H_M so neither factor is ever in L0A or L0B whole.
-    // Only for a size with no dense form at all -- not a speedup, the
-    // difference between running and not compiling.
     constexpr uint32_t kSlot = Pong ? 1u : 0u;
 
     if constexpr (L::kAlias) {
       // The two accumulators share one L0C range here, so the previous tile's
-      // stores must have drained before this tile's FIRST matmul -- not merely
-      // before the left multiply, as in the unaliased form below.
+      // stores must drain before this tile's FIRST matmul.
       if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
     }
 
@@ -565,12 +508,12 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample, bool freeSlot,
         shallowBlockA<R, C, S, kSlot, 0, EV_SRA0, EV_SWA0>(i);
       }
     }
-    if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // all blocks read
+    if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);
     Sync<PIPE_M, PIPE_FIX>(EV_SEQ);
 
     // --- vertical stack -> horizontal concatenation, in L1 ---
     // Grouped by the left multiply's ROW blocks, so each of its kR1 slices is
-    // one contiguous (Ma x S*C) tile rather than a strided row slice.
+    // contiguous.
     TileAcc<float, kStackRows, C> acc_stack;
     TASSIGN(acc_stack, L::l0cStack(false));
     for (uint32_t a = 0; a < L::kR1; ++a) {
@@ -583,8 +526,8 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample, bool freeSlot,
     Sync<PIPE_FIX, PIPE_MTE1>(EV_SEQ);
 
     // --- left multiply: H_R * T, as kR1 row blocks summed in L0C ---
-    // Under kAlias this writes over acc_stack. The extracts have drained it and
-    // M is ordered behind them transitively: FIX -> MTE1 by the Sync just made,
+    // Under kAlias this writes over acc_stack, which the extracts have drained;
+    // M is ordered behind them transitively, FIX -> MTE1 by the Sync just made
     // then MTE1 -> M by the one inside the loop.
     TileRight<half, L::kMa, S * C> t_l0;
     TASSIGN(t_l0, L::kL0bT);
@@ -598,7 +541,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample, bool freeSlot,
       Sync<PIPE_MTE1, PIPE_M>(EV_SEQ);
       if constexpr (!L::kAlias) {
         if (ap == 0) {
-          if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous tile's stores drained
+          if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
         }
       }
       for (uint32_t a = 0; a < L::kR1; ++a) {
@@ -624,10 +567,6 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample, bool freeSlot,
         TASSIGN(acc_block,
                 L::l0cCatBlock(false, a) + sm * L::kMa * C * sizeof(float));
         __gm__ half *y_row = y + (sample + sm) * L::kN + a * L::kMa * C;
-        // Always ND here: these are row SUB-BLOCKS of the output, and
-        // TStoreAccNz2nz takes the destination block-column stride from the
-        // shape, so it can only write a whole NZ tile. kNzGm is false on this
-        // path for exactly that reason.
         GmTile<L::kMa, C> y_gm(y_row);
         TASSIGN(y_gm, y_row);
         TSTORE(y_gm, acc_block);
@@ -644,14 +583,14 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample, bool freeSlot,
     TASSIGN(acc_stack, L::kL0cStack);
 
     TMOV(x_l0, x_l1);
-    if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // load after next
+    if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);
     Sync<PIPE_MTE1, PIPE_M>(EV_SEQ);
     TMATMUL(acc_stack, x_l0, hc_l0);
     Sync<PIPE_M, PIPE_FIX>(EV_SEQ);
 
     // --- vertical stack -> horizontal concatenation, in L1 ---
-    // Block-columns are contiguous in NZ, so sample s's (R x C) result lands
-    // at s * R * C and the S writes read back as one (R x S*C) tile.
+    // Block-columns are contiguous in NZ, so sample s's (R x C) result lands at
+    // s * R * C and the S writes read back as one (R x S*C) tile.
     for (uint32_t s = 0; s < S; ++s) {
       MatTile<R, C> t_block;
       TASSIGN(t_block, L::kL1T + s * R * C * sizeof(half));
@@ -673,25 +612,19 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample, bool freeSlot,
     TASSIGN(hl_l0, L::kL0aHl);
     TASSIGN(acc_cat, L::kL0cCat);
 
-    if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous tile's TSTORE has drained
+    if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);
     TMATMUL(acc_cat, hl_l0, t_l0);
     Sync<PIPE_M, PIPE_FIX>(EV_SEQ);
 
-    // Each sample is a contiguous (R x C) block-column range of acc_cat.
-    // The fixpipe L0C->GM path is 2D-to-2D only (TStoreAccNz2nd asserts the
-    // three outer GlobalTensor dims are 1), so these cannot be folded into one
-    // strided descriptor -- a 5D scatter faults the aicore.
+    // Each sample is a contiguous (R x C) block-column range of acc_cat, but
+    // the fixpipe L0C->GM path is 2D-to-2D only, so they cannot be folded into
+    // one strided descriptor -- a 5D scatter faults the aicore.
     for (uint32_t s = 0; s < S; ++s) {
       TileAcc<float, R, C> acc_block;
       TASSIGN(acc_block, L::kL0cCat + s * R * C * sizeof(float));
 
       __gm__ half *y_row = y + (sample + s) * L::kN;
       if constexpr (L::kNzGm) {
-        // The second half of the pair: writing the accumulator out through the
-        // NZ view undoes the permutation the NZ load introduced, so the result
-        // lands in natural order. Unlike the ND path (TStoreAccNz2nd, which
-        // asserts the three outer GlobalTensor dims are 1) this one carries a
-        // real block-column stride, so a wide tile is one descriptor.
         GmNz<R, C> y_gm(y_row);
         TASSIGN(y_gm, y_row);
         TSTORE(y_gm, acc_block);
@@ -716,8 +649,8 @@ AICORE void shallowBlockA(uint32_t i) {
   MatTile<kStackRows, L::kMb> x_l1_i;
   TASSIGN(x_l1_i, L::xSlot(Slot) + i * L::kMb * kStackRows * sizeof(half));
 
-  // Only the block kSlotsA back shared this slot, so with two slots MTE1 stages
-  // block i+1 while M is still on block i.
+  // Only the block kSlotsA back shared this slot, so with two slots MTE1
+  // stages block i+1 while M is still on block i.
   if (i >= L::kSlotsA) {
     wait_flag(PIPE_M, PIPE_MTE1, EvWar);
   }
@@ -744,15 +677,15 @@ AICORE void shallowBlockA(uint32_t i) {
 // --- deep pipeline --------------------------------------------------------
 //
 // The straight-line tile above, split at the L1 turnaround. Phase A takes the
-// loaded X slot to L0B, left-multiplies by H_R and parks the result in L1;
-// phase B takes it to L0A, right-multiplies by H_C and stores. The driver
-// issues A(i+1) before B(i), so each pipe always has the next tile's work
-// queued behind the current one's.
+// loaded X slot to L0A, right-multiplies by H_C and parks the result in L1;
+// phase B takes it to L0B, left-multiplies by H_R and stores. The driver issues
+// A(i+1) before B(i), so each pipe always has the next tile's work queued
+// behind the current one's.
 //
-// With two slots per intermediate and issue order A0 A1 B0 A2 B1 ..., every
-// cross-tile WAR edge is already covered transitively: A(i+2)'s reuse of a slot
-// sits behind B(i)'s MTE1, which waits on A(i)'s FIX. So no WAR flags are
-// needed here and the shallow path's EV_ACC edge disappears.
+// With two slots per intermediate and that issue order, every cross-tile WAR
+// edge is already covered transitively -- A(i+2)'s reuse of a slot sits behind
+// B(i)'s MTE1, which waits on A(i)'s FIX -- so this path needs no WAR flags and
+// no EV_ACC.
 
 // X slot -> L0A, X * H_C -> L0C, L0C -> L1 T slot. Releases the X slot and
 // leaves t_l1(Par) ready, signalled FIX->MTE1 on EvPA.
@@ -770,20 +703,18 @@ AICORE void tilePhaseA(bool freeSlot) {
   TASSIGN(hc_l0, L::kL0bHc);
   TASSIGN(acc_stack, L::l0cStack(Par));
 
-  wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);  // this tile's load has landed
+  wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);
   TMOV(x_l0a, x_l1);
-  if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // load 4 tiles on
+  if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);
   set_flag(PIPE_MTE1, PIPE_M, EvPA);
 
   wait_flag(PIPE_MTE1, PIPE_M, EvPA);
   TMATMUL(acc_stack, x_l0a, hc_l0);
   set_flag(PIPE_M, PIPE_FIX, EvPA);
 
-  // Park T in L1 for phase B, which reads it WIDE as (R x S*C). At C == 16
-  // that view is the same fractals in the same order as this (S*R x C)
-  // accumulator, so one TMOV moves the whole tile; above 16 the two differ and
-  // the regroup costs one descriptor per sample. This is the kernel's only
-  // size-dependent branch on the tile path.
+  // Park T in L1 for phase B, which reads it WIDE as (R x S*C). At C == 16 that
+  // view is the same fractals in the same order as this (S*R x C) accumulator,
+  // so one TMOV moves the whole tile; above 16 it is one descriptor per sample.
   wait_flag(PIPE_M, PIPE_FIX, EvPA);
   if constexpr (C == 16) {
     MatTile<L::kStackRows, C> t_l1;
@@ -799,7 +730,7 @@ AICORE void tilePhaseA(bool freeSlot) {
   set_flag(PIPE_FIX, PIPE_MTE1, EvPA);
 }
 
-// L1 T slot -> L0, the other matmul -> L0C, L0C -> GM.
+// L1 T slot -> L0B, H_R * T -> L0C, L0C -> GM.
 template <uint32_t R, uint32_t C, uint32_t S, bool Par, event_t EvPA,
           event_t EvPB>
 AICORE void tilePhaseB(__gm__ half *y, uint32_t sample, uint32_t rows) {
@@ -814,7 +745,7 @@ AICORE void tilePhaseB(__gm__ half *y, uint32_t sample, uint32_t rows) {
   TASSIGN(hl_l0, L::kL0aHl);
   TASSIGN(acc_cat, L::l0cCat(Par));
 
-  wait_flag(PIPE_FIX, PIPE_MTE1, EvPA);  // phase A parked T in L1
+  wait_flag(PIPE_FIX, PIPE_MTE1, EvPA);
   TMOV(t_l0b, t_l1);
   set_flag(PIPE_MTE1, PIPE_M, EvPB);
 
@@ -822,15 +753,12 @@ AICORE void tilePhaseB(__gm__ half *y, uint32_t sample, uint32_t rows) {
   TMATMUL(acc_cat, hl_l0, t_l0b);
   set_flag(PIPE_M, PIPE_FIX, EvPB);
 
-  // No EV_ACC edge: with two cat accumulators the write-after-read on slot Par
-  // is already ordered, because B(i+2)'s TMOV waits on A(i+2)'s FIX->MTE1 flag
-  // and A(i+2)'s writes follow B(i)'s TSTOREs on the in-order FIX pipe.
   wait_flag(PIPE_M, PIPE_FIX, EvPB);
   __gm__ half *y_tile = y + sample * L::kN;
 
-  // Same reinterpret as phase A's turnaround, on the output: at C == 16 this
-  // (R x S*C) accumulator IS the (S*R x C) stack the GM tile wants, so one
-  // whole-tile store does every sample -- masked when the last tile is short.
+  // Phase A's turnaround again, on the output: at C == 16 this (R x S*C)
+  // accumulator IS the (S*R x C) stack the GM tile wants, so one whole-tile
+  // store does every sample -- masked when the last tile is short.
   if constexpr (C == 16) {
     if constexpr (S > 1) {
       if (rows != S) {
@@ -865,9 +793,8 @@ AICORE void tilePhaseB(__gm__ half *y, uint32_t sample, uint32_t rows) {
     return;
   }
 
-  // Above 16 the samples are side by side in L0C, so each stores separately:
-  // the fixpipe L0C->GM path is 2D-to-2D only, and a 5D scatter faults. The
-  // cube ran all S samples whatever `rows` says; the transform is per-sample,
+  // Above 16 the samples sit side by side in L0C, so each stores separately.
+  // The cube ran all S whatever `rows` says, but the transform is per-sample,
   // so the surplus reaches only output rows this loop skips.
   for (uint32_t s = 0; s < rows; ++s) {
     TileAcc<float, R, C> acc_block;
@@ -886,17 +813,14 @@ AICORE void tilePhaseB(__gm__ half *y, uint32_t sample, uint32_t rows) {
 }
 
 // One loop iteration: prefetch tile i+3 into the ring slot it is about to
-// vacate, start phase A of tile i+1, finish phase B of tile i. Slot and parity
-// are template arguments because the flag ids must be literal, and all of them
-// follow from i mod 4, so the loop is a four-way switch over that.
+// vacate, start phase A of tile i+1, finish phase B of tile i.
 template <uint32_t R, uint32_t C, uint32_t S, uint32_t SlotLoad,
           uint32_t SlotA, bool ParA, bool ParB, event_t EvXLoad, event_t EvXA,
           event_t EvPA_A, event_t EvPA_B, event_t EvPB_B>
 AICORE void deepStep(__gm__ half *x, __gm__ half *y, uint32_t base, uint32_t i,
                      uint32_t n, uint32_t rest) {
   // Tile j's load reuses tile j-4's slot, so it waits iff j >= 4; here j = i+3.
-  // Only the LAST tile can be short, so every row count picks between `rest`
-  // and the constant S.
+  // Only the LAST tile can be short, so a row count picks `rest` or S.
   if (i + 3 < n) {
     issueTileLoad<R, C, S, SlotLoad, EvXLoad>(
         x, base + (i + 3) * S, (i + 3 == n - 1) ? rest : S, i >= 1);
@@ -915,23 +839,18 @@ AICORE void runTilesDeep(__gm__ half *x, __gm__ half *y, uint32_t &sample,
   const uint32_t base = sample;
   const uint32_t span = end - base;
   // ceil, not floor: a core's remainder is the last tile of this ring, masked
-  // to the rows it really holds, not a separate smaller tile and not a chain
-  // of them. A full tile is just where the row count picks S.
+  // to the rows it really holds, not a separate smaller tile.
   const uint32_t n = DIV_ROUNDUP(span, S);
   const uint32_t rest = span - (n - 1) * S;
 
-  // No primed credits and none drained. A credit says a resource is free
-  // again, which is only worth saying once someone has held it: tile j reuses
-  // tile j-4's slot, so its load waits iff j >= 4 and tile j frees its slot
-  // iff tile j+4 exists. The pairing is exact, and tile j's load is issued an
-  // iteration after tile j-4 was consumed, so the credit always precedes the
-  // wait. 8 flag ops a core paid whether it ran 1 tile or 200.
+  // No primed credits and none drained: tile j reuses tile j-4's slot, so its
+  // load waits iff j >= 4 and tile j frees its slot iff tile j+4 exists. The
+  // pairing is exact, and tile j's load is issued an iteration after tile j-4
+  // was consumed, so the credit always precedes the wait.
   //
-  // The ring therefore does NOT drain itself. Nothing follows it any more --
-  // that is what deleting the halving chain below bought. Anything placed
-  // after it that reuses L1, L0A or L0C would first have to hand the buffers
-  // over on MTE1 -> MTE2, and a three-edge handoff instead of that one edge
-  // measured 0.79x - 0.95x on exactly the spans it runs on.
+  // So the ring does NOT drain itself, and nothing follows it today. Anything
+  // placed after it that reuses an L1 slot, L0A or L0C must first take the
+  // buffers over on MTE1 -> MTE2, M -> MTE1 and FIX -> M.
 
   // Fill the ring three deep and open phase A of tile 0, so the first loop
   // iteration already has MTE2 two tiles ahead of MTE1.
@@ -944,21 +863,28 @@ AICORE void runTilesDeep(__gm__ half *x, __gm__ half *y, uint32_t &sample,
   }
   tilePhaseA<R, C, S, 0, false, EV_D0, EV_PA0>(4 < n);
 
+  // Slot and parity follow from i mod 4:
+  //
+  //   i mod 4   load slot   A slot   A parity   B parity
+  //   0         3           1        odd        even
+  //   1         0           2        even       odd
+  //   2         1           3        odd        even
+  //   3         2           0        even       odd
   for (uint32_t i = 0; i < n; ++i) {
     switch (i & 3u) {
-      case 0:  // load slot 3, A slot 1 (odd), B even
+      case 0:
         deepStep<R, C, S, 3, 1, true, false, EV_D3, EV_D1, EV_PA1, EV_PA0,
                  EV_PB0>(x, y, base, i, n, rest);
         break;
-      case 1:  // load slot 0, A slot 2 (even), B odd
+      case 1:
         deepStep<R, C, S, 0, 2, false, true, EV_D0, EV_D2, EV_PA0, EV_PA1,
                  EV_PB1>(x, y, base, i, n, rest);
         break;
-      case 2:  // load slot 1, A slot 3 (odd), B even
+      case 2:
         deepStep<R, C, S, 1, 3, true, false, EV_D1, EV_D3, EV_PA1, EV_PA0,
                  EV_PB0>(x, y, base, i, n, rest);
         break;
-      default:  // load slot 2, A slot 0 (even), B odd
+      default:
         deepStep<R, C, S, 2, 0, false, true, EV_D2, EV_D0, EV_PA0, EV_PA1,
                  EV_PB1>(x, y, base, i, n, rest);
         break;
@@ -969,8 +895,8 @@ AICORE void runTilesDeep(__gm__ half *x, __gm__ half *y, uint32_t &sample,
 
 
 // One tile, standalone. It has no neighbour to wait for or signal to, so every
-// credit is skipped. Not the ring: that would instantiate its loop and all
-// four slot/parity combinations at every size runShortSpan can reach.
+// credit is skipped. Not the ring: that would instantiate its loop and all four
+// slot/parity combinations at every size runShortSpan can reach.
 template <uint32_t R, uint32_t C, uint32_t S>
 AICORE void oneTile(__gm__ half *x, __gm__ half *y, uint32_t sample,
                     uint32_t rows) {
@@ -986,11 +912,8 @@ AICORE void oneTile(__gm__ half *x, __gm__ half *y, uint32_t sample,
 
 // A span of 1..S-1 samples, as ONE tile of the smallest size that covers it.
 // Masking is free on the TRANSFERS but not on the tile -- the cube runs all S
-// samples whatever the row count says -- and a lone tile has no predecessor to
-// hide those wasted rows behind. Inside the ring the same waste IS hidden,
-// which is why only this path picks a size and the ring's last tile does not.
-// A compile-time choice, not a chain: exactly one tile ever runs, because a
-// level is entered with span <= S and stays with span > S/2.
+// samples regardless -- and a lone tile, unlike the ring's last tile, has no
+// predecessor to hide the waste behind. Exactly one tile ever runs.
 template <uint32_t R, uint32_t C, uint32_t S>
 AICORE void runShortSpan(__gm__ half *x, __gm__ half *y, uint32_t sample,
                          uint32_t span) {
@@ -1004,18 +927,15 @@ AICORE void runShortSpan(__gm__ half *x, __gm__ half *y, uint32_t sample,
 }
 
 // Consume [sample, end) as ONE unit of work: a single ring of S-sample tiles
-// whose last tile is masked to whatever is left. There is no power-of-two
-// halving chain any more, so no level boundary to hand buffers over at, and
-// the remainder is an ordinary ring tile -- overlapped like any other instead
-// of a drained standalone unit in front of a pipeline flush.
+// whose last tile is masked to whatever is left, so there is no level boundary
+// to hand buffers over at and the remainder overlaps like any other tile.
 template <uint32_t R, uint32_t C, uint32_t S>
 AICORE void runTiles(__gm__ half *x, __gm__ half *y, uint32_t &sample,
                      uint32_t end) {
   if (sample >= end) {
     return;
   }
-  // A core with no whole tile at all: one masked tile at its own size. A core
-  // that HAS whole tiles keeps its remainder in the ring, where it overlaps.
+  // A core with no whole tile at all: one masked tile at its own size.
   if constexpr (S > 1) {
     if (end - sample < S) {
       runShortSpan<R, C, S>(x, y, sample, end - sample);
@@ -1026,20 +946,15 @@ AICORE void runTiles(__gm__ half *x, __gm__ half *y, uint32_t &sample,
   if constexpr (Layout<R, C, S>::kDbuf) {
     runTilesDeep<R, C, S>(x, y, sample, end);
   } else {
-    // The shallow path is only ever reached at the top level, where kDbuf is
-    // monotone in S, and every shallow size in the case table has S == 1 -- so
-    // a shallow tile is one sample and can never be short.
+    // kDbuf is monotone in S and every shallow size in the case table has
+    // S == 1, so a shallow tile is one sample and can never be short.
     static_assert(S == 1, "a shallow tile size > 1 would need a masked last tile");
-    // Same lazy credits as the deep ring, at depth 2 and with a depth-1
-    // accumulator: tile i's load waits iff i >= 2, tile i frees its slot iff
-    // tile i+2 exists, and the EV_ACC edge runs between neighbours only, so
-    // tile 0 does not wait on it and the last tile does not set it. That is
-    // what deletes the prime/drain pair in runTwosided as well.
+    // Same lazy credits as the deep ring, at depth 2: tile i's load waits iff
+    // i >= 2, tile i frees its slot iff tile i+2 exists, and the EV_ACC edge
+    // runs between neighbours only, so tile 0 does not wait on it and the last
+    // tile does not set it.
     const uint32_t last = (end - sample) / S - 1;
 
-    // bisheng needs the flag id to be a compile-time literal, so the slot
-    // parity is a template argument and the loop dispatches to one of two
-    // instantiations rather than carrying it in a variable.
     uint32_t cur = sample;
     issueTileLoad<R, C, S, 0, EV_X0>(x, cur, S, false);
 
@@ -1081,10 +996,9 @@ AICORE void runTwosided(__gm__ half *x, __gm__ half *y,
   const uint32_t num_cores = block_num;
   const uint32_t core_id = get_block_idx();
 
-  // Split by TILES, not samples: an even sample split leaves most cores walking
-  // the power-of-two fallback down to single-sample tiles, which cost a full
-  // tile's handshakes for a fraction of the work. Worth 2x where batch/cores
-  // lands just above a tile boundary, at the price of idling the last cores.
+  // Split by TILES, not samples: an even sample split leaves most cores on the
+  // short-span path, paying a full tile's handshakes for a fraction of a tile's
+  // work. The price is idling the last cores.
   const uint32_t tiles_per_core = DIV_ROUNDUP(DIV_ROUNDUP(batch, S), num_cores);
   const uint32_t begin = tiles_per_core * S * core_id;
   if (begin >= batch) {
@@ -1097,9 +1011,6 @@ AICORE void runTwosided(__gm__ half *x, __gm__ half *y,
 
   loadHadamardFactors<R, C, S>(h_left, h_right);
 
-  // No EV_ACC prime: the shallow ring's first tile skips the wait and its last
-  // tile skips the set, so the credit never outlives the ring. The deep path
-  // never used EV_ACC at all and was paying this pair for nothing.
   uint32_t sample = begin;
   runTiles<R, C, S>(x, y, sample, end);
 }
@@ -1108,9 +1019,6 @@ AICORE void dispatchTwosided(__gm__ half *x, __gm__ half *y,
                                  __gm__ half *h_left, __gm__ half *h_right,
                                  uint32_t batch, uint32_t n) {
   switch (n) {
-// Three tile heights per size, picked on the tile count the batch yields. The
-// `if constexpr` arms are what keep a size that has no second (or third) tile
-// free of both the instantiation and the branch.
 #define FAST_HADAMARD_TWOSIDED_DISPATCH(N, R, C, S)                        \
   case N: {                                                                \
     constexpr uint32_t kMid = ((S) > 1) ? (S) / 2 : 1;                     \
@@ -1135,9 +1043,9 @@ AICORE void dispatchTwosided(__gm__ half *x, __gm__ half *y,
   }
 }
 
-}  // namespace
+}
 
-#endif  // cube core
+#endif
 
 __global__ AICORE void fast_hadamard_twosided_fp16(__gm__ void *x, __gm__ void *y,
                                                __gm__ void *h_left,

@@ -8,8 +8,11 @@ from plot_common import (
     resolve_dir_arg,
 )
 
+# The bench writes <CSV_PREFIX><block_dim>.csv; block_dim_from_path reads the
+# integer back off that stem.
 CSV_PREFIX = "fht_twosided_compare_bd"
 
+# Both arms run at every N the bench sweeps, so these plot the whole CSV.
 LINE_PLOTS = (
     {
         "filename": "hadamard_twosided_duration_bd{block_dim}.png",

@@ -44,12 +44,10 @@ using namespace pto;
 
 // A batch too small to give every core a deep run of tiles is not short of
 // pipeline depth, it is short of TILES: the tile height caps usable cores at
-// ceil(batch / S), and below the threshold the measured optimum sits exactly
-// on that cap. So the resident sizes carry a second, shorter tile and pick it
-// when the tall one would yield fewer than PTO_OS_TILES_TO_PIPELINE tiles.
-// Above the threshold the tall tile wins instead, on depth. The blocked sizes
-// have no crossover -- their short tile wins at every batch -- so they repeat
-// one value and the pick compiles away.
+// ceil(batch / S). So the resident sizes carry a second, shorter tile and pick
+// it when the tall one would yield fewer than PTO_OS_TILES_TO_PIPELINE tiles.
+// The blocked sizes have no crossover, so they repeat one value and the pick
+// compiles away.
 #ifndef PTO_OS_S64_SHALLOW
 #define PTO_OS_S64_SHALLOW 128
 #endif
