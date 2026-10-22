@@ -533,62 +533,13 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample, bool freeSlot,
   TASSIGN(x_l1, L::xSlot(Pong ? 1u : 0u));
   wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);  // this tile's load has landed
 
-  if constexpr (C == 16) {
-    // (S*R x 16) and (16 x S*R) are the SAME BYTES, so the stack reads back
-    // as the horizontal concatenation for free. Apply H_R first on that view,
-    // then H_C on the vertical one: 7 descriptors per tile whatever S is.
-    static_assert(R == 16, "the free reinterpret needs square 16x16 fractals");
-    constexpr uint32_t kCat = S * C;
-
-    MatTile<R, kCat> x_cat;
-    TileRight<half, R, kCat> x_l0b;
-    TASSIGN(x_cat, L::xSlot(Pong ? 1u : 0u));  // same bytes as x_l1, read the other way
-    TASSIGN(x_l0b, L::kL0bT);
-    TMOV(x_l0b, x_cat);
-    if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // load after next
-    Sync<PIPE_MTE1, PIPE_M>(EV_SEQ);
-
-    TileLeft<half, R, R> hl_l0;
-    TileAcc<float, R, kCat> acc_cat;
-    TASSIGN(hl_l0, L::kL0aHl);
-    TASSIGN(acc_cat, L::kL0cStack);
-    TMATMUL(acc_cat, hl_l0, x_l0b);
-    Sync<PIPE_M, PIPE_FIX>(EV_SEQ);
-
-    // Same reinterpret on the accumulator: an Acc fractal is 16x16 fp32, so
-    // (R x S*R) and (S*R x R) are again one block-column of S fractals.
-    TileAcc<float, kStackRows, C> acc_vert;
-    MatTile<kStackRows, C> t_l1;
-    TASSIGN(acc_vert, L::kL0cStack);
-    TASSIGN(t_l1, L::kL1T);
-    TMOV(t_l1, acc_vert);
-    Sync<PIPE_FIX, PIPE_MTE1>(EV_SEQ);
-
-    TileLeft<half, kStackRows, C> t_l0a;
-    TASSIGN(t_l0a, L::kL0aX);
-    TMOV(t_l0a, t_l1);
-    Sync<PIPE_MTE1, PIPE_M>(EV_SEQ);
-
-    TileRight<half, C, C> hc_l0;
-    TileAcc<float, kStackRows, C> acc_out;
-    TASSIGN(hc_l0, L::kL0bHc);
-    TASSIGN(acc_out, L::kL0cCat);
-    if (waitAcc) wait_flag(PIPE_FIX, PIPE_M, EV_ACC);  // previous tile's TSTORE has drained
-    TMATMUL(acc_out, t_l0a, hc_l0);
-    Sync<PIPE_M, PIPE_FIX>(EV_SEQ);
-
-    __gm__ half *y_tile = y + sample * L::kN;
-    if constexpr (L::kNzGm) {
-      GmNz<kStackRows, C> y_gm(y_tile);
-      TASSIGN(y_gm, y_tile);
-      TSTORE(y_gm, acc_out);
-    } else {
-      GmTile<kStackRows, C> y_gm(y_tile);
-      TASSIGN(y_gm, y_tile);
-      TSTORE(y_gm, acc_out);
-    }
-    if (freeAcc) set_flag(PIPE_FIX, PIPE_M, EV_ACC);
-  } else if constexpr (L::kBlkA || L::kBlkB) {
+  // No shipped size reaches this path with C == 16: the shallow path needs
+  // S == 1 (asserted at the call site) while every C == 16 row has kDbuf and
+  // takes the deep two-phase ring, so the C == 16 tile body lives only in
+  // tilePhaseA/tilePhaseB. This assert is what makes adding such a size a
+  // build error instead of a silently slower path.
+  static_assert(C != 16, "a shallow C == 16 size would need the cat body here");
+  if constexpr (L::kBlkA || L::kBlkB) {
     // Blocked shallow body: the same two multiplies as below, applied as blocks
     // against a resident +-H_M so neither factor is ever in L0A or L0B whole.
     // Only for a size with no dense form at all -- not a speedup, the
@@ -803,179 +754,134 @@ AICORE void shallowBlockA(uint32_t i) {
 // sits behind B(i)'s MTE1, which waits on A(i)'s FIX. So no WAR flags are
 // needed here and the shallow path's EV_ACC edge disappears.
 
-// X slot -> L0B, H_R * X -> L0C, L0C -> L1 T slot. Releases the X slot and
+// X slot -> L0A, X * H_C -> L0C, L0C -> L1 T slot. Releases the X slot and
 // leaves t_l1(Par) ready, signalled FIX->MTE1 on EvPA.
 template <uint32_t R, uint32_t C, uint32_t S, uint32_t Slot, bool Par,
           event_t EvX, event_t EvPA>
 AICORE void tilePhaseA(bool freeSlot) {
   using L = Layout<R, C, S>;
 
-  if constexpr (C != 16) {
-    // General body, same cut: right multiply, then park T in L1. X is the LEFT
-    // operand here (and T the right one in phase B), the mirror of the C == 16
-    // case, so the two share Layout's slot helpers and capacity asserts.
-    MatTile<L::kStackRows, C> x_l1;
-    TileLeft<half, L::kStackRows, C> x_l0a;
-    TileRight<half, C, C> hc_l0;
-    TileAcc<float, L::kStackRows, C> acc_stack;
-    TASSIGN(x_l1, L::xSlot(Slot));
-    TASSIGN(x_l0a, L::l0aX(Par));
-    TASSIGN(hc_l0, L::kL0bHc);
-    TASSIGN(acc_stack, L::l0cStack(Par));
+  MatTile<L::kStackRows, C> x_l1;
+  TileLeft<half, L::kStackRows, C> x_l0a;
+  TileRight<half, C, C> hc_l0;
+  TileAcc<float, L::kStackRows, C> acc_stack;
+  TASSIGN(x_l1, L::xSlot(Slot));
+  TASSIGN(x_l0a, L::l0aX(Par));
+  TASSIGN(hc_l0, L::kL0bHc);
+  TASSIGN(acc_stack, L::l0cStack(Par));
 
-    wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);  // this tile's load has landed
-    TMOV(x_l0a, x_l1);
-    if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // load 4 tiles on
-    set_flag(PIPE_MTE1, PIPE_M, EvPA);
+  wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);  // this tile's load has landed
+  TMOV(x_l0a, x_l1);
+  if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // load 4 tiles on
+  set_flag(PIPE_MTE1, PIPE_M, EvPA);
 
-    wait_flag(PIPE_MTE1, PIPE_M, EvPA);
-    TMATMUL(acc_stack, x_l0a, hc_l0);
-    set_flag(PIPE_M, PIPE_FIX, EvPA);
+  wait_flag(PIPE_MTE1, PIPE_M, EvPA);
+  TMATMUL(acc_stack, x_l0a, hc_l0);
+  set_flag(PIPE_M, PIPE_FIX, EvPA);
 
-    // Vertical stack -> horizontal concatenation, in L1. Block-columns are
-    // contiguous in NZ, so sample s's (R x C) result lands at s * R * C and the
-    // S writes read back as one (R x S*C) tile in phase B.
-    wait_flag(PIPE_M, PIPE_FIX, EvPA);
+  // Park T in L1 for phase B, which reads it WIDE as (R x S*C). At C == 16
+  // that view is the same fractals in the same order as this (S*R x C)
+  // accumulator, so one TMOV moves the whole tile; above 16 the two differ and
+  // the regroup costs one descriptor per sample. This is the kernel's only
+  // size-dependent branch on the tile path.
+  wait_flag(PIPE_M, PIPE_FIX, EvPA);
+  if constexpr (C == 16) {
+    MatTile<L::kStackRows, C> t_l1;
+    TASSIGN(t_l1, L::l1T(Par));
+    TMOV(t_l1, acc_stack);
+  } else {
     for (uint32_t s = 0; s < S; ++s) {
       MatTile<R, C> t_block;
       TASSIGN(t_block, L::l1T(Par) + s * R * C * sizeof(half));
       TEXTRACT(t_block, acc_stack, s * R, 0);
     }
-    set_flag(PIPE_FIX, PIPE_MTE1, EvPA);
-    return;
   }
-
-  constexpr uint32_t kCat = S * C;
-
-  MatTile<R, kCat> x_cat;
-  TileRight<half, R, kCat> x_l0b;
-  TASSIGN(x_cat, L::xSlot(Slot));  // same bytes as the loaded tile, read wide
-  TASSIGN(x_l0b, L::l0bT(Par));
-  wait_flag(PIPE_MTE2, PIPE_MTE1, EvX);  // this tile's load has landed
-  TMOV(x_l0b, x_cat);
-  if (freeSlot) set_flag(PIPE_MTE1, PIPE_MTE2, EvX);  // load 4 tiles on
-  set_flag(PIPE_MTE1, PIPE_M, EvPA);
-
-  TileLeft<half, R, R> hl_l0;
-  TileAcc<float, R, kCat> acc_cat;
-  TASSIGN(hl_l0, L::kL0aHl);
-  TASSIGN(acc_cat, L::l0cStack(Par));
-  wait_flag(PIPE_MTE1, PIPE_M, EvPA);
-  TMATMUL(acc_cat, hl_l0, x_l0b);
-  set_flag(PIPE_M, PIPE_FIX, EvPA);
-
-  // Same free reinterpret on the accumulator: an Acc fractal is 16x16 fp32, so
-  // (R x S*R) and (S*R x R) are again one block-column of S fractals.
-  TileAcc<float, L::kStackRows, C> acc_vert;
-  MatTile<L::kStackRows, C> t_l1;
-  TASSIGN(acc_vert, L::l0cStack(Par));
-  TASSIGN(t_l1, L::l1T(Par));
-  wait_flag(PIPE_M, PIPE_FIX, EvPA);
-  TMOV(t_l1, acc_vert);
   set_flag(PIPE_FIX, PIPE_MTE1, EvPA);
 }
 
-// L1 T slot -> L0A, T * H_C -> L0C, L0C -> GM.
+// L1 T slot -> L0, the other matmul -> L0C, L0C -> GM.
 template <uint32_t R, uint32_t C, uint32_t S, bool Par, event_t EvPA,
           event_t EvPB>
 AICORE void tilePhaseB(__gm__ half *y, uint32_t sample, uint32_t rows) {
   using L = Layout<R, C, S>;
 
-  if constexpr (C != 16) {
-    // General body: left multiply on the concatenated view, then store each
-    // sample separately. The fixpipe L0C->GM path is 2D-to-2D only, so these
-    // cannot be folded into one strided descriptor -- a 5D scatter faults.
-    MatTile<R, S * C> t_l1;
-    TileRight<half, R, S * C> t_l0b;
-    TileLeft<half, R, R> hl_l0;
-    TileAcc<float, R, S * C> acc_cat;
-    TASSIGN(t_l1, L::l1T(Par));
-    TASSIGN(t_l0b, L::l0bT(Par));
-    TASSIGN(hl_l0, L::kL0aHl);
-    TASSIGN(acc_cat, L::l0cCat(Par));
+  MatTile<R, S * C> t_l1;
+  TileRight<half, R, S * C> t_l0b;
+  TileLeft<half, R, R> hl_l0;
+  TileAcc<float, R, S * C> acc_cat;
+  TASSIGN(t_l1, L::l1T(Par));
+  TASSIGN(t_l0b, L::l0bT(Par));
+  TASSIGN(hl_l0, L::kL0aHl);
+  TASSIGN(acc_cat, L::l0cCat(Par));
 
-    wait_flag(PIPE_FIX, PIPE_MTE1, EvPA);  // phase A parked T in L1
-    TMOV(t_l0b, t_l1);
-    set_flag(PIPE_MTE1, PIPE_M, EvPB);
+  wait_flag(PIPE_FIX, PIPE_MTE1, EvPA);  // phase A parked T in L1
+  TMOV(t_l0b, t_l1);
+  set_flag(PIPE_MTE1, PIPE_M, EvPB);
 
-    wait_flag(PIPE_MTE1, PIPE_M, EvPB);
-    TMATMUL(acc_cat, hl_l0, t_l0b);
-    set_flag(PIPE_M, PIPE_FIX, EvPB);
+  wait_flag(PIPE_MTE1, PIPE_M, EvPB);
+  TMATMUL(acc_cat, hl_l0, t_l0b);
+  set_flag(PIPE_M, PIPE_FIX, EvPB);
 
-    // No EV_ACC edge, as in the C == 16 phase body: with two cat accumulators
-    // the write-after-read on slot Par is already ordered, because B(i+2)'s
-    // TMOV waits on A(i+2)'s FIX->MTE1 flag and A(i+2)'s TEXTRACTs follow
-    // B(i)'s TSTOREs on the in-order FIX pipe.
-    // The cube ran all S samples whatever `rows` says; the transform is
-    // per-sample, so the surplus reaches only output rows this loop skips.
-    wait_flag(PIPE_M, PIPE_FIX, EvPB);
-    for (uint32_t s = 0; s < rows; ++s) {
-      TileAcc<float, R, C> acc_block;
-      TASSIGN(acc_block, L::l0cCat(Par) + s * R * C * sizeof(float));
-      __gm__ half *y_row = y + (sample + s) * L::kN;
-      if constexpr (L::kNzGm) {
-        GmNz<R, C> y_gm(y_row);
-        TASSIGN(y_gm, y_row);
-        TSTORE(y_gm, acc_block);
-      } else {
-        GmTile<R, C> y_gm(y_row);
-        TASSIGN(y_gm, y_row);
-        TSTORE(y_gm, acc_block);
+  // No EV_ACC edge: with two cat accumulators the write-after-read on slot Par
+  // is already ordered, because B(i+2)'s TMOV waits on A(i+2)'s FIX->MTE1 flag
+  // and A(i+2)'s writes follow B(i)'s TSTOREs on the in-order FIX pipe.
+  wait_flag(PIPE_M, PIPE_FIX, EvPB);
+  __gm__ half *y_tile = y + sample * L::kN;
+
+  // Same reinterpret as phase A's turnaround, on the output: at C == 16 this
+  // (R x S*C) accumulator IS the (S*R x C) stack the GM tile wants, so one
+  // whole-tile store does every sample -- masked when the last tile is short.
+  if constexpr (C == 16) {
+    if constexpr (S > 1) {
+      if (rows != S) {
+        TileAcc<float, L::kStackRows, C, DYNAMIC> acc_short;
+        TASSIGN(acc_short, L::l0cCat(Par));
+        acc_short.SetValidRow(rows * R);
+        if constexpr (L::kNzGm) {
+          GmNzDyn<L::kStackRows, C> y_gm(y_tile);
+          TASSIGN(y_gm, y_tile);
+          y_gm.template SetShape<GlobalTensorDim::DIM_2>(rows * R / 16);
+          TSTORE(y_gm, acc_short);
+        } else {
+          GmTileDyn<L::kStackRows, C> y_gm(y_tile);
+          TASSIGN(y_gm, y_tile);
+          y_gm.template SetShape<GlobalTensorDim::DIM_3>(rows * R);
+          TSTORE(y_gm, acc_short);
+        }
+        return;
       }
+    }
+    TileAcc<float, L::kStackRows, C> acc_out;
+    TASSIGN(acc_out, L::l0cCat(Par));
+    if constexpr (L::kNzGm) {
+      GmNz<L::kStackRows, C> y_gm(y_tile);
+      TASSIGN(y_gm, y_tile);
+      TSTORE(y_gm, acc_out);
+    } else {
+      GmTile<L::kStackRows, C> y_gm(y_tile);
+      TASSIGN(y_gm, y_tile);
+      TSTORE(y_gm, acc_out);
     }
     return;
   }
 
-  constexpr uint32_t kStackRows = L::kStackRows;
-
-  MatTile<kStackRows, C> t_l1;
-  TileLeft<half, kStackRows, C> t_l0a;
-  TASSIGN(t_l1, L::l1T(Par));
-  TASSIGN(t_l0a, L::l0aX(Par));
-  wait_flag(PIPE_FIX, PIPE_MTE1, EvPA);  // phase A parked T in L1
-  TMOV(t_l0a, t_l1);
-  set_flag(PIPE_MTE1, PIPE_M, EvPB);
-
-  TileRight<half, C, C> hc_l0;
-  TileAcc<float, kStackRows, C> acc_out;
-  TASSIGN(hc_l0, L::kL0bHc);
-  TASSIGN(acc_out, L::l0cCat(Par));
-  wait_flag(PIPE_MTE1, PIPE_M, EvPB);
-  TMATMUL(acc_out, t_l0a, hc_l0);
-  set_flag(PIPE_M, PIPE_FIX, EvPB);
-
-  __gm__ half *y_tile = y + sample * L::kN;
-  wait_flag(PIPE_M, PIPE_FIX, EvPB);
-
-  // Same masking on the single whole-tile store, and on the same layout.
-  if constexpr (S > 1) {
-    if (rows != S) {
-      TileAcc<float, kStackRows, C, DYNAMIC> acc_short;
-      TASSIGN(acc_short, L::l0cCat(Par));
-      acc_short.SetValidRow(rows * R);
-      if constexpr (L::kNzGm) {
-        GmNzDyn<kStackRows, C> y_gm(y_tile);
-        TASSIGN(y_gm, y_tile);
-        y_gm.template SetShape<GlobalTensorDim::DIM_2>(rows * R / 16);
-        TSTORE(y_gm, acc_short);
-      } else {
-        GmTileDyn<kStackRows, C> y_gm(y_tile);
-        TASSIGN(y_gm, y_tile);
-        y_gm.template SetShape<GlobalTensorDim::DIM_3>(rows * R);
-        TSTORE(y_gm, acc_short);
-      }
-      return;
+  // Above 16 the samples are side by side in L0C, so each stores separately:
+  // the fixpipe L0C->GM path is 2D-to-2D only, and a 5D scatter faults. The
+  // cube ran all S samples whatever `rows` says; the transform is per-sample,
+  // so the surplus reaches only output rows this loop skips.
+  for (uint32_t s = 0; s < rows; ++s) {
+    TileAcc<float, R, C> acc_block;
+    TASSIGN(acc_block, L::l0cCat(Par) + s * R * C * sizeof(float));
+    __gm__ half *y_row = y + (sample + s) * L::kN;
+    if constexpr (L::kNzGm) {
+      GmNz<R, C> y_gm(y_row);
+      TASSIGN(y_gm, y_row);
+      TSTORE(y_gm, acc_block);
+    } else {
+      GmTile<R, C> y_gm(y_row);
+      TASSIGN(y_gm, y_row);
+      TSTORE(y_gm, acc_block);
     }
-  }
-
-  if constexpr (L::kNzGm) {
-    GmNz<kStackRows, C> y_gm(y_tile);
-    TASSIGN(y_gm, y_tile);
-    TSTORE(y_gm, acc_out);
-  } else {
-    GmTile<kStackRows, C> y_gm(y_tile);
-    TASSIGN(y_gm, y_tile);
-    TSTORE(y_gm, acc_out);
   }
 }
 

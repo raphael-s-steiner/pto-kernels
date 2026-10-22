@@ -2325,7 +2325,7 @@ path -- so `test_bitplan_floor_boundaries` straddles the floor and crosses a
 whole-tile boundary to keep both the bulk launch and the bulk-plus-remainder
 split exercised.
 
-#### Which factor is applied FIRST is worth 1.28x, and one wrong symbol had hidden it
+#### The free reinterpret is worth 1.28x -- NOT the order, which is what it was first credited to
 
 With the `(N/16, 16)` split, which of `H_16` and `H_{N/16}` goes first? It
 depends on the body, and **the two bodies disagree**:
@@ -2348,12 +2348,23 @@ the order**. Measured:
 |  8192 | 5.48 | 6.48 | 0.8457 |
 | 32768 | **15.10** | 19.16 | **0.7881** |
 
-**H_R-first is 1.083x geomean and 1.269x at batch 32768**, and the gap grows
-with batch. The reason is FIX descriptors: the general body has to turn the
+**H_R-first measured 1.083x geomean and 1.269x at batch 32768**, and the gap
+grew with batch. The reason is FIX descriptors: the general body turns the
 vertical stack of S samples into a horizontal concatenation with **S separate
 `TEXTRACT`s** -- S FIX ops per tile against the cat body's one `TMOV` -- on the
-pipe that is already the bottleneck. This is the same accounting as the
-turnaround section above, and here it is measured rather than forecast.
+pipe that is already the bottleneck.
+
+> **This experiment was mis-attributed, and the follow-up below corrects it.**
+> Forcing N=256 through the general body changes the order AND the descriptor
+> count, because the general body paid its S `TEXTRACT`s *unconditionally* --
+> it never took the `C == 16` reinterpret even where it was available. So what
+> was isolated was the BODY, not the order, and the mechanism named (FIX
+> descriptors) is in fact the whole of it. Give the single body the reinterpret
+> and the order is free: measured 1.0009 geomean over 54 cells. The 1.28x is
+> real and still the reason the `C == 16` sizes are fast -- it is just a
+> descriptor-count win, not an ordering win. **A probe that swaps one
+> `if constexpr` has not isolated one variable if that branch differs in two
+> ways.**
 
 **The better order was unreachable because of one symbol.** The cat body set
 `kCat = S * R` and viewed the loaded tile as `MatTile<R, kCat>`. The tile holds
@@ -2468,6 +2479,111 @@ descriptors** -- and FIX is the measured bottleneck at N=512..8192 (store
 bottleneck to relieve the idlest pipe is the wrong direction. The `C == 16`
 split above is the better form of the same idea: it makes the permutation the
 identity **by construction**, instead of hiring a pipe to perform it.
+
+#### Unifying the order: the source unifies, the order cannot, and the generated size is elsewhere
+
+Asked whether "the larger factor goes first" could be made the actual rule, so
+that one body serves every size and both text and generated code shrink. Three
+separate answers, because the three parts of that question come apart.
+
+**The pattern is real but it is a consequence, not a rule.** The order is
+selected by one predicate, `C == 16`, and nothing in the kernel mentions size.
+It comes out as "larger first" only because the `C == 16` sizes are exactly the
+ones where C is the *small* factor (16 < R) and the rest keep `R <= C` from the
+balanced split. At N=256 the two are equal and the order still mattered 1.269x,
+so size is not the mechanism and would be the wrong thing to key on.
+
+**The order CAN be unified, and the first attempt at this answer was wrong.**
+"Delete the `C == 16` body" was rejected at 1.083x geomean / 1.269x -- but that
+measured a body which paid its S `TEXTRACT`s unconditionally, including at
+`C == 16` where the reinterpret was sitting there unused. The condition is
+`C == 16` and it is **symmetric in direction**: `(S*R x C)` and `(R x S*C)` are
+the same fractals in the same order, so at `C == 16` BOTH hand-offs are free,
+whichever way round they run. Give the single body that reinterpret on the
+turnaround and on the store and the second body is redundant:
+
+| | turnaround | store | total FIX descriptors |
+|---|---|---|---:|
+| `C == 16` | 1 `TMOV` | 1 whole-tile `TSTORE` | **2** |
+| `C != 16` | S `TEXTRACT`s | `rows` `TSTORE`s | 2S |
+
+Measured, two bodies -> one, 54 cells, 5 rotated passes x 50 reps:
+
+|       N | geomean | worst |
+|---|---:|---:|
+|     256 | 1.0020 | 0.9838 |
+|     512 | 0.9996 | 0.9802 |
+|    1024 | 1.0045 | 0.9750 |
+|    2048 | 1.0009 | 0.9915 |
+|    4096 | 0.9987 | 0.9875 |
+|    8192 | 0.9999 | 0.9961 |
+| **ALL** | **1.0009** | 0.9750 |
+
+null geomean 0.9990, band 0.9844 - 1.0123. Every per-N geomean is inside the
+null band, so **applying H_C first at every size is free** -- the 1.28x was
+always the descriptor count and never the ordering. 864/864 fp64 cases pass.
+
+So the kernel now runs **one** tile body, right-multiply-first everywhere, and
+"larger factor first" is abandoned with no cost, which is the cleanest proof
+that it was never the mechanism. Swapping `(R, C)` is not needed for this and
+would not have helped on its own: the orientation only moves the layout
+(`C == 16`) and the MAC count, both already measured, and at equal MACs the
+`C == 16` orientation already wins.
+
+What does NOT unify is the pair of hand-offs at `C > 16`, and that is
+structural: the S samples sit side by side in L0C, and the fixpipe L0C->GM path
+is 2D-to-2D only, so one store cannot express them. The deep tile path is down
+to exactly **two** size-dependent branches, both the same predicate, both
+saying the same thing -- is the reinterpret free.
+
+**The source does unify, though, and byte-identity proves it costs nothing.**
+There are only two distinct matmul shapes in the whole kernel, and each phase
+runs one of each -- in opposite order. For a given shape both phases use the
+same L0A and L0B addresses; only the L1 source and the L0C accumulator move:
+
+|  | phase A | phase B |
+|---|---|---|
+| `C == 16` | shape L, then **1** `TMOV` | shape S, then **1** `TSTORE` |
+| `C != 16` | shape S, then **S** `TEXTRACT`s | shape L, then **`rows`** `TSTORE`s |
+
+That table is the whole cost story -- **2S descriptors against 2** -- and it is
+why this is worth chasing where S is large and worth nothing at `S == 1`. The
+first version of this refactor kept both orders and shared them through
+`stageTileData<OperandLeft>` / `multiplyTile<OperandLeft>` helpers; once the
+single body was shown to be free, each helper had one caller and was inlined
+back. Net: one staging path and one matmul per phase, with the two `C == 16`
+branches above.
+
+Two deletions, both **byte-identical** and so proved free without a device:
+
+- `hadamardTile` carried its own `C == 16` branch -- **56 lines of dead code**.
+  The shallow path asserts `S == 1` while every `C == 16` row has `kDbuf` and
+  takes the deep ring, so it was never instantiated. It is also where the
+  `kCat = S * R` bug lived in duplicate. Replaced by
+  `static_assert(C != 16, ...)`, which turns adding such a size into a build
+  error instead of a silently slower path.
+- the two phases, factored as above.
+
+`fast_hadamard_twosided.cpp` **1248 -> 1158 lines**, nine `TMATMUL` sites down
+from eleven, and the deep tile path went from two bodies carrying two matmul
+shapes each to one body carrying one. 864/864 fp64 cases pass, 271 tests pass.
+
+**The generated size is not in the duplication -- it is in the tile tiers.**
+Measured by rebuilding with shallower dispatch:
+
+| dispatch | `.so` bytes | vs shipped | regret geomean | regret worst |
+|---|---:|---:|---:|---:|
+| **3 tiers (shipped)** | **100552** | -- | **1.0092** | 1.0846 |
+| 2 tiers (S, S/2) | 84200 | **-16%** | 1.0155 | 1.0859 |
+| 1 tier (S only) | 57704 | **-42%** | 1.0553 | 1.1918 |
+
+So `if constexpr` already costs nothing for the untaken branches, and the only
+large lever on generated size is instantiating fewer tile heights. The 3 -> 2
+step is the interesting one: **16% of the binary for 0.6% of mean performance**,
+with worst-case regret essentially unchanged (1.0859 against 1.0846). The
+3 -> 1 step is a bad trade at 42% for 4.6% mean and 19% worst case. Neither is
+taken here -- the tiers were measured in and this is a size decision, not a
+performance one -- but the price is now on record.
 
 #### Found by audit, measured, not yet taken
 
