@@ -2406,6 +2406,51 @@ for one case (`_TILE_RUN_K`), an operand layout (`GmTile`), a specialised body
 (`kCat = S * R`) and a path threshold (`_BITPLAN_TILE`) each encoded that
 assumption, and each read as deliberate.
 
+##### Reference: per size, which factor is which and which goes first
+
+`Y = H_R . X . H_C` with the sample viewed as `R x C` row-major, so **`H_R` is
+the LEFT multiplication** (acts on the row index, the HIGH bits of the element
+index) and **`H_C` is the RIGHT multiplication** (the column index, the LOW
+bits). The order rule is one predicate, and it holds identically in all three
+tile bodies (`tilePhaseA`/`tilePhaseB` deep, `hadamardTile` shallow dense,
+`hadamardTile` + `shallowBlockA` blocked):
+
+> `C == 16` -> **left multiplication first** (`H_R . X`, then `T . H_C`).
+> `C != 16` -> **right multiplication first** (`X . H_C`, then `H_R . T`).
+
+|       N | R = left | C = right | S | smaller | body | applied FIRST | phase-A FIX descriptors |
+|---|---:|---:|---:|---|---|---|---:|
+|     256 |  16 |  16 | 32 | equal | deep cat | **left** `H_16` | 1 |
+|     512 |  32 |  16 | 16 | **right** (16) | deep cat | **left** `H_32` | 1 |
+|    1024 |  64 |  16 |  8 | **right** (16) | deep cat | **left** `H_64` | 1 |
+|    2048 |  32 |  64 |  4 | **left** (32) | deep general | **right** `H_64` | 4 |
+|    4096 |  64 |  64 |  2 | equal | deep general | **right** `H_64` | 2 |
+|    8192 |  64 | 128 |  1 | **left** (64) | deep general | **right** `H_128` | 1 |
+|   16384 | 128 | 128 |  1 | equal | shallow general | **right** `H_128` | 1 |
+|   32768 | 128 | 256 |  1 | **left** (128) | shallow blocked | **right** `+-H_64` | 1 |
+
+(`kBlockIt` is true only at N=32768, where both sides block: `kMa = kMb = 64`,
+so `kBlkA` and `kBlkB` are both set. `kDbuf` is true for N=256..8192 and false
+from N=16384 up.)
+
+**The larger factor goes first in every unequal case** -- but that is
+descriptive, not the mechanism. At N=256 the two are equal and the order was
+still worth 1.269x, so size is not what pays. What pays is the **intermediate's
+shape**: the cat body writes `T` as `(R x S*C)` and hands it to phase B as one
+`TMOV`, while the general body writes `(S*R x C)` and must turn the vertical
+stack into a horizontal concatenation with **S separate `TEXTRACT`s**. The
+penalty is therefore proportional to S, which is exactly why it is worth
+chasing at small N and worth nothing at large N: the right-hand column collapses
+to 1 as soon as `S == 1`.
+
+So there is **no order win left at N=8192, 16384 or 32768** -- they run one
+sample per tile, so both orders cost one descriptor. And the order cannot be
+flipped at N=2048 or 4096 either: the cat body's read-wide view needs each
+sample's `(R x C)` block to be ONE NZ block-column, which is true only at
+`C == 16`, and buying `C == 16` at those sizes costs more MACs than it saves
+(measured above). The two sizes where S is large and `C == 16` is affordable --
+512 and 1024 -- are the two that moved.
+
 #### Why the L0C turnaround cannot absorb a layout change (it already absorbs the free one)
 
 Asked whether the permutation could be folded into the `L0C -> L1` turnaround,
