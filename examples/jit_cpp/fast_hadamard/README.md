@@ -435,6 +435,19 @@ the per-core Hadamard-factor prologue is free (0.90 us, identical to an empty
 kernel), deleting both `TMATMUL`s saves 2-13%, and reps=20 and
 reps=2000 give identical times, so it is not a clock ramp either.
 
+> **The third of those four was wrong, and it was the answer.** The prologue's
+> ND operand load *was* the intercept: see *The operands were loaded as a
+> narrow-tile gather* below, where reading the factors as NZ instead is
+> 1.34x - 1.65x at N=256 and turns this section's core-count U-curve into
+> monotone scaling to 24 cores. The probe that cleared it timed a
+> prologue-only kernel against an empty one, and at `block_dim=24` all 24
+> cores run their gathers *in parallel, behind block dispatch*, so in isolation
+> it hides inside the 0.90 us floor. In the real kernel it sits in front of
+> MTE1 on every core instead. **Pricing a fixed cost in isolation measures its
+> latency, not what it blocks** -- the probe has to delete it from the whole
+> kernel, which is what finally found it. The rest of this section's analysis
+> stands; its conclusion about the cause does not.
+
 It is **pipeline depth per core**, and two sweeps isolate it. Holding the work
 fixed at 48 tiles and changing only the spread:
 
@@ -1677,6 +1690,14 @@ Combined, the two kernel-side changes are **1.0972x geomean over 176 shapes,
 (75944 -> 63336 bytes). The host-side changes are a further 1.085x on the
 launch path and 1.016x on device.
 
+A function-by-function audit and a tile resweep then followed, and the two
+subsections below them -- the ND operand gather and the three-height tiling with
+its tiles-per-core schedule -- are worth more than everything above. **Over the
+whole of it: 1.2043x geomean over 134 shapes, best 2.9096x, worst 0.9638x**
+against a null arm of 1.0001 (band 0.9863 - 1.0379), 63 shapes at >= 1.05x and
+2 below 0.98x (both small-batch, at N=1024 and N=2048, marginally outside the
+null). Per N: **N=256 1.7772x, N=512 1.8360x**, everything else 1.02x - 1.07x.
+
 The rig's floor first: 19 shapes, two byte-identical `.so` under different
 names, interleaved in one profiling session -- geomean **0.9997**, band
 **0.9933 - 1.0050**. Everything below is read against that.
@@ -1841,36 +1862,312 @@ intermittent and shape-dependent -- it was gated on more than one green run:
 first checked against an exact fp64 transform. 0 non-deterministic, 0 out of
 tolerance, plus an 864-case fp64 sweep and the repo's 265 tests.
 
-#### Measured, applicable, and not taken: the tile-size / core-count crossover
+#### The operands were loaded as a narrow-tile gather, and every core repaid it (1.1819x overall, 1.84x at N=256)
 
-The one-sided kernel's largest tuning finding is that at small batch the tile
-height **is** the core count, so `(S, tiles_per_core)` must be swept jointly.
-That is true here too. 2374 configs, every candidate `S` for every N crossed
-with every reachable core count, each `S` then judged at **its own** best count:
+`loadHadamardFactors` read its `(W x W)` factors through `GmTile`, i.e. ND. A
+factor is small, so that is a `W`-row, `2W`-byte-per-row ND2NZ gather -- at
+N=256, **16 separate 32-byte reads** of a 512-byte buffer. It is the narrow-tile
+defect this file already records for the X tile at `C == 16` (4.5x - 8.7x),
+applied to the OPERAND instead of the data, with one extra consequence: the
+factors are loaded **once per core**, before MTE1 may touch that core's first
+tile, so the cost is paid again for every core in the launch.
 
-| N | batch | shipped S | us | best S | us | gain |
-|---:|------:|---:|---:|---:|---:|---:|
-| 256 | 16 | 32 | 2.485 | **8** | 1.935 | **1.284** |
-| 256 | 32 | 32 | 2.150 | 16 | 2.040 | 1.054 |
-| 512 | 16 | 16 | 2.340 | 8 | 2.175 | 1.076 |
-| 1024 | 16 | 8 | 1.935 | **2** | 1.685 | **1.148** |
-| 1024 | 32 | 8 | 1.975 | 4 | 1.860 | 1.062 |
-| 1024 | 64 | 8 | 2.190 | 4 | 2.075 | 1.055 |
-| 2048 | 16 | 4 | 1.975 | 2 | 1.790 | 1.103 |
-| 2048 | 32 | 4 | 2.110 | 2 | 1.990 | 1.060 |
-| 4096 | 16 | 2 | 2.175 | 1 | 2.040 | 1.066 |
+The fix is four `GmTile` -> `GmNz` substitutions plus a host `_to_nz` that
+stores each operand block pre-fractalised. Measured in isolation at N=256, each
+shape at its shipped `block_dim`, against a byte-identical null arm at 0.9997
+(band 0.9907 - 1.0048):
 
-**At batch >= 128 the shipped `S` is optimal at every N and every core count --
-gain 1.000x, not 1.00x-ish.** The whole opportunity is batch <= 64, where a
-shorter tile yields more tiles to overlap, and it is worth 1.05x - 1.28x there.
+| batch | 32 | 256 | 1024 | 4096 | 8192 | 65536 |
+|---|---:|---:|---:|---:|---:|---:|
+| ND -> NZ | 1.335 | 1.403 | 1.542 | 1.651 | 1.624 | 1.455 |
 
-It is **not taken**, for a reason specific to this kernel: the crossover is not
-at a uniform tile count. N=256 crosses at **2** tall tiles while N=1024 crosses
-at **32**, so the one-sided kernel's trick of stating the threshold in tiles
-(`PTO_OS_TILES_TO_PIPELINE = 32`, one constant for every N) does not fit, and a
-second tier would need a per-N threshold plus a per-tier `_TILE_RUN_K` refit.
-Recorded here with its numbers so the decision is a decision and not an
-oversight.
+**It is also the whole of "why N=256 is the weak case".** That section attributes
+the size's refusal to scale to pipeline depth, and the core-count experiment it
+reports -- 48 tiles, every reachable core count -- says otherwise once the
+gather is gone:
+
+| cores | 1 | 2 | 4 | 6 | 8 | 12 | 16 | 24 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| ND operands | 16.02 | 9.42 | 7.04 | **7.02** | 7.56 | 9.33 | 11.40 | 15.72 |
+| NZ operands | 15.43 | 8.48 | 5.00 | 3.93 | 3.40 | 2.97 | 2.80 | **2.73** |
+
+The U-curve is not a property of the kernel. It is 24 copies of a 0.5 - 0.7 us
+gather, and with the burst the size scales **monotonically to 24 cores**:
+2.571x at each arm's own best count, 5.76x at `bd = 24`.
+
+**So the schedule was encoding the defect.** `_TILE_RUN_K` was 0.49 at N=256 and
+0.6 at N=512 against >= 8 at every other size -- the two sizes whose factors are
+16 and 32 wide. Those constants existed only to stop adding cores, because each
+extra core repaid the gather. Keeping them on the fixed kernel costs **1.6210x /
+1.7398x** worst-case regret; refitting lands both on the same value as everything
+else (7.51 / 7.23, worst regret 1.0106 / 1.0000). *A stale schedule was the
+larger half of this change*, and the resweep below then replaced the fit's
+functional form outright.
+
+End-to-end, old kernel at its own schedule against new kernel at its refit one,
+126 shapes, 3 interleaved passes:
+
+| N | shapes | geomean | best | worst |
+|---:|---:|---:|---:|---:|
+| 256 | 16 | **1.8382** | 2.8885 | 1.3380 |
+| 512 | 16 | **1.8024** | 2.6604 | 1.1794 |
+| 1024 .. 32768 | 94 | 1.0111 - 1.0372 | 1.0619 | 0.9986 |
+| **all** | **126** | **1.1819** | **2.8885** | **0.9986** |
+
+42 shapes at >= 1.05x, **none below 0.98x**, null arm 0.9993.
+
+**Correctness is a host/kernel contract, and it hides its first failure.** A
+16-wide factor's NZ image IS its row-major bytes, so the kernel-only change
+validates at N=256 (108/108) and the host side looks unnecessary. The first size
+to break is N=512, and only on its `H_C`: without `_to_nz` it reads
+`rel_rms` **1.366**, i.e. uncorrelated. With both halves, 864/864 fp64 cases pass
+at worst `rel_rms` 3.264e-04, identical to the baseline, and the repo suite
+passes including the bit-plan path -- `_bit_operand` feeds the very same loads,
+so it needed the same treatment.
+
+The two layouts also index their shape differently, which is easy to get
+silently wrong: `TileShape2D<..., ND>` is `Shape<1,1,1,rows,cols>`, so the row
+count is **DIM_3** and counts rows, while `TileShape2D<..., NZ>` is
+`Shape<1, cols/C0, rows/16, 16, C0>`, so it is **DIM_2** and counts **fractals**.
+
+A note for the sibling kernel: `fast_hadamard_onesided.cpp` loads its operands
+as ND too, but its narrowest is `kM = 64` (a 128-byte row) against 16 here, and
+the measurements above put a 64-wide factor at 1.00x - 1.05x. So the same defect
+exists there and is worth little -- the severity is set by the row length, not by
+the pattern.
+
+#### Taken on a resweep: three tile heights and a tiles-per-core schedule (1.0343x over 135 shapes)
+
+An earlier version of this section recorded the crossover as measured,
+applicable and **not** taken, because N=256 appeared to cross at 2 tall tiles
+while N=1024 crossed at 32, so no single threshold constant could serve both.
+That sweep ran before `loadHadamardFactors` read its operands as `Layout::NZ`.
+On the fixed kernel the crossovers line up, and the whole thing ships. **A
+tuning conclusion is only as current as the kernel it was measured on.**
+
+Resweep: every candidate `S` from the table down to 1 -- six builds, each
+halving the whole case table -- crossed with **every reachable active core
+count**, over batch 1..256 densely plus 1024 and 8192. 5730 timed
+configurations: 1910 (S, cores, batch) points x 3 interleaved passes, medians.
+Each `S` at its own best count, `us@cores`:
+
+| batch | N=256 S=32 | S=16 | S=8 | S=4 | N=1024 S=8 | S=4 | S=2 | S=1 |
+|------:|-----------:|-----:|----:|----:|-----------:|----:|----:|----:|
+| 8 | 1.360@1 | 1.320@1 | 1.340@1 | 1.330@2 | 1.740@1 | 1.500@2 | 1.480@2 | **1.460@4** |
+| 16 | 1.420@1 | 1.410@1 | 1.350@1 | **1.340@2** | 1.760@2 | 1.600@4 | **1.580@4** | 1.660@8 |
+| 32 | 1.640@1 | 1.460@2 | **1.380@2** | 1.440@4 | 1.880@4 | **1.760@4** | 1.780@8 | 1.960@16 |
+| 64 | 1.640@2 | 1.520@2 | **1.480@4** | 1.660@8 | 2.060@8 | **1.960@8** | 2.080@16 | 2.410@16 |
+| 128 | 1.720@4 | **1.640@4** | 1.690@8 | 1.970@16 | 2.320@8 | **2.280@16** | 2.590@16 | 2.980@22 |
+| 256 | 1.920@4 | **1.821@8** | 2.000@16 | 2.380@16 | **2.630@16** | 2.820@22 | 3.240@22 | 3.890@24 |
+| 1024 | **2.430@16** | 2.730@24 | 3.130@24 | 3.960@24 | **4.460@24** | 5.070@24 | 6.670@24 | 9.300@24 |
+| 8192 | **5.500@24** | 7.140@24 | 10.340@24 | 16.790@24 | **18.601@24** | 25.041@24 | 38.481@24 | 62.041@24 |
+
+Three readings, and the third is the one that was missing before:
+
+**The shipped `S` is right at bulk and wrong below it, by up to 1.19x.** At
+batch >= 1024 it wins at every N and every core count; the whole opportunity is
+batch <= 512 and it is worth 1.05x - 1.19x there. (Pre-NZ-fix the same table
+read 1.284x at N=256 batch 16; the operand fix took most of that back, so the
+numbers here are smaller than the ones they replace -- a fix in one place
+shrinks the case for a change in another.)
+
+**The S-vs-S/2 crossover IS at one tile count: 16 tall tiles.** Measured
+intervals, in tall tiles: N=256 [8, 32], N=512 [16, 64], N=1024 [16, 24],
+N=2048 [12, 16], N=4096 [8, 12]. 16 is in all five. The earlier "2 versus 32"
+reading came from comparing different pairs of sizes on the pre-fix kernel.
+
+**The cascade is exactly halving, and three heights is the depth.** The
+per-batch optimum over every `S` is `S`, `S/2`, `S/4` across the whole range
+those two thresholds select them in, so the tiers need no table of their own.
+Scored against the per-batch oracle over 90 (N, batch) points:
+
+| tile heights | thresholds | regret geomean | regret worst | gain vs 1 tier |
+|---|---|---:|---:|---:|
+| 1 (shipped before) | -- | 1.0553 | 1.1918 | 1.0000 |
+| 2: S, S/2 | 16 tall | 1.0155 | 1.0859 | 1.0393 |
+| **3: S, S/2, S/4** | **16 tall, 6 mid** | **1.0092** | **1.0846** | **1.0457** |
+| 4: + S/8 | 16, then 6 per level | 1.0031 | 1.0625 | 1.0521 |
+| 5: + S/16 | 16, then 6 per level | 1.0052 | 1.0625 | 1.0499 |
+| 7: full cascade | 16, then 6 per level | 1.0055 | 1.0606 | 1.0495 |
+
+**The depth is a measurement too, and it has an interior optimum**: a FIFTH
+height is worse than four (1.0052 against 1.0031) -- past S/8 the one lower
+threshold that fits every level starts picking tiles that are too short. Four
+is the regret optimum and **three is what ships**, for three reasons: the
+fourth height's whole gain lands on batch <= 8 (0.04 - 0.09 us on a 1.3 - 1.5
+us kernel, in the widest part of the null band), it is slightly WORSE where the
+third height pays most (N=256 batch 24-32: 1.157x / 1.139x against 1.182x /
+1.188x), and it costs another ~17 KB of instantiation for +0.6% geomean. If
+batch 1-8 at N=512 or N=1024 ever becomes the shape that matters, the fourth
+tier is one `else if` and `PTO_TS_TILES_MID` already has the right value for
+it.
+
+The second threshold is **not** the same constant as the first (it is ~5-7 tiles
+of the mid tile at every N, against 16 of the tall one), so two constants are
+the honest minimum: `PTO_TS_TILES_TALL = 16` and `PTO_TS_TILES_MID = 6`. No
+per-N number anywhere -- the case table is unchanged and the tiers are `S / 2`
+and `S / 4` of it, with `if constexpr` collapsing the pick where they repeat
+(N=4096's third tier, and all of N >= 8192, cost nothing). Cost of the nine
+extra rings: `.so` **62760 -> 109416 bytes**; two tiers would have been 91912.
+
+#### The schedule is tiles per core, and it was never a square root (up to 1.49x)
+
+Refitting `_TILE_RUN_K` per tier exposed the form as wrong rather than the
+constants as stale. `bd = sqrt(k * tiles)` means **tiles per core grows with
+the batch**; the measured optimum holds it at 2 and lets the 24-core cap raise
+it. At N=4096 S=1 the best block_dim over tiles 4, 6, 7, 8, 12, 16, 24, 31 is
+2, 3, 4, 4, 6, 8, 12, 16 -- `ceil(tiles / 2)`, exactly, at every point.
+
+Swept at **every** integer block_dim in [1, 24] over 139 shapes (91 across the
+three tiers of N=256..4096, 48 at N=8192..32768), scored on the clamped count
+the launch really uses and against the best **reachable** split -- a block_dim
+of any other shape is one `ceil(tiles / ceil(tiles / bd))` can never produce,
+so scoring against it invents regret no `k` could remove:
+
+| law | regret worst | regret geomean |
+|---|---:|---:|
+| `sqrt(k * tiles)`, best k per tier | 1.4879 | 1.0251 |
+| one tile per core always | 1.6895 | 1.1197 |
+| two tiles per core always | 1.0680 | 1.0015 |
+| **one each up to `_SOLO_TILES[n]`, two each after** | **1.0139** | **1.0005** |
+
+so `_TILE_RUN_K` is gone and the only free value left is where one-per-core
+turns into two-per-core -- a tile count, per N:
+
+| N | `_SOLO_TILES` | why |
+|---|---:|---|
+| 256..4096 | 1 | they carry three tile HEIGHTS instead, so a small batch arrives as many short tiles, never as a few tall ones, and pairing them always wins |
+| 8192 | 6 | one height, and it is the full 8192 elements: up to six of them, a core wants its own |
+| 16384, 32768 | 24 | dense-shallow and blocked-shallow, no deep ring, so pairing a core's tiles buys no overlap and they want every core they can get |
+
+**The two shallow sizes were the largest single loss the sweep found**: their
+old `k` asks for `sqrt(8 * tiles)` and `sqrt(16.54 * tiles)` cores where they
+want all of them, which costs **1.21x at N=16384 batch 12-16 and 1.49x at
+N=32768 batch 24**. Neither has a tile tier, so that is pure schedule -- and it
+sat under a fit that had been scored only over batches 64 and up.
+
+#### What the two changes are worth together (1.0343x over 135 shapes)
+
+Old kernel and old schedule against new, each arm at the block_dim its **own**
+host picks -- the only honest comparison, since the tile height sets the tile
+count, which sets what the schedule asks for. 135 shapes (every N x batch
+1..65536), **arm order rotated per pass** so no arm keeps the same position,
+6 passes, medians.
+
+| N | geomean | best | worst |
+|---:|--------:|-----:|------:|
+| 256 | 1.0436x | 1.145x | 0.985x |
+| 512 | 1.0447x | 1.176x | 0.992x |
+| 1024 | 1.0355x | 1.176x | 0.986x |
+| 2048 | 1.0342x | 1.148x | 0.986x |
+| 4096 | 1.0271x | 1.104x | 0.996x |
+| 8192 | 1.0042x | 1.053x | 0.994x |
+| 16384 | 1.0508x | 1.220x | 0.997x |
+| 32768 | 1.0314x | 1.493x | 0.996x |
+| **all** | **1.0343x** | **1.493x** | **0.985x** |
+
+By batch band: 1-8 **1.0232x**, 12-64 **1.0697x**, 96-512 **1.0190x**,
+>= 1024 **1.0002x** -- nothing is given up at bulk, which is what the tall tier
+is for. Null arm, same session, same shape set, two byte-identical `.so` under
+different names: geomean **0.9999x**, band **0.9875x - 1.0113x**. Every
+negative cell in the table above is inside that band.
+
+**N=512 is the exception, and it is a host-side one**: the wrapper sends batch
+>= 16 at N=512 through the bit-plan tile (`T = 8192`, i.e. the N=8192 case),
+so the 1.0447x measured here is the classic path, which production reaches only
+below batch 16 and for the <= 15-sample remainder of a bit-plan launch. The
+tiers are still carried there, because the bit-plan is a host decision and the
+kernel must be right without it.
+
+**The arm order mattered more than the change at two shapes.** In the first,
+unrotated run (base, null, tier every pass) N=1024 batch 65536 and N=4096 batch
+16384 -- the two 64M-element shapes -- read **1.175x** for the tier arm, which
+would have been the best numbers in the table. The null read 1.029x and 1.033x
+at exactly those two shapes, its largest deviations anywhere, and the arms'
+block_dim and tile height are identical there. Rotating the order moved them to
+0.992x and 0.990x with a per-pass spread of 35 us. A fixed arm order plus a
+shape big enough to move the clock is a 1.17x result waiting to be believed.
+
+#### Can `S` go UP? No -- every row is exactly on the L0C ceiling
+
+The tall tile is capped, and the comment that says `S * N <= 16384` is the
+SHALLOW bound. The deep path keeps two tiles in flight, each with a stacked and
+a concatenated fp32 accumulator, so `Layout::kDbuf` requires
+`4 * kAccBytes <= L0C_BYTES`, i.e.
+
+    16 * S * N <= 131072   ->   S * N <= 8192
+
+and **every row of the case table sits exactly at `S * N = 8192`** (32x256,
+16x512, 8x1024, 4x2048, 2x4096, 1x8192). L0C is 100% spent; L1 uses at most
+139264 of 524288 and L0A/L0B have >= 32 KB free except at N=8192, where L0B is
+also exactly full. Doubling any `S` needs 262144 bytes of L0C.
+
+Dropping to the shallow path to get the room back is not an option and not a
+guess: `runTiles` has `static_assert(S == 1)` on that path (no masked last
+tile), and the configuration a 16384-element tile would land in is the one
+N=16384 already runs -- which the bit-plan `(N, T)` grid above measured
+directly, at N=512: `T = 8192` (deep) scores 2.19x / 2.42x where `T = 16384`
+(shallow, one tile twice as tall) scores 1.76x / 1.74x. **The deep ring is
+worth more than the taller tile, by 1.24x - 1.39x.**
+
+One route is identified and unmeasured: aliasing the stacked and concatenated
+accumulators the way the blocked path does (`kAlias`) halves the requirement to
+`8 * S * N <= 131072`, i.e. `S * N <= 16384`, because phase A's result leaves
+L0C for the L1 turnaround before phase B's matmul writes. It would serialise
+FIX against M inside a tile and lean on the ring's other in-flight tile to
+cover it, which is new sync on the path that already produced the one-id
+two-channel defect -- so it is a project, not a tweak. Note that blocking's
+measured 1.5x - 1.8x loss does **not** condemn it: that number is aliasing plus
+an M-sized matmul, and only the second half is the expensive part.
+
+#### Found by audit, measured, not yet taken
+
+A function-by-function pass over the kernel with per-pipe "delete one resource,
+keep every flag" probes attributes device time as: **FIX is the bottleneck for
+N=512 .. 8192** (store 13% - 39% plus L0C->L1 turnaround 7% - 30%, and both
+halves are structural -- a two-matmul tile pushes 32 KB through FIX per 16 KB of
+output, twice the one-sided kernel's fixpipe traffic); **MTE2 is never the
+bottleneck** (<= 8%); the cube is 1% - 7% below N=16384 and then 30% / 56%; and
+a fixed floor of 0.94 - 2.4 us is 20% - 53% of device time at batch <= 256.
+
+Three items came out of it that are recorded rather than applied:
+
+- **N=32768 is fully serialized.** Its exposed shares sum to 100%: deleting the
+  matmuls is 2.290x, and the independent MAC floor (12.6 MMAC/sample x 42.67
+  samples/core / 4096 MAC/cycle at 1.8 GHz = 73 us) matches the 74.7 us the
+  matmuls take -- so the cube runs at ~100% of peak while it runs and the other
+  58 us overlaps nothing, because `kBuf == 1` there (one tile's accumulator is
+  all 128 KB of L0C). Perfect overlap would be **1.78x**. The route is to
+  pipeline over output COLUMN blocks: `accA(c)` and `accB(c)` are 32 KB each, so
+  two column blocks in flight is exactly 128 KB, at the price of 32 matmuls per
+  sample instead of 20 and a second `TMOV` of X. Forecast 1.3x - 1.6x on the
+  slowest cell in the grid. Settle it first with a wrong-answer probe that
+  halves both accumulators and runs the halves as a 2-stage pipeline -- under
+  ~100 us means build it, ~125 us means the extra matmuls ate it. Fewer MACs is
+  NOT the lever: a 3-way split is unavailable because a matmul's field must
+  contain the four low bits of its view's row or column index, and the best plan
+  respecting those anchors costs 288 against 384 MACs per element.
+- **The N=512 split launch pays two task-queue drains and two tensor slices.**
+  Host clock, `METH-360`: shipped 104.4 us, one drain 74.0, one drain plus
+  pointer arithmetic instead of slicing **44.5 us (2.35x)**. It affects only
+  N=512 with `batch % 16 != 0`, and the pointer form is *strictly safer* against
+  the launch race than the current code, which creates a tensor slice after the
+  stream pointer has been read.
+- **The stack -> cat turnaround folds at every `C`, not only at `C == 16`**,
+  contradicting the comment at the top of the kernel. One whole-tile `TEXTRACT`
+  yields the concatenated view with its column blocks permuted by
+  `J = jc*S + s`; phase B left-multiplies and never mixes columns, so the
+  permutation passes through and the result read back as the stack is
+  byte-identical. 864/864 validate, geomean 1.0019 with best 1.0391 (real only
+  at large `S`), `.so` 13% smaller. Worth taking as a simplification; it is not
+  a speed lever, because **FIX cost is bytes, not descriptors** -- the same
+  change measured at constant bytes is 1.0042 with 17 of 20 shapes inside the
+  null band.
+
+Measured and worth nothing: a deeper X ring (MTE2 is never binding), MAC
+reduction at N <= 8192 (the cube is 1% - 7%), the prologue `Sync`s (1.0127, and
+provably redundant), sharing one L1 copy of a factor between L0A and L0B, and
+`GmNz` on the X/Y legs for `S > 1, C > 16`.
 
 #### What does not port, and one method note
 

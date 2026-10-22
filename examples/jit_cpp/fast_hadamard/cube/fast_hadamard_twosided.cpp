@@ -31,6 +31,41 @@ using namespace pto;
 #ifndef PTO_TS_S256
 #define PTO_TS_S256 32
 #endif
+
+// The table above is the TALL tile, and it is only the right tile once the
+// batch yields enough of them to spread over the part: a tile is S samples, so
+// the tile height caps usable cores at ceil(batch / S), and below that cap the
+// measured optimum sits exactly on it. Every size therefore carries S, S/2 and
+// S/4 and picks between them on the tile count -- two constants for the whole
+// table, because the measured crossovers land on one value of each:
+//
+//   S    once the batch yields PTO_TS_TILES_TALL tall tiles
+//   S/2  else, once it yields PTO_TS_TILES_MID tiles of S/2
+//   S/4  else
+//
+// Sizes whose S/2 or S/4 would repeat a value compile the pick away with
+// `if constexpr`, so they cost no instantiation and no branch (S == 1 costs
+// nothing at all). The halving is not a free parameter: the per-batch optimum
+// over every S from the table down to 1, each at its own best core count, IS
+// S, S/2, S/4 over the whole range these two thresholds select them in.
+//
+// Three is also where the depth stops paying. A FIFTH height is worse than a
+// fourth (regret 1.0052 against 1.0031), and the fourth's whole gain lands on
+// batch <= 8 -- 0.04-0.09 us on a 1.3-1.5 us kernel, inside the widest part of
+// the null band -- while being slightly worse at N=256 batch 24-32 and costing
+// another ~17 KB of instantiation. See the README.
+#ifndef PTO_TS_TILES_TALL
+// 16 tall tiles: enough that 8 cores get two each, and it sits inside the
+// measured S-vs-S/2 crossover interval at every N (N=256 [8,32] tiles,
+// N=512 [16,64], N=1024 [16,24], N=2048 [12,16], N=4096 [8,12]).
+#define PTO_TS_TILES_TALL 16
+#endif
+#ifndef PTO_TS_TILES_MID
+// 6 mid tiles. The lower crossover is NOT at the same count as the upper one
+// (it is ~5-7 tiles of the mid tile at every N), which is why one constant
+// cannot serve both levels.
+#define PTO_TS_TILES_MID 6
+#endif
 // Both GM legs of a tile go through a Layout::NZ view wherever that is correct
 // (Layout::kNzGm), making each one a contiguous burst instead of the default
 // ND2NZ path, which writes L1 in 32-byte pieces however wide the tile is. It is
@@ -307,7 +342,16 @@ struct Layout {
 };
 
 // GM -> L1 -> L0A/L0B for the two Hadamard factors, once per core; both stay
-// resident. S is a template parameter although no address here depends on it:
+// resident.
+//
+// Both legs read through Layout::NZ, and the HOST stores the operands
+// pre-fractalised to match (see _to_nz). A factor is only (W x W), so an ND
+// read of it is a W-row, 2W-byte-per-row ND2NZ gather -- at N=256 that is 16
+// separate 32-byte reads, and EVERY core pays it before MTE1 may touch its
+// first tile, so the cost scales with block_dim. It is the narrow-tile defect
+// the X tile at C == 16 already avoids, applied to the operand instead of the
+// data: worth 1.34x - 1.65x at N=256 on its own, and it is what made that size
+// stop scaling past ~6 cores. S is a template parameter although no address here depends on it:
 // the blocking decision does, and loading the factors under a different
 // decision from the tile bodies' would stage dense H where they expect +-H_M.
 template <uint32_t R, uint32_t C, uint32_t S>
@@ -321,14 +365,14 @@ AICORE void loadHadamardFactors(__gm__ half *h_left, __gm__ half *h_right) {
       MatTile<L::kMa, L::kMa> hl_l1;
       TASSIGN(hl_l1, L::kL1Hl + neg * L::kMa * L::kMa * sizeof(half));
       __gm__ half *src = h_left + R * R + neg * L::kMa * L::kMa;
-      GmTile<L::kMa, L::kMa> hl_gm(src);
+      GmNz<L::kMa, L::kMa> hl_gm(src);
       TASSIGN(hl_gm, src);
       TLOAD(hl_l1, hl_gm);
     }
   } else {
     MatTile<R, R> hl_l1;
     TASSIGN(hl_l1, L::kL1Hl);
-    GmTile<R, R> hl_gm(h_left);
+    GmNz<R, R> hl_gm(h_left);
     TASSIGN(hl_gm, h_left);
     TLOAD(hl_l1, hl_gm);
   }
@@ -337,14 +381,14 @@ AICORE void loadHadamardFactors(__gm__ half *h_left, __gm__ half *h_right) {
       MatTile<L::kMb, L::kMb> hc_l1;
       TASSIGN(hc_l1, L::kL1Hc + neg * L::kMb * L::kMb * sizeof(half));
       __gm__ half *src = h_right + C * C + neg * L::kMb * L::kMb;
-      GmTile<L::kMb, L::kMb> hc_gm(src);
+      GmNz<L::kMb, L::kMb> hc_gm(src);
       TASSIGN(hc_gm, src);
       TLOAD(hc_l1, hc_gm);
     }
   } else {
     MatTile<C, C> hc_l1;
     TASSIGN(hc_l1, L::kL1Hc);
-    GmTile<C, C> hc_gm(h_right);
+    GmNz<C, C> hc_gm(h_right);
     TASSIGN(hc_gm, h_right);
     TLOAD(hc_l1, hc_gm);
   }
@@ -1136,10 +1180,26 @@ AICORE void dispatchTwosided(__gm__ half *x, __gm__ half *y,
                                  __gm__ half *h_left, __gm__ half *h_right,
                                  uint32_t batch, uint32_t n) {
   switch (n) {
-#define FAST_HADAMARD_TWOSIDED_DISPATCH(N, R, C, S)                      \
-  case N:                                                            \
-    runTwosided<N, R, C, S>(x, y, h_left, h_right, batch);       \
-    return;
+// Three tile heights per size, picked on the tile count the batch yields. The
+// `if constexpr` arms are what keep a size that has no second (or third) tile
+// free of both the instantiation and the branch.
+#define FAST_HADAMARD_TWOSIDED_DISPATCH(N, R, C, S)                        \
+  case N: {                                                                \
+    constexpr uint32_t kMid = ((S) > 1) ? (S) / 2 : 1;                     \
+    constexpr uint32_t kShort = (kMid > 1) ? kMid / 2 : 1;                 \
+    if constexpr ((S) == 1) {                                              \
+      runTwosided<N, R, C, S>(x, y, h_left, h_right, batch);               \
+    } else if (batch >= (uint32_t)(PTO_TS_TILES_TALL) * (S)) {             \
+      runTwosided<N, R, C, S>(x, y, h_left, h_right, batch);               \
+    } else if constexpr (kMid == kShort) {                                 \
+      runTwosided<N, R, C, kMid>(x, y, h_left, h_right, batch);            \
+    } else if (batch >= (uint32_t)(PTO_TS_TILES_MID)*kMid) {               \
+      runTwosided<N, R, C, kMid>(x, y, h_left, h_right, batch);            \
+    } else {                                                               \
+      runTwosided<N, R, C, kShort>(x, y, h_left, h_right, batch);          \
+    }                                                                      \
+    return;                                                                \
+  }
     FAST_HADAMARD_TWOSIDED_CASES(FAST_HADAMARD_TWOSIDED_DISPATCH)
 #undef FAST_HADAMARD_TWOSIDED_DISPATCH
     default:

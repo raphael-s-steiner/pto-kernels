@@ -1,4 +1,6 @@
 import math
+import pathlib
+import re
 
 import pytest
 import torch
@@ -6,6 +8,9 @@ import torch
 from cube.jit_util_hadamard_twosided import (
     MAX_TWOSIDED_N,
     MIN_TWOSIDED_N,
+    _SAMPLES_PER_TILE,
+    _TILES_MID,
+    _TILES_TALL,
     twosided_block_dim_schedule,
     validate_twosided_args,
 )
@@ -112,6 +117,47 @@ def test_sample_tile_boundaries(twosided_hadamard_kernel, npu_device, n):
     """The kernel halves its sample tile on the way down, so straddle the sizes."""
     for batch in TILE_BOUNDARY_BATCHES:
         check_shape(twosided_hadamard_kernel, npu_device, batch, n)
+
+
+@pytest.mark.parametrize("n", TILE_BOUNDARY_HIDDEN_DIMS)
+def test_tile_tier_boundaries(twosided_hadamard_kernel, npu_device, n):
+    """The kernel picks between three tile heights on the tile count, so cross
+    both thresholds at every size that has them -- including the batch one
+    below each, where the shorter tile has to carry a masked remainder."""
+    tall = _SAMPLES_PER_TILE[n]
+    mid = max(1, tall // 2)
+    edges = {_TILES_TALL * tall, _TILES_MID * mid}
+    for edge in edges:
+        for batch in (edge - 1, edge, edge + 1):
+            if batch > 0:
+                check_shape(twosided_hadamard_kernel, npu_device, batch, n)
+
+
+def test_tile_table_mirrors_the_kernel():
+    """The host sizes block_dim for the tile the kernel will run. If the two
+    tables disagree the answers stay correct and the schedule silently sizes a
+    tile nobody runs, so compare them against the kernel source directly."""
+    src = (pathlib.Path(__file__).resolve().parent
+           / "fast_hadamard_twosided.cpp").read_text()
+
+    def define(name):
+        m = re.search(rf"^#define {name} (\d+)$", src, re.M)
+        assert m, f"{name} is not a plain integer #define any more"
+        return int(m.group(1))
+
+    assert define("PTO_TS_TILES_TALL") == _TILES_TALL
+    assert define("PTO_TS_TILES_MID") == _TILES_MID
+
+    rows = re.findall(r"^  X\((\d+), (\d+), (\d+), ([A-Za-z0-9_]+)\)",
+                      src, re.M)
+    assert len(rows) == len(_SAMPLES_PER_TILE), "case table size changed"
+    for n, rows_, cols, samples in rows:
+        n = int(n)
+        s = int(samples) if samples.isdigit() else define(samples)
+        assert int(rows_) * int(cols) == n, f"R * C != N for N={n}"
+        assert _SAMPLES_PER_TILE[n] == s, (
+            f"N={n}: kernel tile is {s} samples, host table says "
+            f"{_SAMPLES_PER_TILE[n]}")
 
 
 def test_batch_partition_boundaries(twosided_hadamard_kernel, npu_device):

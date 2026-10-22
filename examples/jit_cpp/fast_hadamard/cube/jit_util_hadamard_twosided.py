@@ -1,6 +1,5 @@
 import ctypes
 import functools
-import math
 import os
 
 import torch
@@ -30,19 +29,75 @@ _FACTOR_CACHE: dict = {}
 _SAMPLES_PER_TILE = {256: 32, 512: 16, 1024: 8, 2048: 4, 4096: 2, 8192: 1,
                      16384: 1, 32768: 1}
 
+# The kernel carries three tile heights per size -- S, S/2 and S/4 -- and picks
+# between them on the tile count, because below ceil(batch / S) >= cores the
+# tile height IS the core count. These two MUST mirror PTO_TS_TILES_TALL and
+# PTO_TS_TILES_MID in the kernel: the schedule sizing a tile the kernel is not
+# running picks the wrong block_dim (silently -- block_dim cannot change the
+# answer, only the time).
+_TILES_TALL = 16
+_TILES_MID = 6
+
+
+def twosided_samples_per_tile(batch: int, n: int) -> int:
+    """S the kernel will run for this shape, mirroring its dispatch exactly.
+
+    The kernel takes the mid tile without a test when S/2 == S/4, so this does
+    too -- otherwise the two disagree at S == 2, where the mid tile is 1.
+    """
+    tall = _SAMPLES_PER_TILE.get(int(n), 1)
+    if tall == 1 or int(batch) >= _TILES_TALL * tall:
+        return tall
+    mid = max(1, tall // 2)
+    if mid == 1 or int(batch) >= _TILES_MID * mid:
+        return mid
+    return max(1, mid // 2)
+
 # Cores are only worth adding while each still gets a tile run long enough to
-# keep its pipes full: at N=256 a core moves 94 GB/s with 2 tiles queued against
-# 359 GB/s on a long run, so 48 tiles over 24 cores is 1.87x SLOWER than over 8.
-# bd = sqrt(k * tiles) trades the two off, and k is fitted per N rather than by a
-# rule -- nothing about N predicts which way a size behaves (N=512 wants k below
-# 1 where N=1024 wants 8, and assuming 8 for it cost 1.51x). Fitted over every
-# integer block_dim in [1, 24] x batch in {64, 256, 1024, 8192} against msprof
-# device time, minimising worst-case regret; a constant 24 costs up to 1.91x.
-_TILE_RUN_K = {256: 0.49, 512: 0.6, 1024: 8.0, 2048: 8.27, 4096: 8.0,
-               8192: 8.0, 16384: 8.0, 32768: 16.54}
-# Only reached if FAST_HADAMARD_TWOSIDED_CASES grows a size this table has not been
-# fitted for. Then it is an extrapolation -- sweep block_dim and add the entry.
-_DEFAULT_TILE_RUN_K = 8.0
+# keep its pipes full, and the quantity that says so is TILES PER CORE, not the
+# core count: the kernel splits by tiles, so the only schedules a launch can
+# reach are ceil(tiles / j) for integer j, and the measurement picks j. It
+# picks j = 1 while the tiles are few and j = 2 after that, nothing else, and
+# the 24-core cap raises j from there on its own.
+#
+# This replaces a bd = sqrt(k * tiles) fit with a per-N k. That form was the
+# wrong one: cores ~ sqrt(tiles) means tiles per core GROWS with the batch,
+# while the measured optimum holds it at 2. Swept at every integer block_dim in
+# [1, 24] over 139 shapes -- 91 across the three tiers of N=256..4096 plus 48
+# at N=8192..32768 -- and scored on the CLAMPED count the launch really uses,
+# against the best REACHABLE split (a block_dim of any other shape is one the
+# clamp can never produce, so scoring against it invents regret):
+#
+#   law                             worst   geomean
+#   this one                       1.0139    1.0005
+#   two per core always            1.0680    1.0015
+#   one per core always            1.6895    1.1197
+#   sqrt(k * tiles), best k/tier   1.4879    1.0251
+#
+# The only free value is where j turns from 1 into 2, and it is a tile count:
+#
+#   N <= 4096   1    they carry three tile HEIGHTS instead (see above), so a
+#                    small batch arrives as many short tiles, never as a few
+#                    tall ones, and pairing them always wins
+#   N = 8192    6    one tile height and it is the full 8192 elements: up to
+#                    six of them, a core wants its own
+#   N >= 16384  24   dense-shallow and blocked-shallow, no deep ring, so
+#                    pairing a core's tiles buys no overlap at all and they
+#                    want every core they can get. Their old k cost them
+#                    1.21x and 1.49x at batch 12-24 -- the largest single
+#                    loss this sweep found.
+#
+# This table is downstream of the OPERAND LAYOUT. While loadHadamardFactors
+# read its (W x W) factors as ND, every core repaid a narrow-tile gather before
+# it could touch a tile, N=256 and N=512 stopped scaling past ~6 cores, and the
+# k fitted for them came out two orders below every other size -- a defect
+# reading as a property. If that layout moves again, resweep those two first.
+_SOLO_TILES = {256: 1, 512: 1, 1024: 1, 2048: 1, 4096: 1, 8192: 6,
+               16384: 24, 32768: 24}
+# Only reached if FAST_HADAMARD_TWOSIDED_CASES grows a size this table has not
+# been fitted for. 1 is the tiered sizes' value, which a new size would most
+# likely share -- but sweep block_dim and add the entry.
+_DEFAULT_SOLO_TILES = 1
 
 
 # Memoised: it is a pure function of the three arguments and sits on the
@@ -50,26 +105,34 @@ _DEFAULT_TILE_RUN_K = 8.0
 # device time is under ~46 us. The wrapper calls it TWICE on a launch that
 # splits into a bit-plan bulk plus a remainder, and that is the shape that
 # gains most (1.117x against 1.071x - 1.085x elsewhere). The cache is keyed on
-# the arguments only, so _SAMPLES_PER_TILE and _TILE_RUN_K must stay
-# constants: make either settable at run time and this needs a cache_clear.
+# the arguments only, so _SAMPLES_PER_TILE, the tier thresholds and
+# _SOLO_TILES must stay constants: make any of them settable at run time
+# and this needs a cache_clear.
 @functools.lru_cache(maxsize=4096)
 def twosided_block_dim_schedule(batch: int, n: int, max_block_dim: int) -> int:
     """Pick block_dim for one launch: enough cores to use the part, but not so
     many that each core's tile run is too short to fill its pipes.
 
-    Fitted to block_dim sweeps in msprof device time on 910B2 covering every N in
-    the kernel's case table x batch in {64, 256, 1024, 4096, 8192, 65536} -- 40
-    shapes, no extrapolation. Lands within 1.025x of the best measured block_dim
-    (mean 1.001x), against 1.91x worst / 1.19x mean for a constant 24.
+    One tile per core while there are at most `_SOLO_TILES[n]` of them, two
+    each after that, and the 24-core cap lengthens the run from there -- which
+    is what the measured optimum does. Fitted over every integer block_dim in
+    [1, 24] (not a subset) against msprof device time at 139 shapes, scored on
+    the clamped count: worst 1.0139x of the best reachable split, geomean
+    1.0005x.
+
+    The tile tier moves with the batch, so `tiles` has to be computed from the
+    tile the kernel will actually run, not from the tall one.
 
     block_dim cannot change results, so an explicit block_dim always overrides
     this; test_block_dim_does_not_change_result is the gate on that.
     """
-    tiles = -(-int(batch) // _SAMPLES_PER_TILE.get(int(n), 1))
+    samples = twosided_samples_per_tile(batch, n)
+    tiles = -(-int(batch) // samples)
     if tiles == 0:  # the launcher short-circuits batch 0; this keeps it total
         return 1
-    k = _TILE_RUN_K.get(int(n), _DEFAULT_TILE_RUN_K)
-    cores = max(1, min(int(max_block_dim), round(math.sqrt(k * tiles))))
+    solo = _SOLO_TILES.get(int(n), _DEFAULT_SOLO_TILES)
+    wanted = tiles if tiles <= solo else -(-tiles // 2)
+    cores = max(1, min(int(max_block_dim), wanted))
     # Drop the cores that would be launched with nothing to do. The kernel
     # splits the batch as tiles_per_core = ceil(tiles / block_num), so every
     # core from ceil(tiles / tiles_per_core) on finds begin >= batch and
@@ -109,6 +172,22 @@ def hadamard_mat_factor(f: int, block: int | None = None) -> int:
     return min(_BLOCK if block is None else int(block), f)
 
 
+def _to_nz(m):
+    """Row-major (W x W) -> its NZ image: block-column major over 16x16
+    row-major fractals, which is what a `Layout::NZ` GlobalTensor reads as one
+    contiguous burst. `loadHadamardFactors` reads every operand that way, so
+    every operand has to be stored that way.
+
+    At W == 16 this is the identity (one block-column IS the row-major bytes),
+    which is why N=256 validated before the host side existed -- a trap worth
+    naming, since the first size to break is N=512 and only on its H_C.
+    """
+    w = m.shape[0]
+    if w % 16 or m.shape[1] != w:
+        raise ValueError(f"NZ needs a square 16-aligned operand, got {tuple(m.shape)}")
+    return m.view(w // 16, 16, w // 16, 16).permute(2, 0, 1, 3).reshape(-1)
+
+
 def _factor_buffer(f: int, device, block: int | None = None):
     """H_f, then +H_M and -H_M, flat -- the layout loadHadamardFactors reads.
 
@@ -119,7 +198,7 @@ def _factor_buffer(f: int, device, block: int | None = None):
     m = hadamard_mat_factor(f, block)
     h_m = hadamard_matrix(m, device)
     return torch.cat(
-        (hadamard_matrix(f, device).view(-1), h_m.view(-1), -h_m.view(-1))
+        (_to_nz(hadamard_matrix(f, device)), _to_nz(h_m), _to_nz(-h_m))
     ).contiguous()
 
 
@@ -201,7 +280,9 @@ def _bit_operand(bits, n_log2: int, device):
     h2 = torch.tensor([[1.0, 1.0], [1.0, -1.0]])
     for b in bits:
         m = torch.kron(m, h2 if b < n_log2 else torch.eye(2))
-    return m.to(device=device, dtype=torch.float16).contiguous().view(-1)
+    # Same NZ store as the ordinary factors: these are read by the very same
+    # loads, so a row-major bit-plan operand would be silently permuted.
+    return _to_nz(m.to(device=device, dtype=torch.float16).contiguous())
 
 
 def bitplan_operands(n: int, device):
