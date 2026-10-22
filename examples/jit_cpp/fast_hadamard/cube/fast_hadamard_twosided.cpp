@@ -88,8 +88,8 @@ using namespace pto;
 
 #define FAST_HADAMARD_TWOSIDED_CASES(X) \
   X(256, 16, 16, PTO_TS_S256)      \
-  X(512, 16, 32, 16)                \
-  X(1024, 32, 32, 8)                \
+  X(512, 32, 16, 16)                \
+  X(1024, 64, 16, 8)                \
   X(2048, 32, 64, 4)                \
   X(4096, 64, 64, 2)                \
   X(8192, 64, 128, 1)               \
@@ -234,6 +234,24 @@ struct Layout {
   static_assert(kMa % 16 == 0 && kMb % 16 == 0, "M must be 16-aligned");
   static constexpr bool kBlkA = (kC1 > 1);   // phase A (right multiply) blocked
   static constexpr bool kBlkB = (kR1 > 1);   // phase B (left multiply) blocked
+
+  // R == C makes H_R and H_C the SAME matrix -- both are the Sylvester H of
+  // that size -- so ONE L1 copy feeds both L0A and L0B and the second GM read
+  // goes away. That read is 32 KB per core at N=16384, which is where the
+  // operand prologue still cost 1.14x at batch 1. H is symmetric, so the left
+  // operand needs no transpose and the two TMOVs read the same NZ bytes.
+  // Unblocked only: a blocked side reads +-H_M from its own offset instead.
+  static constexpr bool kShareHf = (R == C) && !kBlkA && !kBlkB;
+
+  // The C == 16 tile bodies reinterpret the loaded (S*R x 16) tile as
+  // (R x S*R) -- "read wide" -- which is byte-compatible only when
+  // S*R*16 == S*R*R, i.e. R == 16. They were written for N=256, the only
+  // C == 16 row at the time, and nothing caught the assumption: a split like
+  // X(1024, 64, 16, 8) compiled and faulted the aicore with an MTE range
+  // error. The bodies gate on R == C == 16 now; everything else takes the
+  // general body, which handles any (R, C).
+  static_assert(C != 16 || R == 16 || R % 16 == 0,
+                "a C == 16 split needs a 16-aligned R for the general body");
 
   // Only where blocking is active: without it the slots, not the accumulators,
   // are what overflow, and leaving it off keeps every unblocked size's offsets.
@@ -385,7 +403,7 @@ AICORE void loadHadamardFactors(__gm__ half *h_left, __gm__ half *h_right) {
       TASSIGN(hc_gm, src);
       TLOAD(hc_l1, hc_gm);
     }
-  } else {
+  } else if constexpr (!L::kShareHf) {
     MatTile<C, C> hc_l1;
     TASSIGN(hc_l1, L::kL1Hc);
     GmNz<C, C> hc_gm(h_right);
@@ -420,7 +438,7 @@ AICORE void loadHadamardFactors(__gm__ half *h_left, __gm__ half *h_right) {
   } else {
     MatTile<C, C> hc_l1;
     TileRight<half, C, C> hc_l0;
-    TASSIGN(hc_l1, L::kL1Hc);
+    TASSIGN(hc_l1, L::kShareHf ? L::kL1Hl : L::kL1Hc);
     TASSIGN(hc_l0, L::kL0bHc);
     TMOV(hc_l0, hc_l1);
   }
@@ -788,7 +806,7 @@ template <uint32_t R, uint32_t C, uint32_t S, uint32_t Slot, bool Par,
 AICORE void tilePhaseA(bool freeSlot) {
   using L = Layout<R, C, S>;
 
-  if constexpr (C != 16) {
+  if constexpr (!(C == 16 && R == 16)) {
     // General body, same cut: right multiply, then park T in L1. X is the LEFT
     // operand here (and T the right one in phase B), the mirror of the C == 16
     // case, so the two share Layout's slot helpers and capacity asserts.
@@ -859,7 +877,7 @@ template <uint32_t R, uint32_t C, uint32_t S, bool Par, event_t EvPA,
 AICORE void tilePhaseB(__gm__ half *y, uint32_t sample, uint32_t rows) {
   using L = Layout<R, C, S>;
 
-  if constexpr (C != 16) {
+  if constexpr (!(C == 16 && R == 16)) {
     // General body: left multiply on the concatenated view, then store each
     // sample separately. The fixpipe L0C->GM path is 2D-to-2D only, so these
     // cannot be folded into one strided descriptor -- a 5D scatter faults.

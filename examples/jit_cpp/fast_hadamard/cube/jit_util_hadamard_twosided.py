@@ -144,8 +144,40 @@ def twosided_block_dim_schedule(batch: int, n: int, max_block_dim: int) -> int:
     return -(-tiles // -(-tiles // cores))
 
 
+# Per-N override of the Kronecker split, same env-switch idiom as _BLOCK.
+# The balanced split minimises MACs -- the two-sided cost is N * (R + C) per
+# sample, minimal at R == C == sqrt(N) -- but C == 16 is what makes BOTH GM
+# legs conversion-free at any S (Layout::kNzGm), because a 16-column tile is a
+# single NZ block-column and its NZ image IS the row-major bytes. So the two
+# objectives compete, and which wins is a measurement. MUST agree with
+# FAST_HADAMARD_TWOSIDED_CASES: a disagreement sizes the operand buffers for a
+# split the kernel is not running and it computes garbage.
+#   PTO_TS_SPLIT="1024:64x16,2048:128x16"
+def _parse_split_env(raw: str) -> dict:
+    out = {}
+    for item in raw.split(","):
+        if not item.strip():
+            continue
+        n, _, rc = item.partition(":")
+        r, _, c = rc.partition("x")
+        out[int(n)] = (int(r), int(c))
+    return out
+
+
+# MUST mirror FAST_HADAMARD_TWOSIDED_CASES (test_tile_table_mirrors_the_kernel
+# is the gate). C == 16 at N=512 is MAC-neutral -- the cost is N * (R + C) and
+# 16 + 32 == 32 + 16 -- and at N=1024 it costs 25% more MACs, which measured
+# free because the cube is 1-7% of device time at these sizes while the
+# transfers are not.
+_SPLIT_DEFAULT = {512: (32, 16), 1024: (64, 16)}
+_SPLIT = _parse_split_env(os.environ.get("PTO_TS_SPLIT", "")) or dict(
+    _SPLIT_DEFAULT)
+
+
 def hadamard_split(n: int) -> tuple[int, int]:
-    """Balanced Kronecker split H_n = H_rows (x) H_cols, rows <= cols."""
+    """Kronecker split H_n = H_rows (x) H_cols; balanced unless overridden."""
+    if int(n) in _SPLIT:
+        return _SPLIT[int(n)]
     log2_n = n.bit_length() - 1
     rows_log2 = log2_n // 2
     return 1 << rows_log2, 1 << (log2_n - rows_log2)
@@ -253,6 +285,14 @@ def hadamard_factors(n: int, device, block: int | None = None):
 # and nowhere else: swept over every tile size, N=1024 through 4096 peak at
 # 0.98-1.12x. See the README.
 _BITPLAN_TILE = {512: 8192}
+# Minimum batch at which the bit-plan path is actually worth taking. It buys
+# conversion-free transfers with MACs, and it was fitted when the classic path
+# at N=512 still did a 32-byte-per-row operand gather. Since that fix (1.84x)
+# and the C == 16 split (which gets conversion-free legs structurally, for no
+# MACs), bit-plan only wins at very large batch -- measured against the split
+# it is 1.07x - 1.40x SLOWER from batch 16 to 2048 and 1.02x - 1.08x faster
+# from 8192 up. Below this it is a pessimisation, so the classic path takes it.
+_BITPLAN_MIN_BATCH = {512: 8192}
 _BITPLAN_CACHE: dict = {}
 
 
@@ -372,7 +412,9 @@ def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE):
         # ops issued after the pointer was read, so a hoisted pointer races the
         # operand tensors into existence -- which shows up only on the FIRST
         # call at each N, as a moving set of wrong answers.
-        plan = bitplan_operands(resolved_n, x.device)
+        plan = (bitplan_operands(resolved_n, x.device)
+                if resolved_batch >= _BITPLAN_MIN_BATCH.get(resolved_n, 0)
+                else None)
         h_left, h_right = hadamard_factors(resolved_n, x.device)
         bulk = 0
         if plan is not None:

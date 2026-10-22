@@ -2120,6 +2120,205 @@ two-channel defect -- so it is a project, not a tweak. Note that blocking's
 measured 1.5x - 1.8x loss does **not** condemn it: that number is aliasing plus
 an M-sized matmul, and only the second half is the expensive part.
 
+#### How far the operand fix extends: nothing left below N=2048, 1.14x still there at N=8192/16384
+
+Asked whether the N=256/512 operand win extends upward. The question has an
+exact answer, because the operand load can simply be **deleted**: strip the four
+`TLOAD`s from `loadHadamardFactors` (keeping the `TMOV`s, the `Sync`s and all
+compute, so only the GM leg goes) and the ratio is a hard ceiling on everything
+operand-transfer-related. A wrong-answer probe -- device time here is
+data-independent -- built from one path with a null arm, 4 rotated passes, 60
+reps:
+
+|       N | b1 | b8 | b32 | b128 | b1024 | b16384 | worst-case us |
+|---|---:|---:|---:|---:|---:|---:|---:|
+|   256 | 1.0156 | 1.0000 | 1.0147 | 1.0000 | 1.0042 | 0.9966 | +0.02 |
+|   512 | 1.0308 | 1.0036 | 1.0128 | 1.0000 | 1.0062 | 1.0008 | +0.04 |
+|  1024 | 1.0153 | 1.0137 | 1.0114 | 1.0000 | 1.0045 | 1.0000 | +0.02 |
+|  2048 | 1.0466 | 1.0800 | 1.0265 | 1.0178 | 1.0078 | 1.0023 | +0.13 |
+|  4096 | 1.0700 | 1.0655 | 1.0270 | 1.0219 | 1.0066 | 0.9981 | +0.11 |
+|  8192 | **1.1350** | 1.1143 | 1.0920 | 1.0565 | 1.0162 | 1.0004 | +0.25 |
+| 16384 | **1.1411** | 1.1277 | 1.0952 | 1.0488 | 1.0103 | 0.9987 | +0.45 |
+| 32768 | 1.0140 | 1.0097 | 1.0100 | 1.0047 | 1.0017 | 1.0002 | +0.50 |
+
+null band 0.9898 - 1.0078, geomean 1.0002.
+
+Two readings, and they point opposite ways.
+
+**At N=256..1024 the fix is complete.** Deleting the operands outright is now
+worth 1.00x - 1.03x, i.e. 0.02 us. There is no residue to chase: the `GmNz`
+change captured essentially the whole prologue. That also confirms the
+diagnosis -- what was expensive was never the bytes (512 of them) but the
+32-byte descriptor rows, and severity scales as 1/row-length, which is why the
+same change read 1.00x - 1.05x from N=1024 up where the rows are already
+64 - 512 bytes.
+
+**At N=8192 and N=16384 a different defect is still there**, and it was never
+measured before because the narrow-row story did not predict it. 1.14x at
+batch 1, still 1.05x at batch 128, 0.25 - 0.45 us against a 2 - 3 us kernel. It
+is not a layout problem -- those operands are already one contiguous NZ burst
+with 256-byte rows. It is **volume**: 40 KB per core at N=8192 (64x64 plus
+128x128) and 64 KB at N=16384 (two 128x128), against 1 KB at N=256, sitting on
+MTE2 in front of the first data tile. 64 KB at a plausible single-core MTE2
+rate is ~0.5 us, which is the order measured, so the arithmetic corroborates.
+It decays with batch exactly as a fixed per-core cost should.
+
+Layout cannot shrink it, and the fix is not a layout change at all.
+
+#### Taken: when R == C the kernel was reading the same matrix from GM twice (1.0493x at N=16384)
+
+`R == C` makes `H_R` and `H_C` **the same matrix** -- both are the Sylvester
+`H` of that size -- and the case table has four such sizes: N=256, 1024, 4096
+and **16384**, the worst cell above. The kernel was loading that matrix from GM
+once for L0A and again for L0B. H is symmetric, so the left operand needs no
+transpose, and both `TMOV`s read the same NZ bytes: **one L1 copy can feed
+both**. `Layout::kShareHf = (R == C) && !kBlkA && !kBlkB` skips the second
+`TLOAD` and points phase B's L0B move at `kL1Hl`.
+
+`kL1Hc` is left reserved so `kL1X` and the ring are untouched, which keeps the
+change confined to the prologue -- and makes the four `R != C` sizes an
+**in-binary control**, since `kShareHf` is false there and their device code is
+unchanged. Measured (pre / share, 5 rotated passes x 60 reps):
+
+|       N | b1 | b2 | b4 | b8 | b16 | b32 | b64 | b128 | b512 | b4096 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+|   256 | 1.0000 | 1.0000 | 1.0156 | 1.0152 | 1.0149 | 1.0147 | 1.0000 | 1.0000 | 1.0000 | 1.0000 |
+|  1024 | 1.0071 | 1.0143 | 1.0141 | 1.0137 | 1.0000 | 0.9941 | 1.0000 | 1.0000 | 1.0000 | 0.9915 |
+|  4096 | 1.0000 | 1.0247 | 1.0241 | 1.0224 | 1.0204 | 1.0088 | 1.0078 | 1.0061 | 1.0136 | 1.0014 |
+| **16384** | **1.0441** | 1.0435 | **1.0493** | 1.0392 | 1.0355 | 1.0273 | 1.0250 | 1.0189 | 1.0051 | 1.0011 |
+
+`R == C` geomean 1.0127 over 40 cells, worst 0.9915; **control (R != C)
+geomean 1.0001**, band 0.9863 - 1.0154; null arm 0.9846 - 1.0086. 864/864 fp64
+cases pass, worst rel_rms 3.264e-04 (at N=512, which does not use the path --
+the pre-existing fp16 floor).
+
+The absolute column is what identifies the mechanism: at N=16384 it is
+**+0.12 us at every batch from 1 to 4096**, dead flat. That is one 32 KB GM
+read per core, removed -- exactly a fixed per-core cost, not a scaling effect.
+
+The kernel now *depends* on the two operand buffers holding identical bytes,
+and nothing in `_factor_buffer` enforces it: give either side its own
+convention and the kernel silently multiplies by the wrong matrix on the side
+it no longer reads. `test_shared_factor_sizes_have_identical_operand_buffers`
+parses the case table for `R == C` rows and asserts `torch.equal` on the pair.
+
+#### Still open: N=8192, and why blocking is the only remaining lever
+
+N=8192 is untouched -- R=64, C=128, so there is nothing to share -- and keeps
+its 1.135x ceiling. The only thing that can shrink those bytes is the
+compile-time operand freedom itself: `H_128 = H_2 (x) H_64`, so the blocked
+form applies `+-H_64` twice on half the operand bytes. That is the
+`kBlkA`/`kBlkB` path the kernel already runs at N=32768 -- which reads 1.014x
+in the table above, the lowest, consistent with its smaller blocked operands.
+Blocking's measured cost here is 1.5x - 1.8x against a <=1.135x prize, so
+expect it to lose; but see the caveat above, that number is aliasing plus an
+M-sized matmul and only the second half is expensive. H_64 is also literally
+the top-left block of H_128, but in NZ that sub-block is 4 strided 2 KB chunks
+rather than one burst, and it is only 8 KB of the 40 KB -- scaling from the
+N=16384 result, worth ~0.03 us, i.e. under the null band. Not worth the risk.
+
+The honest ordering, though: after the fix above, N=16384 has ~1.09x of this
+class left at batch 1 and ~1.00x in bulk, while the N=32768 column-block
+serialization below is worth ~1.78x wherever it applies. That is where the
+large-N work is.
+
+#### The split is a free variable, and C == 16 buys conversion-free GM legs (1.1793x)
+
+`hadamard_split` returned the **balanced** split, and the kernel's case table
+mirrored it. Balanced minimises MACs -- the two-sided cost is `N * (R + C)` per
+sample, minimal at `R == C == sqrt(N)` -- but it is not the only objective.
+`Layout::kNzGm` is `(C == 16) || (S == 1 && !kBlockIt)`, and the `C == 16` arm is
+there because **a 16-column tile is a single NZ block-column, so its NZ image IS
+the row-major bytes**: the ND2NZ permutation is the identity and BOTH GM legs go
+conversion-free at any S. The balanced split throws that away for every size
+except N=256.
+
+The two objectives can be priced against each other:
+
+|    N | balanced | C == 16 form | R + C | MAC cost |
+|---|---|---|---:|---:|
+|  512 | 16 x 32 | **32 x 16** | 48 -> 48 | **neutral** |
+| 1024 | 32 x 32 | **64 x 16** | 64 -> 80 | +25% |
+| 2048 | 32 x 64 | 128 x 16 | 96 -> 144 | +50% |
+| 4096 | 64 x 64 | 256 x 16 | 128 -> 272 | +113%, and R=256 forces blocking |
+
+N=512 is **free**: `16 + 32 == 32 + 16`. And the +25% at N=1024 is nearly free
+for a different reason -- the audit put the cube at 1-7% of device time below
+N=16384, so MACs are the one resource there is slack in, while the transfers
+are not. Measured (balanced / C==16, 5 rotated passes x 60 reps, null band
+0.9902 - 1.0143):
+
+|    N | b1 | b8 | b32 | b128 | b512 | b2048 | b8192 | b32768 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+|  512 | 1.0000 | 1.0286 | 1.0194 | 1.0211 | 1.0645 | 1.0646 | 1.1406 | **1.1551** |
+| 1024 | 0.9772 | 1.0137 | 1.0595 | 1.0446 | 1.0031 | 1.0868 | 1.1400 | **1.1734** |
+
+The win **grows with batch**, which is the signature of a per-byte transfer
+saving rather than a fixed cost, and it is paid for at batch 1 at N=1024
+(0.956x in the final sweep, +0.06 us) where there is no volume to amortise the
+extra MACs. N=2048 is left balanced: +50% MACs for the same class of win.
+
+**A latent fault this uncovered.** `X(1024, 64, 16, 8)` compiled and **faulted
+the aicore** with an MTE range error. The `C == 16` tile bodies reinterpret the
+loaded `(S*R x 16)` tile as `(R x S*R)` -- "read wide" -- and that is
+byte-compatible only when `S*R*16 == S*R*R`, i.e. **R == 16**. They were
+written for N=256, the only `C == 16` row at the time, and no assert captured
+the assumption. The bodies now gate on `R == C == 16` and everything else takes
+the general body, which handles any `(R, C)`. **That predicate change is
+byte-identical on the shipped table** (N=256 is the only row with `C == 16` and
+it has `R == 16`), so it is a pure safety fix -- proved by `cmp` on the `.so`
+from one build path, not by a timing.
+
+#### The bit-plan floor had to move: its baseline got 1.84x faster underneath it
+
+`_BITPLAN_TILE = {512: 8192}` routed **every** batch >= 16 at N=512 through the
+bit-plan path. That was fitted when the classic path still did the 32-byte-per-
+row operand gather. Since the `GmNz` fix (1.84x at N=512) and now the `32 x 16`
+split, the classic path is much faster and the comparison inverts. Three ways
+to do N=512, device us per launch:
+
+| batch | classic (16x32) | bit-plan (shipped) | split (32x16) | split / bit-plan |
+|---|---:|---:|---:|---:|
+|    16 | 1.48 | 2.04 | 1.46 | **1.3973** |
+|    32 | 1.58 | 2.08 | 1.56 | 1.3333 |
+|   128 | 1.96 | 2.34 | 1.90 | 1.2316 |
+|   512 | 2.66 | 2.86 | 2.50 | 1.1440 |
+|  2048 | 4.43 | 4.48 | 4.18 | 1.0719 |
+|  8192 | 10.74 | 9.42 | 9.60 | 0.9811 |
+| 32768 | 36.10 | 28.92 | 31.27 | 0.9249 |
+
+Bit-plan was **1.23x - 1.40x slower than the path it replaced** from batch 16 to
+2048, and only pays from ~8192 up. `_BITPLAN_MIN_BATCH = {512: 8192}` gates it
+there. It keeps its large-batch win (1.08x over the split at 32768), so it is
+gated, not deleted.
+
+Two cautions this leaves on record. First, **an optimisation's verdict expires
+when its baseline changes**; bit-plan's 2.19x - 2.42x was true against the
+kernel of the time. Anything fitted as "X beats Y" needs re-running after Y
+improves. Second, raising the floor moved the bit-plan path **out of test
+coverage** -- batches 22 and 65 used to exercise it and now take the classic
+path -- so `test_bitplan_floor_boundaries` straddles the floor and crosses a
+whole-tile boundary to keep both the bulk launch and the bulk-plus-remainder
+split exercised.
+
+#### Why the L0C turnaround cannot absorb a layout change (it already absorbs the free one)
+
+Asked whether the permutation could be folded into the `L0C -> L1` turnaround,
+which moves anyway. It already is, where it is free: `tilePhaseA` writes the
+accumulator as `(R x S*R)` and re-reads the same bytes as `(kStackRows x C)`,
+and the general body's `TEXTRACT` loop turns a vertical stack into a horizontal
+concatenation by choosing each block's L1 offset. Both are **reinterprets** --
+the NZ images coincide, so no data moves.
+
+What is not available there is a permutation that is *not* the identity on the
+bytes. The fixpipe does ND and NZ, not an arbitrary bit permutation, so a
+non-trivial reorder costs one `TMOV` per fractal group, i.e. **FIX
+descriptors** -- and FIX is the measured bottleneck at N=512..8192 (store
+13-39% plus turnaround 7-30%) while MTE2 is never above 8%. Paying the
+bottleneck to relieve the idlest pipe is the wrong direction. The `C == 16`
+split above is the better form of the same idea: it makes the permutation the
+identity **by construction**, instead of hiring a pipe to perform it.
+
 #### Found by audit, measured, not yet taken
 
 A function-by-function pass over the kernel with per-pipe "delete one resource,

@@ -11,6 +11,10 @@ from cube.jit_util_hadamard_twosided import (
     _SAMPLES_PER_TILE,
     _TILES_MID,
     _TILES_TALL,
+    _BITPLAN_MIN_BATCH,
+    _BITPLAN_TILE,
+    hadamard_factors,
+    hadamard_split,
     twosided_block_dim_schedule,
     validate_twosided_args,
 )
@@ -155,10 +159,55 @@ def test_tile_table_mirrors_the_kernel():
         n = int(n)
         s = int(samples) if samples.isdigit() else define(samples)
         assert int(rows_) * int(cols) == n, f"R * C != N for N={n}"
+        # The host sizes the OPERAND BUFFERS from hadamard_split. A split the
+        # kernel is not running hands it a wrong-shaped H and it computes
+        # garbage, so this one is a correctness gate, not a schedule gate.
+        assert hadamard_split(n) == (int(rows_), int(cols)), (
+            f"N={n}: kernel splits as {(int(rows_), int(cols))}, host "
+            f"hadamard_split says {hadamard_split(n)}")
         assert _SAMPLES_PER_TILE[n] == s, (
             f"N={n}: kernel tile is {s} samples, host table says "
             f"{_SAMPLES_PER_TILE[n]}")
 
+
+
+
+@pytest.mark.parametrize("n", sorted(_BITPLAN_MIN_BATCH))
+def test_bitplan_floor_boundaries(twosided_hadamard_kernel, npu_device, n):
+    """The bit-plan path only runs at or above `_BITPLAN_MIN_BATCH` now, which
+    moved it out of the batch range the other correctness tests cover. Straddle
+    the floor and cross a whole-tile boundary, so both the bulk launch and the
+    bulk-plus-ragged-remainder split are exercised."""
+    floor = _BITPLAN_MIN_BATCH[n]
+    samples = _BITPLAN_TILE[n] // n
+    for batch in (floor - 1, floor, floor + 1, floor + samples):
+        check_shape(twosided_hadamard_kernel, npu_device, batch, n)
+
+def test_shared_factor_sizes_have_identical_operand_buffers(npu_device):
+    """When R == C the two Hadamard factors are the same matrix, and
+    `Layout::kShareHf` has the kernel read ONE GM buffer into one L1 copy and
+    feed both L0A and L0B from it -- worth 32 KB per core of MTE2 at N=16384.
+    That makes the kernel depend on the two buffers holding identical bytes,
+    and nothing in `_factor_buffer` enforces it: give either side its own
+    convention (a transpose, a different NZ image, a sign) and the kernel
+    silently multiplies by the wrong matrix on the side it no longer reads.
+    """
+    src = (pathlib.Path(__file__).resolve().parent
+           / "fast_hadamard_twosided.cpp").read_text()
+    assert "kShareHf = (R == C)" in src, (
+        "Layout::kShareHf changed shape -- re-derive which sizes share a "
+        "buffer before trusting this test")
+
+    rows = re.findall(r"^  X\((\d+), (\d+), (\d+), ([A-Za-z0-9_]+)\)",
+                      src, re.M)
+    shared = [int(n) for n, r, c, _ in rows if int(r) == int(c)]
+    assert shared, "no R == C size left in the case table"
+
+    for n in shared:
+        h_left, h_right = hadamard_factors(n, npu_device)
+        assert torch.equal(h_left, h_right), (
+            f"N={n}: R == C, so the kernel reads h_left for both sides, but "
+            "the two operand buffers do not match")
 
 def test_batch_partition_boundaries(twosided_hadamard_kernel, npu_device):
     n = 1024
