@@ -561,6 +561,7 @@ AICORE void hadamardTile(__gm__ half *y, uint32_t sample, bool freeSlot,
     }
     Sync<PIPE_M, PIPE_FIX>(EV_SEQ);
 
+    // Row sub-blocks, so these must stay ND whatever C is -- see kNzGm.
     for (uint32_t a = 0; a < L::kR1; ++a) {
       for (uint32_t sm = 0; sm < S; ++sm) {
         TileAcc<float, L::kMa, C> acc_block;
