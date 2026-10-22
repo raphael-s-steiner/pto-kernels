@@ -2520,8 +2520,35 @@ Measured, two bodies -> one, 54 cells, 5 rotated passes x 50 reps:
 | **ALL** | **1.0009** | 0.9750 |
 
 null geomean 0.9990, band 0.9844 - 1.0123. Every per-N geomean is inside the
-null band, so **applying H_C first at every size is free** -- the 1.28x was
-always the descriptor count and never the ordering. 864/864 fp64 cases pass.
+null band, and the 1.28x was always the descriptor count, never the ordering.
+864/864 fp64 cases pass.
+
+**But "free" is a statement about the geomean, and a tighter sweep shows it
+averages over a SIGN FLIP.** 6 rotated passes x 80 reps at the two sizes with
+unequal factors, with the tile height the dispatch actually picks:
+
+| N | S | batches | larger-first / smaller-first | winner |
+|---|---:|---|---|---|
+| 1024 | 2, 4 | 2 - 64 | 1.0239 - **1.0417** | **larger-first** |
+| 1024 | 8 | 128 - 32768 | 0.9704 - 0.9954 | **smaller-first**, to 1.030x |
+| 512 | 4, 8 | 1 - 128 | 1.0000 - 1.0072 | tie |
+| 512 | 16 | 256 - 32768 | 0.9682 - 1.0010 | **smaller-first**, to 1.033x |
+
+12 of 14 cells at N=1024 fall outside the null band (0.9948 - 1.0079), so this
+is structure, not scatter. The sign is set by the **tile height**, not the
+batch: the crossover at N=1024 sits exactly at batch 128 = `TILES_TALL * S`,
+the tier boundary. **The tall tile always prefers smaller-first**, at both
+sizes; the short tiles prefer larger-first only where the MAC split is lopsided
+(`R/C` = 4 at N=1024, where the two matmuls are 524k and 131k MACs; `R/C` = 2 at
+N=512 reads as a tie).
+
+So order is worth up to ~4%, in whichever direction the tile height says, and
+the net over a batch sweep is ~0 because the regions cancel. Keeping the single
+body is still right: it carries **smaller-first, which is the correct order for
+the tall tile**, and the tall tile is where the absolute time is (54 us at batch
+32768 against 1.4 us at batch 8). The ~4% left at N=1024's short tiles is
+0.06 us, under the 46 us host launch floor, and collecting it means carrying
+both orders -- more generated code, which is the opposite of the point here.
 
 So the kernel now runs **one** tile body, right-multiply-first everywhere, and
 "larger factor first" is abandoned with no cost, which is the cleanest proof
