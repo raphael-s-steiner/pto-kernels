@@ -195,83 +195,6 @@ def hadamard_factors(n: int, device, block: int | None = None):
     return cached
 
 
-# --- the bit-plan tile ----------------------------------------------------
-#
-# Conversion-free GM transfers (Layout::NZ on both legs) need the kernel's view
-# of the tile to be the NZ regrouping of the GM byte index, which for S > 1
-# samples lifts the high column bits above the SAMPLE index -- an ordinary
-# H_R / H_C pair cannot undo that. But the operands are compile-time constants
-# and need not be Hadamard matrices: H_N is a tensor power of H_2, so the
-# transform applies H_2 to each index bit independently, and a matmul applies
-# whatever we choose to one FIELD of the byte index. For an (A x B) NZ view,
-#
-#     p = [ col_hi | row_hi | row_lo | col_lo ]
-#           t-1..a+4  a+3..8   7..4     3..0
-#
-# the left operand owns p[4, a+4) and the right owns p[0,4) u p[a+4, t), and
-# correctness is pure bit accounting:
-#
-#     every transform bit gets H_2 exactly once; every sample bit gets I_2.
-#
-# Each operand is the tensor product over its field, in bit order, of H_2 for a
-# transform bit and I_2 for a sample bit. There is no new kernel code: it is the
-# existing S == 1 body driven with T-sized "samples".
-#
-# The price is MACs -- A + B = 2*sqrt(T) per value instead of 2*sqrt(N) -- so it
-# only pays where the per-tile descriptor count dominates, which is N=512 alone.
-_BITPLAN_TILE = {512: 8192}
-# Minimum batch at which the bit-plan path is worth taking: it pays MACs for
-# conversion-free transfers, which the classic path's C == 16 split already gets
-# structurally, so below this it is a pessimisation and the classic path runs.
-_BITPLAN_MIN_BATCH = {512: 8192}
-_BITPLAN_CACHE: dict = {}
-
-
-def bitplan_view(n: int, tile: int):
-    """(A, B, row_bits, col_bits) for the (A x B) NZ view of a `tile`-element tile.
-
-    `a` is balanced so that A + B -- the MAC cost per value -- is minimal, and
-    clamped so both operands stay within L0A/L0B (<= 128 wide for fp16).
-    """
-    t = tile.bit_length() - 1
-    a = min(max(t // 2, max(4, t - 7)), min(7, t - 4))
-    A, B = 1 << a, 1 << (t - a)
-    if A * B != tile:
-        raise ValueError(f"no valid view for tile={tile}")
-    row_bits = list(range(a + 3, 7, -1)) + list(range(7, 3, -1))
-    col_bits = list(range(t - 1, a + 3, -1)) + list(range(3, -1, -1))
-    assert sorted(row_bits + col_bits) == list(range(t)), "fields must partition p"
-    return A, B, row_bits, col_bits
-
-
-def _bit_operand(bits, n_log2: int, device):
-    """Tensor product over `bits` (high to low) of H_2 on a transform bit
-    (index < n_log2, i.e. inside one sample) and I_2 on a sample bit."""
-    m = torch.ones((1, 1), dtype=torch.float32)
-    h2 = torch.tensor([[1.0, 1.0], [1.0, -1.0]])
-    for b in bits:
-        m = torch.kron(m, h2 if b < n_log2 else torch.eye(2))
-    # Read by the very same loads as the ordinary factors, so a row-major
-    # bit-plan operand would be silently permuted.
-    return _to_nz(m.to(device=device, dtype=torch.float16).contiguous())
-
-
-def bitplan_operands(n: int, device):
-    """Cached (OpA, OpB) device buffers for n's bit-plan tile, or None."""
-    tile = _BITPLAN_TILE.get(n)
-    if tile is None:
-        return None
-    key = (n, device)
-    cached = _BITPLAN_CACHE.get(key)
-    if cached is None:
-        A, B, row_bits, col_bits = bitplan_view(n, tile)
-        n_log2 = n.bit_length() - 1
-        cached = (_bit_operand(row_bits, n_log2, device),
-                  _bit_operand(col_bits, n_log2, device), tile // n)
-        _BITPLAN_CACHE[key] = cached
-    return cached
-
-
 def validate_twosided_args(x, y):
     if x.dim() != 2 or y.dim() != 2:
         raise ValueError("x and y must be 2D tensors with shape [batch, n].")
@@ -337,54 +260,23 @@ def load_lib(lib_path, block_dim=None, device: str | int = DEFAULT_DEVICE):
             else resolve_launch_block_dim(block_dim, resolved_block_dim)
         )
 
-        # Build every device buffer BEFORE resolving a stream pointer, and
-        # resolve one per launch: resolving drains torch_npu's task queue, so a
-        # hoisted pointer lets the raw ctypes launch jump ahead of the torch ops
-        # that build the operands -- wrong answers on the first call at each N.
-        plan = (bitplan_operands(resolved_n, x.device)
-                if resolved_batch >= _BITPLAN_MIN_BATCH.get(resolved_n, 0)
-                else None)
+        # Build the operands BEFORE resolving the stream pointer: resolving is
+        # what drains torch_npu's task queue, so a hoisted pointer lets the raw
+        # ctypes launch jump ahead of the torch ops that build them -- wrong
+        # answers on the first call at each N.
         h_left, h_right = hadamard_factors(resolved_n, x.device)
-        bulk = 0
-        if plan is not None:
-            op_a, op_b, samples_per_tile = plan
-            # Whole bit-plan tiles only; a ragged remainder goes to the classic
-            # path below. The tile is `samples_per_tile` samples seen as ONE
-            # T-element row, which is a plain reinterpret of the same buffers.
-            tiles = resolved_batch // samples_per_tile
-            if tiles:
-                bulk = tiles * samples_per_tile
-                tile_n = samples_per_tile * resolved_n
-                kernel(
-                    twosided_block_dim_schedule(tiles, tile_n, resolved_block_dim)
-                    if block_dim is None
-                    else launch_block_dim,
-                    resolve_stream_ptr(stream_ptr),
-                    torch_to_ctypes(x),
-                    torch_to_ctypes(y),
-                    torch_to_ctypes(op_a),
-                    torch_to_ctypes(op_b),
-                    tiles,
-                    tile_n,
-                )
-        if bulk == resolved_batch:
-            return
-
-        rest = resolved_batch - bulk
         kernel(
-            launch_block_dim if bulk == 0 else twosided_block_dim_schedule(
-                rest, resolved_n, resolved_block_dim),
+            launch_block_dim,
             resolve_stream_ptr(stream_ptr),
-            torch_to_ctypes(x[bulk:] if bulk else x),
-            torch_to_ctypes(y[bulk:] if bulk else y),
+            torch_to_ctypes(x),
+            torch_to_ctypes(y),
             torch_to_ctypes(h_left),
             torch_to_ctypes(h_right),
-            rest,
+            resolved_batch,
             resolved_n,
         )
 
     hadamard_func.block_dim = resolved_block_dim
-    hadamard_func.bitplan_sizes = sorted(_BITPLAN_TILE)
     return hadamard_func
 
 

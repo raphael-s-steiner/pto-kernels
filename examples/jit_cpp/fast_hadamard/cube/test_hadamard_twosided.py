@@ -14,8 +14,6 @@ from cube.jit_util_hadamard_twosided import (
     _SAMPLES_PER_TILE,
     _TILES_MID,
     _TILES_TALL,
-    _BITPLAN_MIN_BATCH,
-    _BITPLAN_TILE,
     hadamard_factors,
     hadamard_split,
     twosided_block_dim_schedule,
@@ -180,19 +178,6 @@ def test_tile_table_mirrors_the_kernel():
             f"{_SAMPLES_PER_TILE[n]}")
 
 
-
-
-@pytest.mark.parametrize("n", sorted(_BITPLAN_MIN_BATCH))
-def test_bitplan_floor_boundaries(twosided_hadamard_kernel, npu_device, n):
-    """The bit-plan path runs only at or above `_BITPLAN_MIN_BATCH`, outside
-    the range the other correctness tests cover. Straddle the floor and cross a
-    whole-tile boundary, so both the bulk launch and the bulk-plus-remainder
-    split run."""
-    floor = _BITPLAN_MIN_BATCH[n]
-    samples = _BITPLAN_TILE[n] // n
-    for batch in (floor - 1, floor, floor + 1, floor + samples):
-        check_shape(twosided_hadamard_kernel, npu_device, batch, n)
-
 def test_shared_factor_sizes_have_identical_operand_buffers(npu_device):
     """When R == C, `Layout::kShareHf` has the kernel read ONE GM buffer and
     feed both L0A and L0B from it, so the two host buffers must hold identical
@@ -216,6 +201,7 @@ def test_shared_factor_sizes_have_identical_operand_buffers(npu_device):
         assert torch.equal(h_left, h_right), (
             f"N={n}: R == C, so the kernel reads h_left for both sides, but "
             "the two operand buffers do not match")
+
 
 def test_batch_partition_boundaries(twosided_hadamard_kernel, npu_device):
     """The launch splits whole tiles over the cores, so cross the point where

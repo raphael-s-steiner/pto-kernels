@@ -8,10 +8,11 @@ import pytest
 import torch
 
 from auto.jit_util_hadamard_auto import (
-    BITPLAN_BATCH_MIN,
     MAX_AUTO_N,
     MIN_AUTO_N,
+    ONESIDED_BATCH_MIN,
     ONESIDED_MAX_N,
+    TWOSIDED_MIN_N,
     pick_implementation,
     supported_auto_sizes,
 )
@@ -68,28 +69,45 @@ def _assert_matches_reference(y, ref):
 
 @pytest.mark.parametrize("n", ALL_HIDDEN_DIMS)
 def test_routing_is_the_measured_crossover(n):
-    expected = "onesided" if n <= ONESIDED_MAX_N else "twosided"
+    expected = "onesided" if n < TWOSIDED_MIN_N else "twosided"
     assert pick_implementation(n) == expected
 
 
 @pytest.mark.parametrize("batch,expected", [
-    (1, "onesided"), (16, "onesided"), (128, "onesided"),
-    (BITPLAN_BATCH_MIN, "twosided"), (1024, "twosided"), (16384, "twosided"),
+    (1, "twosided"), (16, "twosided"), (1024, "twosided"),
+    (ONESIDED_BATCH_MIN[256] - 1, "twosided"),
+    (ONESIDED_BATCH_MIN[256], "onesided"),
+    (4 * ONESIDED_BATCH_MIN[256], "onesided"),
 ])
-def test_n512_routing_follows_batch(batch, expected):
-    """N=512 is the one size where batch moves the choice.
+def test_n256_routing_follows_batch(batch, expected):
+    """N=256 is the one size where batch moves the choice: both kernels hit the
+    memory roofline there, and past the floor the one-sided store pattern is
+    the better of the two by 1.03-1.04x. Below it the split wins by up to
+    1.29x."""
+    assert pick_implementation(256, batch) == expected
 
-    The two-sided kernel's bit-plan tile wins there from batch 256 up, by
-    1.01x to 1.69x; below it the one-sided kernel holds a flat 1.04-1.06x.
-    """
-    assert pick_implementation(512, batch) == expected
 
-
-@pytest.mark.parametrize("n", [64, 128, 256])
-def test_batch_does_not_move_routing_below_512(n):
-    """Only N=512 is a crossover; the rest are decided by N alone."""
-    for batch in (1, 16, 1024, 16384):
+@pytest.mark.parametrize("n", [64, 128])
+def test_batch_does_not_move_routing_below_the_split(n):
+    """Below N=256 there is no R * C with both factors 16-aligned, so the
+    one-sided kernel is the only one that runs at any batch."""
+    for batch in (1, 16, 1024, 16384, 1 << 20):
         assert pick_implementation(n, batch) == "onesided"
+
+
+@pytest.mark.parametrize("n", [512, 1024, 16384, 32768])
+def test_batch_does_not_move_routing_above_256(n):
+    """Everywhere above N=256 the split wins at every batch, and from 1024 up
+    it is the only kernel that runs at all."""
+    for batch in (1, 16, 1024, 16384, 1 << 20):
+        assert pick_implementation(n, batch) == "twosided"
+
+
+def test_onesided_floors_are_inside_the_overlap():
+    """A floor at an N only one kernel reaches would be unreachable, and at an
+    N the one-sided kernel refuses it would route to a ValueError."""
+    for n in ONESIDED_BATCH_MIN:
+        assert TWOSIDED_MIN_N <= n <= ONESIDED_MAX_N
 
 
 def test_required_grid_is_inside_the_supported_range():

@@ -14,16 +14,21 @@ almost entirely by N:
         in UB.
 
 The one-sided product's MAC count grows 4x per doubling of N against 2x for its
-bytes, so it wins while N is small and loses once arithmetic dominates; the
-split's extra turnaround costs more than it saves while N is small. They cross
-between 512 and 1024, which is where this module switches.
+bytes, so it loses once arithmetic dominates. It holds the sizes the split
+cannot reach at all -- N < 256, where N = R * C with both factors 16-aligned
+has no solution -- and one corner of N=256, where both kernels are already at
+the memory roofline and the one-sided store pattern is the better of the two.
+Everywhere else the split runs, the split wins.
 
-**The vector kernel is not a branch here: it is never the fastest choice in the
-supported range.** Measured over the required grid (N 128..16384 x batch
-1/16/64/256/1024, msprof device time on 910B2, each kernel at its own best
-block_dim) it loses every one of the 40 cells, by 1.17x to 3.58x. It stays in
-`standard/` as the baseline these kernels are measured against, and because it
-is the only one that runs N below 64.
+**The vector kernel is not a branch here.** Measured over the required grid
+(N 128..16384 x bench_common.BENCH_BATCHES, msprof device time on 910B2, each
+kernel at its own best block_dim) it loses 100 of 104 cells, geomean 1.60x. The
+four it wins are N=128 at batch <= 8, worst 0.83x -- the one size with no split
+to fall back on, at batches too small to amortise a tile. Routing those few
+cells to a third back end would mean compiling a third kernel for the shape
+least likely to be worth it. It stays in `standard/` as the baseline these
+kernels are measured against, and because it is the only one that runs N below
+64; see cube/bench_cube_vs_vector.py.
 
 Supported N is the union of the two cube kernels: powers of two in
 [64, 32768]. The required grid, `bench_common.BENCH_HIDDEN_DIMS` =
@@ -47,32 +52,34 @@ from cube.jit_util_hadamard_onesided import (
 MIN_AUTO_N = MIN_ONESIDED_N          # 64
 MAX_AUTO_N = MAX_TWOSIDED_N     # 32768
 
-# The crossover, measured rather than reasoned (msprof device time, each kernel
-# at its own best block_dim). At N=1024 and above the split wins everywhere, and
-# below N=512 the one-sided kernel does, by enough that neither needs a batch
-# term; N=512 is the one size where batch moves the choice. See the README.
+# Only N >= 256 factors as R * C with both 16-aligned, so below this the
+# one-sided kernel is the only one that runs -- not a crossover, a capability.
+TWOSIDED_MIN_N = MIN_TWOSIDED_N      # 256
+
+# Above this the one-sided kernel refuses: its N*N MACs per sample grow 4x per
+# doubling against 2x for the bytes.
 ONESIDED_MAX_N = MAX_ONESIDED_N      # 512
 
-# N=512 is the one size where batch moves the choice, because the two-sided
-# kernel's bit-plan tile (see `bitplan_operands` in cube/) made it 1.73-2.47x
-# faster there and so turned a clear loss into a crossover. It needs 16 samples
-# to fill one tile, and a few tiles to fill the pipes; below that the one-sided
-# kernel's single-pipe-pass tile still wins. Device time in us, each at its own
-# best block_dim:
+# Where both run, the split wins -- measured, msprof device time, each kernel
+# at its own schedule, four interleaved passes with the arm order rotated and
+# a null arm reading 1.000x/1.003x. The margin is 1.01x - 1.29x at N=256 and
+# 1.25x - 1.82x at N=512, and it GROWS with batch at N=512 (the one-sided
+# kernel is compute-bound there) while it SHRINKS at N=256 (both reach the
+# memory roofline, and past batch 16384 the one-sided store pattern is
+# marginally the better of the two). Device time in us at N=256:
 #
-#   batch   onesided   twosided+bitplan
-#      16      2.140   2.260
-#      32      2.220   2.320
-#      64      2.310   2.440
-#     128      2.520   2.620
-#     256      2.840   2.820
-#    1024      4.300   3.850
-#    4096      8.901   6.430
-#   16384     27.090  16.020
+#   batch   onesided   twosided   onesided/twosided
+#      64      1.800      1.480   1.22
+#    1024      2.760      2.450   1.13
+#    8192      5.660      5.505   1.03
+#   16384      8.790      8.805   1.00
+#   32768     14.761     15.190   0.97
+#   65536     27.011     28.191   0.96
 #
-# One-sided holds a flat 1.04-1.06x below 256; above it the bit-plan runs away,
-# to 1.69x at batch 16384. 256 is where they cross.
-BITPLAN_BATCH_MIN = 256
+# So N=256 is the one size where batch moves the choice, and it moves it the
+# other way from what this module used to assume. Batch 16384 is a tie inside
+# the null band; the floor is set at the first batch with a margin to win.
+ONESIDED_BATCH_MIN = {256: 32768}
 
 
 def supported_auto_sizes() -> list[int]:
@@ -87,10 +94,9 @@ def supported_auto_sizes() -> list[int]:
 def pick_implementation(n: int, batch: int | None = None) -> str:
     """'onesided' or 'twosided' -- the faster kernel at this N (and batch).
 
-    N decides everywhere except N=512, where the two-sided kernel's bit-plan
-    tile moved the crossover into the middle of the batch range; see
-    BITPLAN_BATCH_MIN. Omitting `batch` keeps the small-batch answer, which is
-    the conservative one.
+    N decides everywhere except N=256, where both kernels are memory-bound and
+    the one-sided one edges ahead at very large batch; see ONESIDED_BATCH_MIN.
+    Omitting `batch` keeps the small-batch answer, which is the common one.
     """
     n = int(n)
     if not MIN_AUTO_N <= n <= MAX_AUTO_N:
@@ -102,11 +108,14 @@ def pick_implementation(n: int, batch: int | None = None) -> str:
         )
     if n & (n - 1):
         raise ValueError(f"n must be a power of two; got {n}.")
+    if n < TWOSIDED_MIN_N:
+        return "onesided"
     if n > ONESIDED_MAX_N:
         return "twosided"
-    if n == ONESIDED_MAX_N and batch is not None and int(batch) >= BITPLAN_BATCH_MIN:
-        return "twosided"
-    return "onesided"
+    floor = ONESIDED_BATCH_MIN.get(n)
+    if floor is not None and batch is not None and int(batch) >= floor:
+        return "onesided"
+    return "twosided"
 
 
 def jit_compile(
@@ -177,7 +186,8 @@ __all__ = [
     "MIN_AUTO_N",
     "MAX_AUTO_N",
     "ONESIDED_MAX_N",
-    "BITPLAN_BATCH_MIN",
+    "ONESIDED_BATCH_MIN",
+    "TWOSIDED_MIN_N",
     "MIN_TWOSIDED_N",
     "jit_compile",
     "pick_implementation",

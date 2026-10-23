@@ -16,8 +16,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import torch
 import torch_npu  # noqa: F401
 
-from cube.jit_util_hadamard_twosided import (bitplan_operands,
-                                            hadamard_factors)
+from cube.jit_util_hadamard_twosided import hadamard_factors
 from cube.jit_util_hadamard_onesided import hadamard_full
 from jit_util_common import get_current_stream_ptr, load_cdll, load_required_symbol
 
@@ -42,7 +41,6 @@ ONESIDED_ARGS = [
 # One .so per kind, so a config only needs `so` to point at a variant build.
 DEFAULT_SO = {
     "twosided": "cube/outputs/so/fast_hadamard_twosided_jit.so",
-    "bitplan": "cube/outputs/so/fast_hadamard_twosided_jit.so",
     "onesided": "cube/outputs/so/fast_hadamard_onesided_jit.so",
     "std": "standard/outputs/so/fast_hadamard_jit.so",
 }
@@ -96,18 +94,6 @@ def main():
                     ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(y.data_ptr()),
                     ctypes.c_void_p(h_left.data_ptr()),
                     ctypes.c_void_p(h_right.data_ptr()), batch, n)
-        elif kind == "bitplan":
-            # The conversion-free single-view tile: `batch` samples of width n
-            # driven as batch/samples_per_tile rows of T = A*B elements against
-            # the tensor-product operands. Same .so and entry point.
-            fn = kernel_for(so, TWOSIDED_ARGS)
-            op_a, op_b, spt = bitplan_operands(n, x.device)
-            tiles, tile_n = batch // spt, spt * n
-            assert tiles, f"batch {batch} is below one bit-plan tile ({spt})"
-            args = (block_dim, stream_ptr,
-                    ctypes.c_void_p(x.data_ptr()), ctypes.c_void_p(y.data_ptr()),
-                    ctypes.c_void_p(op_a.data_ptr()),
-                    ctypes.c_void_p(op_b.data_ptr()), tiles, tile_n)
         else:
             fn = kernel_for(so, STD_ARGS)
             args = (block_dim, stream_ptr, ctypes.c_void_p(x.data_ptr()),

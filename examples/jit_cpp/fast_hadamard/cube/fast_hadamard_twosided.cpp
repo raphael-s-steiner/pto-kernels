@@ -19,8 +19,8 @@ using namespace pto;
 // where the NZ image IS the row-major bytes, and at S == 1, where ND and NZ
 // differ by a permutation of the BIT FIELDS of the byte index, under which
 // H[i][j] = (-1)^popcount(i & j) is invariant, so an NZ load and an NZ store
-// cancel. S > 1 at C > 16 buys the same descriptor through the OPERANDS
-// instead -- bitplan_operands in jit_util_hadamard_twosided.py.
+// cancel. S > 1 at C > 16 keeps the gather; buying the burst there costs more
+// MACs than the gather costs, measured.
 //
 // See the README for the measurements behind every constant here.
 

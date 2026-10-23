@@ -53,6 +53,11 @@ python benchmark.py --target hadamard_quant_compare_int8_int4 --npu 0
 # or run all benchmark suites with one command
 python benchmark.py --target all --npu 0
 
+# cube vs vector over the whole grid, from msprof DEVICE time rather than the
+# event timer -- the only comparison these kernels are visible in. Needs msprof
+# on PATH; it is not part of --target all for that reason.
+python cube/bench_cube_vs_vector.py
+
 # generate plots from CSV files
 python plot.py --target standard
 # two-sided-vs-vector duration, bandwidth, and speedup plots
@@ -69,6 +74,10 @@ python plot.py --target hadamard_quant_int4
 python plot.py --target hadamard_quant_compare_int8_int4
 # or run all plot suites with one command
 python plot.py --target all
+
+# cube-vs-vector speedup heatmaps, device time and bandwidth, from the CSV
+# cube/bench_cube_vs_vector.py writes
+python plot_hadamard_cube_compare.py
 
 # correctness tests
 python test.py --target standard -v --npu "npu:0"
@@ -147,7 +156,6 @@ under `msprof` and reads the per-launch duration off the device task record:
 cat > /tmp/cfg.json <<'EOF'
 [{"tag":"ts", "kind":"twosided","batch":8192,"n":4096,"bd":24,"reps":10,"warmup":3},
  {"tag":"os", "kind":"onesided","batch":8192,"n":512, "bd":24,"reps":10,"warmup":3},
- {"tag":"bp", "kind":"bitplan", "batch":8192,"n":512, "bd":24,"reps":10,"warmup":3},
  {"tag":"std","kind":"std",     "batch":8192,"n":4096,"bd":24,"reps":10,"warmup":3}]
 EOF
 python cube/devtime_bench.py /tmp/cfg.json
@@ -156,23 +164,32 @@ python cube/devtime_bench.py /tmp/cfg.json
 ### The combined entry point (`auto/`)
 
 `auto/jit_util_hadamard_auto.py` exposes one out-of-place `fn(x, y)` that picks
-the kernel from `N`:
+the kernel from `N` and, at one size, the batch:
 
 | `N` | kernel | why |
 |---|---|---|
-| 64 .. 512 | one-sided | `N*N` MACs per sample, but one pipe pass per tile |
-| 1024 .. 32768 | two-sided | `N*(R+C)` MACs, at the cost of a turnaround |
+| 64, 128 | one-sided | no `R * C` with both factors 16-aligned exists |
+| 256, batch < 32768 | two-sided | `N*(R+C)` MACs instead of `N*N` |
+| 256, batch >= 32768 | one-sided | both are at the memory roofline; its stores win |
+| 512 .. 32768 | two-sided | the split's margin grows with `N` |
 
-The one-sided product's MACs grow 4x per doubling of `N` against 2x for its
-bytes, so it wins while `N` is small and loses once arithmetic dominates; the
-split's extra turnaround costs more than it saves while `N` is small. They cross
-between 512 and 1024. Each back end is compiled the first time a size needs it,
-and `pick_implementation(n)` answers the routing question without compiling
+**Where both kernels run, the split wins.** The one-sided product's MACs grow
+4x per doubling of `N` against 2x for its bytes, so it is left holding only the
+sizes the split cannot reach -- `N < 256`, where `N = R * C` with both factors
+16-aligned has no solution -- plus one corner of `N=256`. There both kernels are
+bandwidth-bound rather than MAC-bound, which is the only regime where the
+one-sided kernel's cheaper store pattern can show, and past batch 16384 it does.
+Each back end is compiled the first time a size needs it, and
+`pick_implementation(n, batch)` answers the routing question without compiling
 anything.
 
-**The vector kernel is not one of the branches, because it is never the fastest
-choice in this range** -- see the table below. It stays in `standard/` as the
-baseline, and as the only kernel that runs `N < 64`.
+**The vector kernel is not one of the branches.** Over the required grid it
+loses 100 of 104 cells, geomean 1.60x; the four it wins are `N=128` at batch
+<= 8, where the one-sided kernel's fixed per-tile cost has nothing to amortise
+against. `N=128` is also one of the two sizes the split cannot reach, so there
+is no third option there -- see "Cube versus vector over the whole grid" below.
+It stays in `standard/` as the baseline, and as the only kernel that runs
+`N < 64`.
 
 #### Required sizes, and what covers them
 
@@ -254,9 +271,10 @@ kernel's padded 2.18 us -- 0.22 us at a 2 us shape, inside what a per-library
 offset produces, so it is not worth a batch condition.
 
 **This table predates the bit-plan tile and the batch-aware N=512 routing**, so
-that weakest column has since improved: at batch 256 - 1024 the entry point now
-returns the bit-plan two-sided tile and reads 1.28x - 1.45x rather than 1.24x -
-1.26x. Every other column reproduces: re-measured at batch 1024, N=16384 is
+that weakest column has since improved: at batch 256 - 1024 the entry point then
+returned the bit-plan two-sided tile and read 1.28x - 1.45x rather than 1.24x -
+1.26x. The bit-plan has since been retired and the routing re-measured --
+see *Re-routing one-sided vs two-sided* for what ships now. Every other column reproduces: re-measured at batch 1024, N=16384 is
 120.4 -> 44.3 us against the 120.5 -> 44.4 recorded here, and N=8192 is
 57.6 -> 16.0 against 57.6 -> 16.1.
 
@@ -348,9 +366,9 @@ Reading it:
   than the two-sided tile's L1 turnaround.
 - **`N = 512` is the one crossover, and batch decides it.** One-sided wins at
   batch 16 and 64 (1.03x, 1.08x); the two-sided bit-plan tile wins from batch
-  256 up (1.02x, 1.13x, 1.41x, 1.70x). `BITPLAN_BATCH_MIN = 256` in `auto/` is
-  exactly this boundary, and the 1.02x at the boundary itself says the fit is
-  tight rather than lucky.
+  256 up (1.02x, 1.13x, 1.41x, 1.70x). **Superseded**: the split now wins every
+  batch at N=512 by 1.25x - 1.82x, and the one crossover has moved to N=256
+  pointing the other way -- see *Re-routing one-sided vs two-sided*.
 - **`N >= 1024`: the two-sided split wins everywhere**, 1.59x - 4.00x over the
   vector kernel. The one-sided product's `N*N` MACs grow 4x per doubling against
   2x for its bytes, which is why its table stops at 512.
@@ -733,7 +751,7 @@ Complete, after sweeping the grid above:
 | kernel / size | GM legs today | conversion-free possible? | measured |
 |---|---|---|---|
 | two-sided N=256 | **NZ both** (byte identity, `C == 16`) | already is | shipped |
-| two-sided N=512 | ND->NZ converting | **yes**, bit-plan T=8192 | **2.19-2.42x, shipped** |
+| two-sided N=512 | ND->NZ converting | **yes**, bit-plan T=8192 | 2.19-2.42x, since superseded by the `C == 16` split |
 | two-sided N=1024 | ND->NZ converting | yes, best T=8192 | 0.98-1.12x, declined |
 | two-sided N=2048 | ND->NZ converting | yes, best T=8192 | 0.96-1.01x, declined |
 | two-sided N=4096 | ND->NZ converting | yes, best T=8192 | 0.98-1.00x, declined |
@@ -966,7 +984,7 @@ accumulation) and the per-N samples-per-tile overrides. Removed:
 | `PTO_OS_BLOCKED` | blocked accumulation on/off | always on; the dense form it falls back to was 0.6-0.8x of the vector kernel |
 | `PTO_OS_BIG`, `PTO_OS_S1024`, `PTO_OS_S2048` | one-sided N=1024/2048 | correct but 1.7-4.8x slower than the two-sided kernel |
 | `PTO_OS_TILE_SPLIT` | split per-core work by samples instead of tiles | the sample split walks the halving chain on most cores -- **that reason has since expired**, there is no chain any more; see *The per-core remainder* |
-| `PTO_TS_BITPLAN` (host) | bit-plan on/off | always on; it is 2.19-2.42x at the one size it applies to |
+| `PTO_TS_BITPLAN` (host) | bit-plan on/off | **removed**; the `C == 16` split gives the same transfers for free, see *Re-routing one-sided vs two-sided* |
 
 Two whole code paths went with them, both **provably** dead rather than merely
 slow, and the proof is that deleting each one left a **byte-identical `.so`**:
@@ -1062,7 +1080,8 @@ the vector kernel and 0.54x of the two-sided one, and is now 1.28x - 1.50x and
 cannot reach at all (it needs `N = R * C` with both factors 16-aligned).
 
 **The two-sided column here is the CLASSIC path**, which is what that kernel ran
-when this table was measured. At N=512 it now ships the bit-plan tile instead,
+when this table was measured, and what it ships again today. At N=512 it then
+shipped the bit-plan tile instead,
 and that reverses the last two rows: from batch 256 up the two-sided kernel is
 1.02x - 1.70x FASTER, which is why `auto` routes N=512 by batch. N <= 256 is
 unaffected -- the bit-plan has no entry there -- and the one-sided kernel still
@@ -2312,16 +2331,18 @@ to do N=512, device us per launch:
 | 32768 | 36.10 | 28.92 | 31.27 | 0.9249 |
 
 Bit-plan was **1.23x - 1.40x slower than the path it replaced** from batch 16 to
-2048, and only pays from ~8192 up. `_BITPLAN_MIN_BATCH = {512: 8192}` gates it
-there. It keeps its large-batch win (1.08x over the split at 32768), so it is
-gated, not deleted.
+2048, and only pays from ~8192 up. `_BITPLAN_MIN_BATCH = {512: 8192}` gated it
+there. It kept a large-batch win (1.08x over the split at 32768), so at this
+point it was gated rather than deleted. **That win has since gone too** -- the
+split caught it at every batch and the path is now removed; see *Re-routing
+one-sided vs two-sided*, which is the second instance of the caution below.
 
 Two cautions this leaves on record. First, **an optimisation's verdict expires
 when its baseline changes**; bit-plan's 2.19x - 2.42x was true against the
 kernel of the time. Anything fitted as "X beats Y" needs re-running after Y
 improves. Second, raising the floor moved the bit-plan path **out of test
-coverage** -- batches 22 and 65 used to exercise it and now take the classic
-path -- so `test_bitplan_floor_boundaries` straddles the floor and crosses a
+coverage** -- batches 22 and 65 used to exercise it and then took the classic
+path -- so `test_bitplan_floor_boundaries` straddled the floor and crossed a
 whole-tile boundary to keep both the bulk launch and the bulk-plus-remainder
 split exercised.
 
@@ -2691,3 +2712,168 @@ content built as `k.cpp` and as `k_copy.cpp` produces different section hashes,
 which reads exactly like a codegen change. Build both arms over one path,
 and keep a null arm -- same content, same path, twice -- to show the comparison
 can return "identical" at all.
+
+### Re-routing one-sided vs two-sided, and retiring the bit-plan tile
+
+Both kernels had moved under the dispatcher since its crossover was fitted, so
+the routing was re-measured from scratch: every batch from 1 to 65536 at the two
+sizes they share, each kernel at its own schedule, four interleaved passes with
+the arm order rotated per pass. The null arm -- the same config run twice --
+read 1.0000x and 1.0032x, so a 3% margin is signal.
+
+| batch | N=256 one/two | N=512 one/two |
+|---|---|---|
+| 1 | 1.10 | 1.25 |
+| 16 | 1.17 | 1.46 |
+| 64 | 1.22 | 1.35 |
+| 256 | 1.16 | 1.25 |
+| 1024 | 1.13 | 1.30 |
+| 4096 | 1.04 | 1.55 |
+| 8192 | 1.03 | 1.68 |
+| 16384 | 1.00 | 1.77 |
+| 32768 | 0.97 | 1.82 |
+| 65536 | 0.96 | 1.82 |
+
+**The two columns run in opposite directions, and that is the whole result.**
+At N=512 the one-sided kernel is compute-bound -- 262144 MACs per sample against
+the split's 24576 -- so the more work a launch has, the further behind it falls.
+At N=256 its MACs drop 4x while its bytes only halve, both kernels reach the
+memory roofline (2485 against 2380 GB/s at batch 65536), and what is left to
+separate them is the store pattern, where the one-sided kernel is marginally
+ahead. So the crossover that used to be at N=512 is gone, and a new one appears
+at N=256 pointing the other way.
+
+The dispatcher now reads
+
+```python
+ONESIDED_BATCH_MIN = {256: 32768}
+```
+
+with batch 16384 left to the split: at 0.9983x it is inside the null band, and
+a tie is not a reason to switch kernels.
+
+**The bit-plan tile is retired.** It bought conversion-free GM transfers by
+paying `A + B = 2*sqrt(T)` MACs per value instead of `2*sqrt(N)`, and at N=512
+that was 2.19x - 2.42x when the classic path still did a 32-byte-per-row ND2NZ
+gather. The `C == 16` split landed earlier in this log gives the classic path
+the same conversion-free transfers structurally, at no MAC cost at all, so there
+is nothing left for the bit-plan to buy:
+
+| batch | bit-plan / classic at N=512 |
+|---|---|
+| 8192 | 1.0495 |
+| 16384 | 1.0299 |
+| 32768 | 1.0152 |
+| 65536 | 1.0082 |
+
+It decays toward parity as the fixed cost amortises but never crosses it.
+
+Before removing it, the one place it could still have paid was checked: `N=2048`
+and `N=4096` are the only sizes whose classic split is neither `C == 16` nor
+`S == 1`, so they are the only ones still doing the gather. Driving them through
+the bit-plan's `T=8192` tile -- same tile volume, same tile count, 2x the MACs,
+conversion-free transfers -- loses 1.25x - 1.33x at small batch for at most
+1.026x at batch >= 4096. `T=16384` does not validate at any `N`.
+
+The cheaper way to buy `kNzGm` at those two sizes was checked too and is worse:
+forcing `S == 1` makes the transfers conversion-free at **no** MAC cost, and
+still loses up to 2.37x, because the tile it shrinks is what fills the pipes.
+
+| batch | N=2048 `S=1`/`S=4` | N=4096 `S=1`/`S=2` |
+|---|---|---|
+| 8 | 1.01 | 1.01 |
+| 128 | 1.26 | 1.09 |
+| 2048 | 2.09 | 1.40 |
+| 8192 | 2.37 | 1.48 |
+
+**So the gather is not worth buying at any price these sizes can pay**, and
+`_BITPLAN_TILE`, `_BITPLAN_MIN_BATCH`, `bitplan_view`, `_bit_operand`,
+`bitplan_operands` and the launcher's bulk-plus-remainder split are gone with
+it. The launcher is back to one launch per call.
+
+#### A method note: the first block of an msprof session reads high
+
+Forcing `S == 1` at N=2048 first measured **1.35x faster** at batch 1 -- where
+the dispatch macro proves both arms run the identical `runTwosided<2048,32,64,1>`
+instantiation. A null arm (the same `.so` copied to a second path, both arms
+rotated over four passes) read 1.0069x and the effect vanished. The 1.35x was
+the first config in that session; nothing before it had warmed the path. Every
+sweep here now opens with a throwaway block, and no conclusion rests on a
+config that ran first.
+
+### Cube versus vector over the whole grid
+
+`cube/bench_cube_vs_vector.py` measures the dispatcher's choice against the
+vector kernel over `BENCH_HIDDEN_DIMS x BENCH_BATCHES`, 104 shapes, and
+`plot_hadamard_cube_compare.py` draws it. Device time, three interleaved passes
+with the arm order rotated, null arm 1.013x at the 3 us scale.
+
+**It has to report two numbers, because the two sides are not equally tuned.**
+The cube kernels carry a per-shape `block_dim` schedule; the vector kernel
+launches on a fixed count whatever the shape. Giving each kernel its own best
+count compares the kernels; letting each pick for itself compares what a caller
+gets today.
+
+| | geomean | min | max | cells the cube loses |
+|---|---|---|---|---|
+| each at its own best `block_dim` | **1.60x** | 0.83x | 3.67x | 4 of 104 |
+| as shipped | **2.09x** | 1.62x | 3.66x | 0 of 104 |
+
+Speedup at each kernel's own best `block_dim`:
+
+| batch \ N | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
+|---|---|---|---|---|---|---|---|---|
+| 1 | 0.83 | 1.00 | 0.95 | 1.13 | 1.31 | 1.57 | 1.88 | 2.49 |
+| 5 | 0.91 | 1.09 | 1.13 | 1.28 | 1.35 | 1.61 | 1.83 | 1.86 |
+| 8 | 0.96 | 1.17 | 1.21 | 1.29 | 1.35 | 1.60 | 1.80 | 2.34 |
+| 10 | 1.03 | 1.11 | 1.25 | 1.40 | 1.42 | 1.66 | 1.81 | 1.84 |
+| 16 | 1.03 | 1.20 | 1.30 | 1.38 | 1.42 | 1.56 | 1.76 | 2.19 |
+| 20 | 1.02 | 1.21 | 1.31 | 1.38 | 1.52 | 1.59 | 1.77 | 2.22 |
+| 32 | 1.10 | 1.31 | 1.37 | 1.42 | 1.53 | 1.63 | 1.77 | 1.80 |
+| 40 | 1.10 | 1.28 | 1.37 | 1.52 | 1.61 | 1.60 | 1.77 | 1.81 |
+| 64 | 1.14 | 1.36 | 1.41 | 1.57 | 1.57 | 1.88 | 2.09 | 2.35 |
+| 128 | 1.32 | 1.42 | 1.54 | 1.54 | 1.80 | 1.98 | 2.33 | 2.26 |
+| 256 | 1.47 | 1.46 | 1.56 | 1.74 | 1.94 | 2.38 | 3.00 | 2.65 |
+| 512 | 1.66 | 1.53 | 1.69 | 1.73 | 2.12 | 2.70 | 3.25 | 2.60 |
+| 1024 | 1.86 | 1.67 | 1.71 | 2.02 | 2.55 | 3.08 | 3.67 | 2.75 |
+
+**The four cells the cube loses are all `N=128` at batch <= 8**, worst 0.83x,
+and they are stable: six rotated passes read 0.776 - 0.849 at batch 1. `N=128`
+is one of the two sizes the split cannot reach, so the one-sided kernel is the
+only cube option there, and at one to eight samples its fixed per-tile cost has
+nothing to amortise against. `N=256` at batch 1 is a dead tie (1.0008x).
+
+The win grows along both axes and peaks at `N=8192`, where the cube reads 2124
+GB/s against the vector kernel's 581. It falls back at `N=16384` because that
+is one row per 32 KB UB tile for the vector kernel -- its best case, not the
+cube's worst.
+
+#### What the as-shipped column is actually measuring
+
+The vector kernel launches on `BLOCK_DIM = cube_core_num = 24`. A sweep to 48
+shows that is the right constant and not an oversight: at `block_dim` 32, 40 and
+48 the part runs two waves of 24 blocks, so batch 1024 at N=16384 reads 123.7 us
+at 24 against 177.8, 145.7 and 125.2. What it is missing is a **schedule** --
+fewer cores at small batch, exactly what both cube kernels carry. Its own best
+count beats its shipped one by up to **1.77x**, all of it at batch <= 256:
+
+| N | batch 16 | batch 64 | batch 256 | batch 1024 |
+|---|---|---|---|---|
+| 256 | 1.61 | 1.55 | 1.27 | 1.00 |
+| 1024 | 1.31 | 1.23 | 1.00 | 1.00 |
+| 16384 | 1.07 | 1.05 | 1.00 | 1.00 |
+
+So roughly half the as-shipped 2.09x is the cube kernels' schedule rather than
+their arithmetic, and giving the vector kernel the same treatment would close
+most of the gap below batch 256 and none of it above. The cube schedules
+themselves are within **1.0107x** geomean of their own per-shape best over the
+same grid, worst 1.234x at N=256 batch 8.
+
+**Two controls that had to run first.** The vector kernel is in place, so the
+harness cycles a pool of pre-filled buffers; a pool-size sweep shows device time
+is flat in the pool (`pool` 1, 2, 10, 20 within 0.3%) except at the single
+largest shape, where a 335 MB working set costs 2.7%. The reported numbers use
+`pool=1`, the reading most favourable to the baseline. And the vector kernel's
+butterfly is branch-free, so fp16 values diverging to `inf` across repeated
+in-place launches cannot change its timing -- which the same control confirms,
+`pool=1` timing identical to `pool=20`.

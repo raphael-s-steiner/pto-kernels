@@ -9,7 +9,7 @@ Usage (cwd = this example's root, needs msprof on PATH):
     python3 cube/devtime_bench.py <configs.json> [out.json]
 
 where configs.json is a list of
-    {"tag": "...", "kind": "twosided"|"onesided"|"bitplan"|"std",
+    {"tag": "...", "kind": "twosided"|"onesided"|"std",
      "batch": N, "n": N, "bd": 24, "reps": 30, "warmup": 5}
 
 `kind` picks the .so each config launches; add "so": "<path>" to point one at a
@@ -20,6 +20,7 @@ blocks are chunked in that order and the warmups dropped.
 import csv
 import glob
 import json
+import os
 import pathlib
 import shutil
 import statistics
@@ -29,7 +30,10 @@ import sys
 BASE = pathlib.Path(__file__).resolve().parent
 # msprof owns its output tree and names each run PROF_*, so it gets a directory
 # of its own, wiped per run: the glob below is only unambiguous with one run.
-PROF_DIR = BASE / "outputs" / "prof"
+# PTO_PROF_DIR moves it, for a checkout whose outputs/ is not writable or a
+# caller that wants concurrent runs kept apart.
+PROF_DIR = pathlib.Path(
+    os.environ.get("PTO_PROF_DIR", BASE / "outputs" / "prof"))
 
 # op_summary carries every AI_CORE task the process issued, so filter by
 # symbol -- one marker per .so DEFAULT_SO can point at.
@@ -41,9 +45,13 @@ def run_msprof(cfg_path: pathlib.Path) -> pathlib.Path:
     if PROF_DIR.exists():
         shutil.rmtree(PROF_DIR, ignore_errors=True)
     PROF_DIR.mkdir(parents=True, exist_ok=True)
+    # msprof re-launches the application itself, so it needs an interpreter
+    # that can import torch_npu; a bare `python3` is the system one, which
+    # cannot. PTO_PY names the venv's, or a wrapper script around it.
+    python = os.environ.get("PTO_PY", sys.executable)
     cmd = [
         "msprof",
-        f"--application=python3 {BASE / 'devtime_run.py'} {cfg_path}",
+        f"--application={python} {BASE / 'devtime_run.py'} {cfg_path}",
         f"--output={PROF_DIR}",
         "--ai-core=on",
         "--aicpu=off",
