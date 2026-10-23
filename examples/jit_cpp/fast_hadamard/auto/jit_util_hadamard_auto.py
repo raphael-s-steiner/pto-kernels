@@ -22,11 +22,11 @@ Everywhere else the split runs, the split wins.
 
 **The vector kernel is not a branch here.** Measured over the required grid
 (N 128..16384 x bench_common.BENCH_BATCHES, msprof device time on 910B2, each
-kernel at its own best block_dim) it loses 100 of 104 cells, geomean 1.60x. The
-four it wins are N=128 at batch <= 8, worst 0.83x -- the one size with no split
-to fall back on, at batches too small to amortise a tile. Routing those few
-cells to a third back end would mean compiling a third kernel for the shape
-least likely to be worth it. It stays in `standard/` as the baseline these
+kernel at its own best block_dim) it loses 99 of 104 cells, geomean 1.61x. The
+five it wins are all at batch <= 8 and N <= 512, worst 0.85x, where a cube
+tile's fixed cost has nothing to amortise against. Routing those few cells to a
+third back end would mean compiling a third kernel for the shapes least likely
+to be worth it. It stays in `standard/` as the baseline these
 kernels are measured against, and because it is the only one that runs N below
 64; see cube/bench_cube_vs_vector.py.
 

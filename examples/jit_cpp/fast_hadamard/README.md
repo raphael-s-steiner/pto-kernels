@@ -184,10 +184,9 @@ Each back end is compiled the first time a size needs it, and
 anything.
 
 **The vector kernel is not one of the branches.** Over the required grid it
-loses 100 of 104 cells, geomean 1.60x; the four it wins are `N=128` at batch
-<= 8, where the one-sided kernel's fixed per-tile cost has nothing to amortise
-against. `N=128` is also one of the two sizes the split cannot reach, so there
-is no third option there -- see "Cube versus vector over the whole grid" below.
+loses 99 of 104 cells, geomean 1.61x; the five it wins are all at batch <= 8
+and `N` <= 512, where a cube tile's fixed cost has nothing to amortise against
+-- see "Cube versus vector over the whole grid" below.
 It stays in `standard/` as the baseline, and as the only kernel that runs
 `N < 64`.
 
@@ -2806,7 +2805,21 @@ config that ran first.
 `cube/bench_cube_vs_vector.py` measures the dispatcher's choice against the
 vector kernel over `BENCH_HIDDEN_DIMS x BENCH_BATCHES`, 104 shapes, and
 `plot_hadamard_cube_compare.py` draws it. Device time, three interleaved passes
-with the arm order rotated, null arm 1.013x at the 3 us scale.
+with the arm order rotated, null arm 1.013x at the 3 us scale. Every arm is
+measured at two candidate `block_dim`s -- the best of a coarse sweep and the
+kernel's own tile-matched schedule -- and the better taken, because a fixed
+sweep grid misses the counts that divide the tile count evenly and reads
+10% - 25% high wherever it does (`N=16384` at batch 5, 10, 32 and 40). Each
+pass also opens with a throwaway launch OF EACH KIND, not just one: the first
+launch of a given kernel in an msprof session reads up to 1.5x high, and one
+warm block only covers the kind it ran.
+
+`outputs/csv/hadamard_three_way.csv` carries the same run broken out per
+kernel -- vector, one-sided and two-sided side by side at every shape, each
+with the `block_dim` it was measured at. A cube column is blank where that
+kernel cannot run the size (`N < 256` two-sided, `N > 512` one-sided), and over
+this whole grid the two-sided kernel wins every shape it can run, so "best
+cube" and "what the dispatcher picks" coincide at all 104 cells.
 
 **It has to report two numbers, because the two sides are not equally tuned.**
 The cube kernels carry a per-shape `block_dim` schedule; the vector kernel
@@ -2816,32 +2829,36 @@ gets today.
 
 | | geomean | min | max | cells the cube loses |
 |---|---|---|---|---|
-| each at its own best `block_dim` | **1.60x** | 0.83x | 3.67x | 4 of 104 |
-| as shipped | **2.09x** | 1.62x | 3.66x | 0 of 104 |
+| each at its own best `block_dim` | **1.61x** | 0.85x | 3.66x | 5 of 104 |
+| as shipped | **2.10x** | 1.67x | 3.66x | 0 of 104 |
 
 Speedup at each kernel's own best `block_dim`:
 
 | batch \ N | 128 | 256 | 512 | 1024 | 2048 | 4096 | 8192 | 16384 |
 |---|---|---|---|---|---|---|---|---|
-| 1 | 0.83 | 1.00 | 0.95 | 1.13 | 1.31 | 1.57 | 1.88 | 2.49 |
-| 5 | 0.91 | 1.09 | 1.13 | 1.28 | 1.35 | 1.61 | 1.83 | 1.86 |
-| 8 | 0.96 | 1.17 | 1.21 | 1.29 | 1.35 | 1.60 | 1.80 | 2.34 |
-| 10 | 1.03 | 1.11 | 1.25 | 1.40 | 1.42 | 1.66 | 1.81 | 1.84 |
-| 16 | 1.03 | 1.20 | 1.30 | 1.38 | 1.42 | 1.56 | 1.76 | 2.19 |
-| 20 | 1.02 | 1.21 | 1.31 | 1.38 | 1.52 | 1.59 | 1.77 | 2.22 |
-| 32 | 1.10 | 1.31 | 1.37 | 1.42 | 1.53 | 1.63 | 1.77 | 1.80 |
-| 40 | 1.10 | 1.28 | 1.37 | 1.52 | 1.61 | 1.60 | 1.77 | 1.81 |
-| 64 | 1.14 | 1.36 | 1.41 | 1.57 | 1.57 | 1.88 | 2.09 | 2.35 |
-| 128 | 1.32 | 1.42 | 1.54 | 1.54 | 1.80 | 1.98 | 2.33 | 2.26 |
-| 256 | 1.47 | 1.46 | 1.56 | 1.74 | 1.94 | 2.38 | 3.00 | 2.65 |
-| 512 | 1.66 | 1.53 | 1.69 | 1.73 | 2.12 | 2.70 | 3.25 | 2.60 |
-| 1024 | 1.86 | 1.67 | 1.71 | 2.02 | 2.55 | 3.08 | 3.67 | 2.75 |
+| 1 | 0.85 | 0.96 | 0.88 | 1.12 | 1.24 | 1.57 | 1.88 | 2.47 |
+| 5 | 0.93 | 1.09 | 1.13 | 1.29 | 1.36 | 1.62 | 1.85 | 2.41 |
+| 8 | 0.99 | 1.11 | 1.17 | 1.27 | 1.35 | 1.57 | 1.80 | 2.33 |
+| 10 | 1.03 | 1.12 | 1.26 | 1.35 | 1.48 | 1.69 | 1.85 | 2.31 |
+| 16 | 1.05 | 1.18 | 1.33 | 1.36 | 1.41 | 1.59 | 1.76 | 2.18 |
+| 20 | 1.04 | 1.20 | 1.31 | 1.43 | 1.53 | 1.66 | 1.82 | 2.18 |
+| 32 | 1.11 | 1.30 | 1.39 | 1.44 | 1.53 | 1.62 | 1.77 | 1.81 |
+| 40 | 1.12 | 1.30 | 1.41 | 1.53 | 1.58 | 1.69 | 1.75 | 1.82 |
+| 64 | 1.18 | 1.36 | 1.43 | 1.56 | 1.59 | 1.91 | 2.16 | 2.41 |
+| 128 | 1.28 | 1.40 | 1.53 | 1.54 | 1.83 | 2.02 | 2.39 | 2.27 |
+| 256 | 1.44 | 1.48 | 1.56 | 1.76 | 1.96 | 2.39 | 2.98 | 2.65 |
+| 512 | 1.63 | 1.54 | 1.70 | 1.78 | 2.19 | 2.67 | 3.25 | 2.60 |
+| 1024 | 1.87 | 1.69 | 1.77 | 2.03 | 2.54 | 3.07 | 3.66 | 2.75 |
 
-**The four cells the cube loses are all `N=128` at batch <= 8**, worst 0.83x,
-and they are stable: six rotated passes read 0.776 - 0.849 at batch 1. `N=128`
-is one of the two sizes the split cannot reach, so the one-sided kernel is the
-only cube option there, and at one to eight samples its fixed per-tile cost has
-nothing to amortise against. `N=256` at batch 1 is a dead tie (1.0008x).
+**The five cells the cube loses are all at batch <= 8 and `N` <= 512**: `N=128`
+at batch 1, 5 and 8 (0.85x, 0.93x, 0.99x) and batch 1 at `N=256` and `N=512`
+(0.96x, 0.88x). They are stable -- six rotated passes read 0.776 - 0.849 at
+`N=128` batch 1. A cube tile is at least 16 samples and its operands must reach
+L0A/L0B before any of them move, so at one to eight samples there is nothing to
+amortise that fixed cost against, while the vector kernel's butterfly starts
+on the first row. `N=128` is also one of the two sizes the split cannot reach,
+so the one-sided kernel is the only cube option there and the loss runs
+furthest.
 
 The win grows along both axes and peaks at `N=8192`, where the cube reads 2124
 GB/s against the vector kernel's 581. It falls back at `N=16384` because that
@@ -2863,7 +2880,7 @@ count beats its shipped one by up to **1.77x**, all of it at batch <= 256:
 | 1024 | 1.31 | 1.23 | 1.00 | 1.00 |
 | 16384 | 1.07 | 1.05 | 1.00 | 1.00 |
 
-So roughly half the as-shipped 2.09x is the cube kernels' schedule rather than
+So roughly half the as-shipped 2.10x is the cube kernels' schedule rather than
 their arithmetic, and giving the vector kernel the same treatment would close
 most of the gap below batch 256 and none of it above. The cube schedules
 themselves are within **1.0107x** geomean of their own per-shape best over the
